@@ -1,0 +1,20 @@
+[project]
+name = "deer-flow"
+version = "0.1.0"
+description = "LangGraph-based AI agent system"
+requires-python = ">=3.12"
+dependencies = [
+    "deerflow-harness",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+]
+
+[tool.uv.workspace]
+members = ["packages/harness"]
+
+[tool.uv.sources]
+deerflow-harness = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
