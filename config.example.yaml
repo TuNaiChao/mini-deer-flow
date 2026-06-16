@@ -18,15 +18,15 @@ log_level: info
 # ============================================================
 models:
 
-  # --- DeepSeek V3（默认模型，支持推理思考）---
-  # 注意：DeepSeek-V3 / V3.1 的 API 端点目前对外暴露的是纯文本对话能力。
-  # 虽然官方在 2025 年发布的 V3.1 模型已支持视觉输入，但 deepseek-chat
+  # --- DeepSeek V4 Pro（默认模型，支持推理思考）---
+  # 注意：DeepSeek-V4 Pro 的 API 端点目前对外暴露的是纯文本对话能力。
+  # 虽然官方在 2025 年发布的 V4 Pro 模型已支持视觉输入，但 deepseek-chat
   # 在多数账号下仍以文本为主。如确认你的账号已开通视觉权限，可把下方
   # supports_vision 改为 true（届时阶段5 的 ViewImageMiddleware 会自动挂载）。
   - name: deepseek
-    display_name: DeepSeek V3
+    display_name: DeepSeek V4 Pro
     use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-chat
+    model: deepseek-v4-pro
     api_key: $DEEPSEEK_API_KEY
     temperature: 0.7
     max_tokens: 8192

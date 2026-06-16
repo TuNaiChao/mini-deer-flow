@@ -30,6 +30,7 @@ def test_agent():
     test_messages = [
         "你好！请用中文简单介绍一下你自己。",
         "1+1等于几？",
+        "你有哪些工具可以使用",
     ]
 
     for msg in test_messages:

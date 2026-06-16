@@ -13,6 +13,7 @@ from ...config import get_app_config
 from ...models import create_chat_model
 from ..thread_state import ThreadState
 from .prompt import apply_prompt_template
+from ..middlewares import build_middlewares
 
 
 def make_lead_agent(config: RunnableConfig) -> Any:
@@ -46,8 +47,20 @@ def make_lead_agent(config: RunnableConfig) -> Any:
     )
     print(f"使用模型: {model_name or app_config.models[0].name}")
 
-    # 获取工具列表（暂时为空，阶段2添加）
-    tools = []
+    # 获取工具列表（延迟导入，避免与 deerflow.tools 的循环导入）
+    from deerflow.tools import get_available_tools
+
+    tools = get_available_tools(
+        model_name=model_name,
+        app_config=app_config,
+    )
+
+    # 构建中间件链（配置驱动：各功能开关从 app_config 读取）
+    middlewares = build_middlewares(
+        config,
+        model_name=model_name,
+        app_config=app_config,
+    )
 
     # 构建系统提示词
     system_prompt = apply_prompt_template()
@@ -58,8 +71,12 @@ def make_lead_agent(config: RunnableConfig) -> Any:
     agent = create_agent(
         model=model,
         tools=tools,
+        middleware=middlewares,
         system_prompt=system_prompt,
         state_schema=ThreadState,
     )
+
+    print(f"ℹ Agent 已创建: model={model_name or app_config.models[0].name}, "
+          f"middlewares={len(middlewares)}个, tools={len(tools)}个")
 
     return agent

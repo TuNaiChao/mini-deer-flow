@@ -62,7 +62,7 @@ class ThreadState(AgentState):
     title: NotRequired[str | None]
     """线程标题（由 TitleMiddleware 自动生成）"""
 
-    # --- Artifacts ---
+    # --- Artifacts(产物) ---
     artifacts: NotRequired[Annotated[list[str], _merge_artifacts]]
     """Agent 输出的文件路径列表（使用去重 reducer）"""
 
