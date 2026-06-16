@@ -65,6 +65,25 @@ class AppConfig(BaseModel):
     tracing: dict[str, Any] = Field(default_factory=dict)
     token_usage: dict[str, Any] = Field(default_factory=dict)
 
+    def get_model_config(self, name: str | None) -> ModelConfig | None:
+        """按名称查找模型配置。
+
+        Args:
+            name: 模型名（对应 config.yaml 中 models[].name）。
+                为 None 时返回第一个模型（默认模型）。
+
+        Returns:
+            ModelConfig 实例；未配置任何模型或找不到该名称时返回 None。
+        """
+        if not self.models:
+            return None
+        if name is None:
+            return self.models[0]
+        for m in self.models:
+            if m.name == name:
+                return m
+        return None
+
 
 # --- 全局配置单例 ---
 
