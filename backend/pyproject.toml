@@ -9,8 +9,29 @@ dependencies = [
     "uvicorn[standard]>=0.34.0",
 ]
 
+# 透传 harness 的可选 extras：让 backend 安装时也能一并拉取
+# （例如 ``uv sync --extra postgres`` 在 backend 目录下启用 postgres 持久化）
+[project.optional-dependencies]
+postgres = ["deerflow-harness[postgres]"]
+sqlite = ["deerflow-harness[sqlite]"]
+aiosqlite = ["deerflow-harness[aiosqlite]"]
+mcp = ["deerflow-harness[mcp]"]
+
+# 开发依赖：测试、lint。blocking-IO gate 用 inline 实现（见
+# test/support/detectors/blocking_io_runtime.py），无需外部库。
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
 [tool.uv.workspace]
 members = ["packages/harness"]
 
 [tool.uv.sources]
 deerflow-harness = { workspace = true }
+
+# pytest 配置已移到项目根的 pytest.ini（test/ 在 backend 外，pytest 的 rootdir
+# 上移到项目根，配置须在根才能被读到：asyncio_mode=auto + markers + testpaths）。
+# ruff 配置同理移到项目根的 ruff.toml（覆盖 backend/ + test/ 全部代码）。

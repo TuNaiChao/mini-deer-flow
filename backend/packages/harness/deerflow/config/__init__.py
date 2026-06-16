@@ -3,6 +3,7 @@
 
 提供统一的配置访问接口
 """
+
 import os
 
 from .app_config import AppConfig, get_app_config, reload_config
@@ -32,9 +33,7 @@ def validate_enabled_tracing_providers() -> None:
             raise ValueError("LANGSMITH_TRACING=true 但未设置 LANGSMITH_API_KEY")
         if p == "langfuse":
             if not os.getenv("LANGFUSE_SECRET_KEY") or not os.getenv("LANGFUSE_PUBLIC_KEY"):
-                raise ValueError(
-                    "LANGFUSE_TRACING=true 但未设置 LANGFUSE_SECRET_KEY / LANGFUSE_PUBLIC_KEY"
-                )
+                raise ValueError("LANGFUSE_TRACING=true 但未设置 LANGFUSE_SECRET_KEY / LANGFUSE_PUBLIC_KEY")
 
 
 def get_tracing_config():

@@ -4,7 +4,8 @@
 ThreadState 继承 langchain 的 AgentState，
 使用自定义 reducer 管理特殊字段的合并逻辑。
 """
-from typing import Annotated, TypedDict, NotRequired
+
+from typing import Annotated, NotRequired
 
 from langchain.agents import AgentState
 

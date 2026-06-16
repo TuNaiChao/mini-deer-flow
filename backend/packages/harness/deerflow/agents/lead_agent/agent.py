@@ -4,6 +4,7 @@ Lead Agent 实现
 这是 LangGraph 的图入口点（langgraph.json 中注册的函数）。
 make_lead_agent(config) → CompiledStateGraph
 """
+
 from typing import Any
 
 from langchain.agents import create_agent
@@ -11,9 +12,9 @@ from langchain_core.runnables import RunnableConfig
 
 from ...config import get_app_config
 from ...models import create_chat_model
+from ..middlewares import build_middlewares
 from ..thread_state import ThreadState
 from .prompt import apply_prompt_template
-from ..middlewares import build_middlewares
 
 
 def make_lead_agent(config: RunnableConfig) -> Any:
@@ -38,7 +39,7 @@ def make_lead_agent(config: RunnableConfig) -> Any:
     # 模型名称（可从运行时配置中动态切换）
     model_name = configurable.get("model_name")
     thinking_enabled = configurable.get("thinking_enabled", False)
-    plan_mode = configurable.get("is_plan_mode", False)
+    # is_plan_mode：M16 TodoMiddleware 落地后经 build_middlewares 传入，当前未接通。
 
     # 创建模型
     model = create_chat_model(
@@ -76,7 +77,6 @@ def make_lead_agent(config: RunnableConfig) -> Any:
         state_schema=ThreadState,
     )
 
-    print(f"ℹ Agent 已创建: model={model_name or app_config.models[0].name}, "
-          f"middlewares={len(middlewares)}个, tools={len(tools)}个")
+    print(f"ℹ Agent 已创建: model={model_name or app_config.models[0].name}, middlewares={len(middlewares)}个, tools={len(tools)}个")
 
     return agent

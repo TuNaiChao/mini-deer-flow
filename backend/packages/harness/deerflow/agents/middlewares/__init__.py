@@ -5,21 +5,31 @@
 中间件通过 AgentMiddleware hook 机制工作，
 按 build_middlewares() 中的顺序装配。
 """
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # 仅类型注解用，运行时不 import（避免循环导入 + 保持轻量）
+    from langchain_core.runnables import RunnableConfig
+
+    from deerflow.config.app_config import AppConfig
+
 from langchain.agents.middleware import AgentMiddleware
 
-from .tool_error_handling_middleware import ToolErrorHandlingMiddleware
-from .llm_error_handling_middleware import LLMErrorHandlingMiddleware
-from .dynamic_context_middleware import DynamicContextMiddleware
-from .loop_detection_middleware import LoopDetectionMiddleware
 from .clarification_middleware import ClarificationMiddleware
-from .title_middleware import TitleMiddleware
+from .dynamic_context_middleware import DynamicContextMiddleware
+from .llm_error_handling_middleware import LLMErrorHandlingMiddleware
+from .loop_detection_middleware import LoopDetectionMiddleware
 from .memory_middleware import MemoryMiddleware
+from .title_middleware import TitleMiddleware
+from .tool_error_handling_middleware import ToolErrorHandlingMiddleware
 
 # ViewImageMiddleware 在阶段5 §步骤6 实现。为了让本阶段的 build_middlewares()
 # 提前具备多模态条件挂载能力（避免阶段5 还要回头改本文件），这里用 try/except
 # 做前向兼容：阶段5 创建该文件后即自动生效，阶段3 暂未创建时也不影响运行。
 try:
     from .view_image_middleware import ViewImageMiddleware
+
     _HAS_VIEW_IMAGE_MIDDLEWARE = True
 except ImportError:
     ViewImageMiddleware = None  # type: ignore[assignment,misc]
@@ -121,11 +131,7 @@ def build_middlewares(
         else:
             # 未指定模型名 → 用默认（第一个）模型的能力判断
             model_config = cfg.models[0]
-    if (
-        _HAS_VIEW_IMAGE_MIDDLEWARE
-        and model_config is not None
-        and getattr(model_config, "supports_vision", False)
-    ):
+    if _HAS_VIEW_IMAGE_MIDDLEWARE and model_config is not None and getattr(model_config, "supports_vision", False):
         middlewares.append(ViewImageMiddleware())
 
     # === 用户自定义中间件（可选）===

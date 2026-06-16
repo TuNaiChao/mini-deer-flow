@@ -6,6 +6,7 @@
 - **集成冒烟**（``test_model_factory_integration``）：需 config.yaml + 真实 API key，
   无则自动跳过。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -58,8 +59,7 @@ def test_basic_creation(monkeypatch):
 
 def test_default_model_uses_first(monkeypatch):
     monkeypatch.setattr(factory_module, "resolve_class", lambda path, base=None: _Recorder)
-    cfg = AppConfig(models=[ModelConfig(name="first", use="x:F", model="mf"),
-                            ModelConfig(name="second", use="x:S", model="ms")])
+    cfg = AppConfig(models=[ModelConfig(name="first", use="x:F", model="mf"), ModelConfig(name="second", use="x:S", model="ms")])
 
     model = create_chat_model(app_config=cfg)
 
@@ -104,8 +104,11 @@ def test_thinking_disabled_vllm_path(monkeypatch):
 def test_thinking_disabled_openai_path(monkeypatch):
     """not thinking_enabled + OpenAI extra_body.thinking.type → disabled + reasoning_effort=minimal。"""
     monkeypatch.setattr(factory_module, "resolve_class", lambda path, base=None: _Recorder)
+    # supports_reasoning_effort=True：否则 reasoning_effort 门控会把 OpenAI 关闭
+    # 路径设的 reasoning_effort="minimal" 弹掉（factory 行为与 deer 一致）。
     cfg = _make_config(
         supports_thinking=True,
+        supports_reasoning_effort=True,
         when_thinking_enabled={"extra_body": {"thinking": {"type": "enabled"}}},
     )
 
@@ -120,6 +123,7 @@ def test_when_thinking_disabled_explicit(monkeypatch):
     monkeypatch.setattr(factory_module, "resolve_class", lambda path, base=None: _Recorder)
     cfg = _make_config(
         supports_thinking=True,
+        supports_reasoning_effort=True,
         when_thinking_enabled={"extra_body": {"thinking": {"type": "enabled"}}},
         when_thinking_disabled={"reasoning_effort": "low"},
     )
@@ -207,8 +211,7 @@ def test_attach_tracing_false_skips(monkeypatch):
 
 def test_get_model_config_on_app_config():
     """AppConfig.get_model_config 的契约：None→首个、命名查找、找不到返回 None。"""
-    cfg = AppConfig(models=[ModelConfig(name="a", use="x:A", model="ma"),
-                            ModelConfig(name="b", use="x:B", model="mb")])
+    cfg = AppConfig(models=[ModelConfig(name="a", use="x:A", model="ma"), ModelConfig(name="b", use="x:B", model="mb")])
 
     assert cfg.get_model_config(None).name == "a"
     assert cfg.get_model_config("b").model == "mb"

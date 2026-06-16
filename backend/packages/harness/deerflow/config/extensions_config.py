@@ -4,12 +4,12 @@
 从 extensions_config.json 加载 MCP 服务器配置和技能启用状态。
 与 config.yaml 分离——运行时通过 Gateway API 修改此文件。
 """
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 @dataclass
@@ -18,9 +18,10 @@ class McpServerConfig:
 
     支持 stdio（本地子进程）和 sse/http（远程服务）两种传输方式。
     """
+
     name: str
     enabled: bool = True
-    type: str = "stdio"         # "stdio" | "sse" | "http"
+    type: str = "stdio"  # "stdio" | "sse" | "http"
     # stdio 传输参数
     command: str | None = None
     args: list[str] = field(default_factory=list)
@@ -48,6 +49,7 @@ class ExtensionsConfig:
     def default_path() -> Path:
         """extensions_config.json 的默认路径（backend/ 目录下）。"""
         from .paths import PROJECT_ROOT
+
         return PROJECT_ROOT / "extensions_config.json"
 
     @classmethod
@@ -62,9 +64,7 @@ class ExtensionsConfig:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
-        servers = [
-            McpServerConfig(**s) for s in raw.get("mcp_servers", [])
-        ]
+        servers = [McpServerConfig(**s) for s in raw.get("mcp_servers", [])]
         skills = raw.get("enabled_skills", [])
         return cls(mcp_servers=servers, enabled_skills=skills)
 
@@ -72,8 +72,4 @@ class ExtensionsConfig:
 
     def get_enabled_mcp_servers(self) -> dict[str, McpServerConfig]:
         """返回 {server_name: McpServerConfig} 仅包含 enabled=True 的服务器。"""
-        return {
-            s.name: s
-            for s in self.mcp_servers
-            if s.enabled
-        }
+        return {s.name: s for s in self.mcp_servers if s.enabled}

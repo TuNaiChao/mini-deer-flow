@@ -11,13 +11,17 @@
 > 2. 参考实现：`../deer-flow/backend/packages/harness/deerflow/` 下同名文件，标注「移植」的文件可基本照搬，标注「适配」的需按 mini 现状调整。
 > 3. 代码风格对齐 mini 现有：中文 docstring、`ruff`（行宽 240）、双引号、Python 3.12+ 类型注解。
 > 4. **可靠性底线**：空 `config.yaml` 必须能以 `memory` 模式启动；任何阻塞 IO 必须走 `asyncio.to_thread`；任何 `wrap_tool_call` 必须 `raise GraphBubbleUp`。
-> 5. 测试目录：`backend/test/test_<module>.py`；学习文档目录：`docs/<module>.md`。
-> 6. 跨阶段不破坏既有：每完成一个 Phase 跑一次 `backend/test/` 全量测试。
+> 5. 测试目录：`test/test_<module>.py`（**项目根，backend 外**，配 `pytest.ini`）；学习文档目录：`docs/<module>.md`。
+> 6. 跨阶段不破坏既有：每完成一个 Phase 跑一次 `test/` 全量（`cd backend && make test`）。
 > 7. **langgraph 版本要求**：需支持 `Runtime` / `ToolRuntime` / `configurable["__pregel_runtime"]` / `Command(goto=END)` / `get_config`（langgraph ≥ 1.1）。在 `packages/harness/pyproject.toml` 锁定下限。
+> 8. **文档命名与位置**（重要）：每个模块的学习文档放 `docs/` 根，命名 `<module>.md`（**kebab-case 英文，禁止中文文件名**，如 `build.md` / `models.md` / `utils.md` / `user_context.md`）。文档**面向小白、从基础讲起**——每个名词第一次出现都要解释，范例见 `docs/build.md` 的「零基础先读」节。**旧版 / 待重写**的文档归档在 `docs/legacy/`（如 `legacy/中间件.md`），不要放回 `docs/` 根。三者分工：**改设计规格** → 本文件；**查/更新进度** → `docs/todo.md`；**写模块文档** → `docs/<module>.md`。
 
 ---
 
 ## 目录
+
+> 📌 **进度跟踪（做到哪了 / 下次做什么）→ [todo.md](todo.md)**
+> 本文件是**设计规格**（做成什么样），todo.md 是**进度看板**（做到哪了）。
 
 - [Part A — 全局约定与依赖图](#part-a--全局约定与依赖图)
 - [Part B — 推荐落地顺序（Phase 0–8 + 可选）](#part-b--推荐落地顺序phase-08--可选)
@@ -90,7 +94,7 @@ models(factory 升级) ◄── config/model_config ──┐                  
 ### B.1 模块级线性修改顺序（推荐执行序）
 
 > 这是比上面 Phase 表更细的**单线执行序列**——把每个模块按依赖关系排成一条龙，后续 AI 可从上到下逐个做。标注：✅已完成 / 🔶部分 / ⬜未开始。每步后括号是「为什么排这里」。
-> **铁律**：每完成一步，跑一次 `backend/test/` 全量，绿了再下一步。
+> **铁律**：每完成一步，跑一次 `test/` 全量（`cd backend && make test`），绿了再下一步。
 
 **Phase 0 — 地基 + 工程化（最先，让「能跑测试」成立）**
 
@@ -421,7 +425,7 @@ models(factory 升级) ◄── config/model_config ──┐                  
 - **关键要点**：按 name 去重（config 优先，防 #1803）；view_image 仅 supports_vision；task 仅 subagent_enabled；MCP 缺包软加载。
 - **依赖**：sandbox（bash 等工具）、subagents（task_tool）、models（supports_vision）、config（tool_search/skill_evolution）、reflection、M-opt-mcp（可选）。
 - **测试**：`backend/test/test_tools.py`（扩展现有）—— 去重、host-bash 过滤、view_image 条件、name-mismatch 告警、sync 包装、MCP 缺包回退。
-- **学习文档**：`docs/tools.md`（**已存在，需按新模板更新**）—— 工具来源四类、去重必要性、条件加载、MCP 软加载。
+- **学习文档**：`docs/tools.md`（旧版在 `docs/legacy/tools.md`，M15 落地时按新模板重写到 `docs/tools.md`）—— 工具来源四类、去重必要性、条件加载、MCP 软加载。
 - **裁剪**：`invoke_acp_agent_tool` **不做**。
 
 ---
@@ -438,7 +442,7 @@ models(factory 升级) ◄── config/model_config ──┐                  
 - **关键要点**：Clarification 必须最后；ThreadData→Sandbox 顺序；所有 `wrap_tool_call` 必须 `raise GraphBubbleUp`；DynamicContext 用 `before_agent` + ID-swap；LoopDetection `from_config`。
 - **依赖**：几乎所有业务模块（sandbox/subagents/skills/memory/tracing/config）。
 - **测试**：`backend/test/test_middlewares.py`（**已存在，需扩展**）—— 顺序断言（Clarification 末位、ThreadData 先于 Sandbox）、GraphBubbleUp 不被吞、各中间件 enable/默认、ID-swap 注入、todo plan_mode。
-- **学习文档**：`docs/middlewares.md`（**已存在为「中间件.md」，需按新模板更新**）—— 中间件 hook 机制、23 步顺序与设计理由、AgentMiddleware 生命周期。
+- **学习文档**：`docs/middlewares.md`（旧版在 `docs/legacy/中间件.md`，M16 落地时按新模板重写到 `docs/middlewares.md`）—— 中间件 hook 机制、23 步顺序与设计理由、AgentMiddleware 生命周期。
 - **裁剪**：guardrail 中间件（依赖 guardrails 模块）**本期不做**。
 
 ---
@@ -632,8 +636,8 @@ mini 已有 [backend/langgraph.json](../backend/langgraph.json)（含 `graphs.le
 | M12 tracing | ✅ | `test/test_tracing.py` | `docs/tracing.md` |
 | M13 memory | ✅ | `test/test_memory.py` | `docs/memory.md` |
 | M14 skills | ✅ | `test/test_skills.py` | `docs/skills.md` |
-| M15 tools | ✅ | `test/test_tools.py` | `docs/tools.md`（已存在·更新） |
-| M16 middlewares | ✅ | `test/test_middlewares.py` | `docs/middlewares.md`（已存在为「中间件.md」·更新） |
+| M15 tools | ✅ | `test/test_tools.py` | `docs/tools.md`（旧版 `legacy/tools.md`，待重写） |
+| M16 middlewares | ✅ | `test/test_middlewares.py` | `docs/middlewares.md`（旧版 `legacy/中间件.md`，待重写） |
 | M17 agents | ✅ | `test/test_agent.py` + `test_agent_with_middlewares.py` | `docs/agents.md` |
 | M18 runs | ✅ | `test/test_run_manager.py` + `test_worker.py` | `docs/runs.md` |
 | M19 runtime/store | ✅ | `test/test_store.py` | `docs/runtime_store.md` |
@@ -657,23 +661,11 @@ mini 已有 [backend/langgraph.json](../backend/langgraph.json)（含 `graphs.le
   - 🟡 M17 补 **prompt 条件段 gating**（skills/deferred/subagent/soul/self_update/acp 各自 feature 开关）。
   - 🟡 D.3 改为「**对齐现有 langgraph.json**」（mini 已有 graphs 条目，仅缺 checkpointer 段）；补 D.5 build_event_store/build_thread_store 工厂。
   - ⚪ 新增红线 #26（langgraph 版本）、#27（stream 超时/用量）、#28（boundary/gate 强制测试）；M0 补 config_version bump；明确 runtime_paths→paths.resolve_path 替代；M7 修正 journal 依赖措辞（progress_reporter 在 worker 注入，无模块循环）。
-  - ⚪ Part F 标注「已存在·更新」的旧文档（tools.md / 中间件.md / 模型更换.md）。
+  - ⚪ Part F 标注「已存在·更新」的旧文档（tools.md / 中间件.md / 模型更换.md，现已归档到 `docs/legacy/`）。
 - **v1**：初版，覆盖 M0–M19 共 20 模块 + 25 红线。
 
-### 实现进度
-
-> 每完成一个模块的三交付（代码→测试→文档）后在此勾选。「测试待验证」=代码已写但因环境（uv 锁等）未跑绿。
-
-| 模块 | 状态 | 备注 |
-|------|------|------|
-| M-build 工程化 | ⬜ 未开始 | |
-| M0 config | 🔶 极小部分 | 仅加了 `AppConfig.get_model_config`；子配置类型化未做 |
-| M1 utils | ⬜ 未开始 | |
-| M2 reflection | ✅ 已具备 | `resolve_class` 已存在，无需改动 |
-| M3 user_context | ⬜ 未开始 | |
-| **M-models** | ✅ 已完成（测试待验证） | factory 重写 + 测试 + `docs/models.md`；待 uv 锁释放后跑 `test_model.py` |
-| M4 persistence | 📋 有规格 | `docs/spec-M4-persistence.md`，代码未落地 |
-| M5–M19 | ⬜ 未开始 | |
+> 📌 **实现进度与待办清单已拆分到 [todo.md](todo.md)**：总览统计 + 模块进度总表（一眼看完所有模块的 ✅/🔶/📋/⬜）+ 按 Phase 的待办 + 下次开工步骤。
+> 本文件（ALIGNMENT_OUTLINE.md）专注**设计规格**：Part C 各模块的文件清单 / 依赖 / 可靠性要点 / 测试要求，Part D 集成装配，Part E 红线规则。改设计来这，查进度去 todo.md。
 
 ---
 

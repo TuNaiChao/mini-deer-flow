@@ -53,9 +53,7 @@ def apply_prompt_template(
         skill_lines = []
         for skill_name in sorted(available_skills):
             skill_lines.append(f"- **{skill_name}**: /{skill_name} <任务描述>")
-        skills_section = SKILLS_SECTION_TEMPLATE.format(
-            skill_list="\n".join(skill_lines)
-        )
+        skills_section = SKILLS_SECTION_TEMPLATE.format(skill_list="\n".join(skill_lines))
     else:
         skills_section = ""
 

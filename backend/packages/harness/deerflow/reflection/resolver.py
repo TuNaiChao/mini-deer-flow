@@ -4,6 +4,7 @@
 通过 'module.path:ClassName' 格式的字符串动态加载类，
 避免硬编码 import，实现完全配置驱动。
 """
+
 import importlib
 from typing import TypeVar
 
@@ -41,9 +42,7 @@ def resolve_variable(path: str, expected_type: type[T] | None = None) -> T:
         # 提供友好的安装提示
         hint = MODULE_TO_PACKAGE_HINTS.get(module_path)
         if hint:
-            raise ImportError(
-                f"缺少依赖 '{hint}'。请运行: uv add {hint}"
-            ) from e
+            raise ImportError(f"缺少依赖 '{hint}'。请运行: uv add {hint}") from e
         raise
 
     obj = getattr(module, var_name)
@@ -52,13 +51,9 @@ def resolve_variable(path: str, expected_type: type[T] | None = None) -> T:
         # 对于类，使用 issubclass；对于实例，使用 isinstance
         if isinstance(obj, type):
             if not issubclass(obj, expected_type):
-                raise TypeError(
-                    f"{obj.__name__} 不是 {expected_type.__name__} 的子类"
-                )
+                raise TypeError(f"{obj.__name__} 不是 {expected_type.__name__} 的子类")
         elif not isinstance(obj, expected_type):
-            raise TypeError(
-                f"{type(obj).__name__} 不是 {expected_type.__name__} 的实例"
-            )
+            raise TypeError(f"{type(obj).__name__} 不是 {expected_type.__name__} 的实例")
 
     return obj
 
@@ -77,17 +72,13 @@ def resolve_class(path: str, base_class: type[T] | None = None) -> type[T]:
     cls = resolve_variable(path)
     # 确保解析得到的确实是一个类（而非实例或函数）
     if not isinstance(cls, type):
-        raise TypeError(
-            f"{path} 解析得到的不是类，而是 {type(cls).__name__}"
-        )
+        raise TypeError(f"{path} 解析得到的不是类，而是 {type(cls).__name__}")
     if base_class is not None and not issubclass(cls, base_class):
-        raise TypeError(
-            f"{cls.__name__} 不是 {base_class.__name__} 的子类"
-        )
+        raise TypeError(f"{cls.__name__} 不是 {base_class.__name__} 的子类")
     return cls
 
 
 # notes:
-# "它是不是一个类"             isinstance(x, type) 
+# "它是不是一个类"             isinstance(x, type)
 # "它是不是某类的实例(实物)"	isinstance(x, 某类)
 # "它是不是某类的子类(亲戚)"	issubclass(类, 某类)

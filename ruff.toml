@@ -1,0 +1,16 @@
+# ruff 配置（项目根，单一真相源）。覆盖 backend/ + test/ 全部 Python 代码。
+# test/ 在 backend 外，配置须放项目根，ruff 从任一文件向上查找才能统一生效
+# （否则 backend/ 用 backend/pyproject.toml、test/ 用默认，行宽等会不一致）。
+# 行宽 240、双引号、py312，对齐 deer-flow 风格。
+line-length = 240
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I"]
+
+[lint.isort]
+known-first-party = ["deerflow"]
+
+[format]
+quote-style = "double"
+indent-style = "space"

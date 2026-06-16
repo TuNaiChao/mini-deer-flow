@@ -16,6 +16,7 @@
 
 注意：Codex/MindIE 等 provider 专有分支（deer 有）本期不做。
 """
+
 from __future__ import annotations
 
 import logging
@@ -181,21 +182,15 @@ def create_chat_model(
 
     # 3. thinking 模式处理 -------------------------------------------------
     # thinking 快捷字段等价于 when_thinking_enabled["thinking"]，先合并出 effective_wte。
-    has_thinking_settings = (
-        model_config.when_thinking_enabled is not None or model_config.thinking is not None
-    )
-    effective_wte: dict[str, Any] = (
-        dict(model_config.when_thinking_enabled) if model_config.when_thinking_enabled else {}
-    )
+    has_thinking_settings = model_config.when_thinking_enabled is not None or model_config.thinking is not None
+    effective_wte: dict[str, Any] = dict(model_config.when_thinking_enabled) if model_config.when_thinking_enabled else {}
     if model_config.thinking is not None:
         merged_thinking = {**(effective_wte.get("thinking") or {}), **model_config.thinking}
         effective_wte = {**effective_wte, "thinking": merged_thinking}
 
     if thinking_enabled and has_thinking_settings:
         if not model_config.supports_thinking:
-            raise ValueError(
-                f"模型 {name!r} 不支持 thinking。请在 config.yaml 中为其设置 supports_thinking: true。"
-            ) from None
+            raise ValueError(f"模型 {name!r} 不支持 thinking。请在 config.yaml 中为其设置 supports_thinking: true。") from None
         if effective_wte:
             model_settings_from_config.update(effective_wte)
 
@@ -211,11 +206,7 @@ def create_chat_model(
                 {"thinking": {"type": "disabled"}},
             )
             model_settings_from_config["reasoning_effort"] = "minimal"
-        elif has_thinking_settings and (
-            disable_chat_template_kwargs := _vllm_disable_chat_template_kwargs(
-                effective_wte.get("extra_body", {}).get("chat_template_kwargs") or {}
-            )
-        ):
+        elif has_thinking_settings and (disable_chat_template_kwargs := _vllm_disable_chat_template_kwargs(effective_wte.get("extra_body", {}).get("chat_template_kwargs") or {})):
             # vLLM 用 chat_template_kwargs 开关 thinking
             model_settings_from_config["extra_body"] = _deep_merge_dicts(
                 model_settings_from_config.get("extra_body"),

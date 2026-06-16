@@ -4,8 +4,8 @@
 捕获工具执行中的异常，将其转换为错误 ToolMessage，
 防止整个 Agent 运行因单个工具失败而中止。
 """
+
 import logging
-from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage

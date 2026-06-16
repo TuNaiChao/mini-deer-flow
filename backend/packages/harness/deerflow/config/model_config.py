@@ -5,7 +5,9 @@
 由于 model_config = ConfigDict(extra="allow")，
 可以传递任意额外的提供者特定参数（如 api_key, temperature 等）。
 """
+
 from typing import Any
+
 from pydantic import BaseModel, ConfigDict
 
 

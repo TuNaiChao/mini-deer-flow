@@ -3,6 +3,7 @@
 
 从 config.yaml 加载所有配置，支持环境变量展开（$VAR 语法）
 """
+
 import os
 import re
 from pathlib import Path
@@ -35,24 +36,30 @@ class AppConfig(BaseModel):
     """工具分组"""
 
     # --- 记忆系统 ---
-    memory: dict[str, Any] = Field(default_factory=lambda: {
-        "enabled": True,
-        "max_facts": 100,
-        "debounce_seconds": 30,
-    })
+    memory: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "max_facts": 100,
+            "debounce_seconds": 30,
+        }
+    )
     """记忆系统配置"""
 
     # --- 子代理配置 ---
-    subagents: dict[str, Any] = Field(default_factory=lambda: {
-        "enabled": True,
-        "max_concurrent": 3,
-    })
+    subagents: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": True,
+            "max_concurrent": 3,
+        }
+    )
     """子代理系统配置"""
 
     # --- 沙箱配置 ---
-    sandbox: dict[str, Any] = Field(default_factory=lambda: {
-        "use": "deerflow.sandbox.local:LocalSandboxProvider",
-    })
+    sandbox: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "use": "deerflow.sandbox.local:LocalSandboxProvider",
+        }
+    )
     """代码执行沙箱配置 （必须配置）"""
 
     # --- 其他可选配置 ---
@@ -98,7 +105,8 @@ def _expand_env_vars(value: Any) -> Any:
         def replacer(match):
             var_name = match.group(1) or match.group(2)
             return os.environ.get(var_name, match.group(0))
-        return re.sub(r'\$(\w+)|\$\{(\w+)\}', replacer, value)
+
+        return re.sub(r"\$(\w+)|\$\{(\w+)\}", replacer, value)
     elif isinstance(value, dict):
         return {k: _expand_env_vars(v) for k, v in value.items()}
     elif isinstance(value, list):

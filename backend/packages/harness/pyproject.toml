@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Deer-Flow Agent Harness"
 requires-python = ">=3.12"
 dependencies = [
-    "langgraph>=1.0.0",
+    # langgraph 下限锁到 1.1：需要 Runtime / ToolRuntime / configurable["__pregel_runtime"]
+    # / Command(goto=END) / get_config 等 API（红线 #26）。当前锁得 1.2.5。
+    "langgraph>=1.1",
     "langgraph-cli[inmem]>=0.4.0",
     "langchain>=1.0.0",
     "langchain-openai>=0.3.0",
@@ -14,6 +16,21 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
 ]
+
+# 可选依赖：对应功能模块用 try/except ImportError 软加载（红线 #24）。
+# 未安装对应 extra 时，模块回退到内存/默认实现，并给出可操作的安装提示。
+# 每个模块的 install hint 必须与此处 extras 命名一致。
+[project.optional-dependencies]
+sqlite = ["langgraph-checkpoint-sqlite>=2.0"]
+postgres = [
+    "asyncpg>=0.29",
+    "langgraph-checkpoint-postgres>=2.0",
+    "psycopg[binary]>=3.3",
+]
+aiosqlite = ["aiosqlite>=0.19"]
+mcp = ["langchain-mcp-adapters>=0.2"]
+tiktoken = ["tiktoken>=0.7"]
+uploads = ["markitdown>=0.0.1"]
 
 [build-system]
 requires = ["hatchling"]

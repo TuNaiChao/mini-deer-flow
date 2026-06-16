@@ -3,6 +3,7 @@
 
 在第一个完整的对话轮次后，自动生成线程标题。
 """
+
 import logging
 
 from langchain.agents.middleware import AgentMiddleware

@@ -8,6 +8,7 @@ get_available_tools() 是所有工具的统一入口，被 make_lead_agent 调�
   3. MCP 工具 —— 从 MCP 服务器加载（阶段5详解）
   4. 子代理 task 工具 —— 仅 subagent_enabled 时（阶段5详解）
 """
+
 import logging
 
 from langchain.tools import BaseTool
@@ -74,4 +75,4 @@ def get_available_tools(
     #     except ImportError:
     #         logger.warning("MCP 模块不可用。安装 langchain-mcp-adapters 以启用 MCP 工具。")
 
-    return tools 
+    return tools

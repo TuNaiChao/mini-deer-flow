@@ -6,6 +6,7 @@
 
 这是必须排在最后的中间件——确保其他中间件已经处理完毕。
 """
+
 import logging
 
 from langchain.agents.middleware import AgentMiddleware
@@ -15,7 +16,8 @@ logger = logging.getLogger(__name__)
 
 # LangGraph 控制流：导入 Command 与 END 终点常量（如果可用）
 try:
-    from langgraph.types import Command, END
+    from langgraph.types import END, Command
+
     _HAS_LANGGRAPH_COMMAND = True
 except ImportError:
     Command = None

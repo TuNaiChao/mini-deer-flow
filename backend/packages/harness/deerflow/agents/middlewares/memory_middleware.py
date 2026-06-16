@@ -4,6 +4,7 @@
 在每个 Agent 轮次完成后，将对话内容加入记忆更新队列。
 实际的记忆提取在后台异步执行。
 """
+
 import logging
 
 from langchain.agents.middleware import AgentMiddleware
@@ -43,22 +44,28 @@ class MemoryMiddleware(AgentMiddleware):
         for msg in messages[-4:]:  # 只看最近几条消息
             msg_type = getattr(msg, "type", "")
             if msg_type == "human":
-                conversation_pair.append({
-                    "role": "user",
-                    "content": getattr(msg, "content", ""),
-                })
+                conversation_pair.append(
+                    {
+                        "role": "user",
+                        "content": getattr(msg, "content", ""),
+                    }
+                )
             elif msg_type == "ai" and conversation_pair:
                 # 只收集有历史上下文的 AI 回复
-                conversation_pair.append({
-                    "role": "assistant",
-                    "content": getattr(msg, "content", ""),
-                })
+                conversation_pair.append(
+                    {
+                        "role": "assistant",
+                        "content": getattr(msg, "content", ""),
+                    }
+                )
 
         if len(conversation_pair) >= 2:
-            self._update_queue.append({
-                "agent_name": self.agent_name,
-                "messages": conversation_pair,
-            })
+            self._update_queue.append(
+                {
+                    "agent_name": self.agent_name,
+                    "messages": conversation_pair,
+                }
+            )
             logger.debug(f"对话已加入记忆队列 (队列长度: {len(self._update_queue)})")
 
         return None

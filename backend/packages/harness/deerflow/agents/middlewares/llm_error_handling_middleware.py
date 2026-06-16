@@ -4,6 +4,7 @@ LLM 错误处理中间件
 包装模型调用，将 API 错误转换为兜底回复，
 允许 Agent 优雅降级而非崩溃。
 """
+
 import logging
 import time
 
@@ -62,10 +63,13 @@ class LLMErrorHandlingMiddleware(AgentMiddleware):
             except Exception as e:
                 kind = _classify(e)
                 if kind == "retryable" and attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
+                    delay = self.base_delay * (2**attempt)
                     logger.warning(
                         "可重试错误 (%d/%d), %.1fs 后重试: %s",
-                        attempt + 1, self.max_retries, delay, e,
+                        attempt + 1,
+                        self.max_retries,
+                        delay,
+                        e,
                     )
                     time.sleep(delay)
                     continue
@@ -83,10 +87,13 @@ class LLMErrorHandlingMiddleware(AgentMiddleware):
             except Exception as e:
                 kind = _classify(e)
                 if kind == "retryable" and attempt < self.max_retries - 1:
-                    delay = self.base_delay * (2 ** attempt)
+                    delay = self.base_delay * (2**attempt)
                     logger.warning(
                         "可重试错误 (%d/%d), %.1fs 后重试: %s",
-                        attempt + 1, self.max_retries, delay, e,
+                        attempt + 1,
+                        self.max_retries,
+                        delay,
+                        e,
                     )
                     await asyncio.sleep(delay)
                     continue

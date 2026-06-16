@@ -7,6 +7,7 @@
 注意：这个工具本身不需要 runtime 参数——它只负责"声明一次澄清请求"，
 真正的中断逻辑由 ClarificationMiddleware 在阶段3实现。
 """
+
 from typing import Literal
 
 from langchain.tools import tool

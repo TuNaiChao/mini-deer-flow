@@ -4,6 +4,7 @@
 检测 Agent 是否陷入重复工具调用的循环，
 在检测到循环时强制 Agent 给出文本回复。
 """
+
 import hashlib
 import json
 import logging
@@ -59,10 +60,12 @@ class LoopDetectionMiddleware(AgentMiddleware):
         # 提取名称+参数的规范形式
         normalized = []
         for tc in tool_calls:
-            normalized.append({
-                "name": tc.get("name", ""),
-                "args": json.dumps(tc.get("args", {}), sort_keys=True),
-            })
+            normalized.append(
+                {
+                    "name": tc.get("name", ""),
+                    "args": json.dumps(tc.get("args", {}), sort_keys=True),
+                }
+            )
 
         serialized = json.dumps(normalized, sort_keys=True)
         return hashlib.md5(serialized.encode()).hexdigest()[:12]
@@ -104,9 +107,7 @@ class LoopDetectionMiddleware(AgentMiddleware):
 
         if repeat_count >= self.hard_limit:
             # 硬限制：移除工具调用，强制文本回复
-            logger.warning(
-                f"[{thread_id}] 工具调用检测到硬循环 ({repeat_count}次)，强制文本回复"
-            )
+            logger.warning(f"[{thread_id}] 工具调用检测到硬循环 ({repeat_count}次)，强制文本回复")
             # ⚠️ 关键：AIMessage 是 Pydantic v2 的冻结模型，不能原地改字段
             # （last_msg.tool_calls = [] 会抛 ValidationError）。
             # 必须用 model_copy(update={...}) 生成一个清空了工具调用的新消息。
@@ -114,22 +115,14 @@ class LoopDetectionMiddleware(AgentMiddleware):
             cleared = last_msg.model_copy(
                 update={
                     "tool_calls": [],
-                    "additional_kwargs": {
-                        k: v
-                        for k, v in (last_msg.additional_kwargs or {}).items()
-                        if k != "tool_calls"
-                    },
+                    "additional_kwargs": {k: v for k, v in (last_msg.additional_kwargs or {}).items() if k != "tool_calls"},
                 }
             )
             return {"messages": [cleared]}
 
         elif repeat_count >= self.warn_threshold:
             # 警告阈值：下一轮提示模型
-            warning = (
-                f"⚠️ 你已重复执行相同的工具调用 {repeat_count} 次。"
-                f"请检查执行结果，考虑不同的方法或告知用户当前状况。"
-                f"不要再次重复相同的工具调用。"
-            )
+            warning = f"⚠️ 你已重复执行相同的工具调用 {repeat_count} 次。请检查执行结果，考虑不同的方法或告知用户当前状况。不要再次重复相同的工具调用。"
             self._pending_warnings[thread_id] = warning
             logger.info(f"[{thread_id}] 循环警告: {repeat_count}次")
 
@@ -149,9 +142,7 @@ class LoopDetectionMiddleware(AgentMiddleware):
                 content=f"<loop_warning>{warning}</loop_warning>",
             )
             # 追加到消息列表末尾
-            modified_request = request.override(
-                messages=request.messages + [warning_msg]
-            )
+            modified_request = request.override(messages=request.messages + [warning_msg])
             return handler(modified_request)
 
         return handler(request)

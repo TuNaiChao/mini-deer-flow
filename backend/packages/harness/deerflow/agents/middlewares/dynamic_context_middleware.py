@@ -10,6 +10,7 @@
 
 基础系统提示词（system_message）保持不变，仍可被 LLM 缓存复用。
 """
+
 from datetime import datetime
 
 from langchain.agents.middleware import AgentMiddleware

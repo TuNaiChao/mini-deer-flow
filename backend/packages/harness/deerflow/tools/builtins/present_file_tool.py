@@ -6,6 +6,7 @@ present_files 工具
 
 这是"需要访问线程上下文"的工具范例——通过 runtime 参数拿到 thread_id 和 state。
 """
+
 from langchain.tools import tool
 from langgraph.types import Command
 
@@ -31,9 +32,7 @@ def present_file_tool(
     """
     # 1. 校验路径在允许范围内
     if not filepath.startswith(OUTPUTS_VIRTUAL_PREFIX):
-        raise ValueError(
-            f"只能展示 {OUTPUTS_VIRTUAL_PREFIX}/ 下的文件，收到: {filepath}"
-        )
+        raise ValueError(f"只能展示 {OUTPUTS_VIRTUAL_PREFIX}/ 下的文件，收到: {filepath}")
 
     # 2. 通过 runtime.state 拿到当前线程状态
     if runtime.state is None:

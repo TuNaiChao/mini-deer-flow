@@ -1,4 +1,25 @@
 {
-  "mcp_servers": [],
-  "enabled_skills": []
+  "# NOTE": "mcp_servers 与 enabled_skills 是 mini 的扩展配置 schema（下划线 / list 形式，见 config/extensions_config.py）。 DeerFlow 上游用 mcpServers/skills 驼峰 map；本文件遵循 mini 现状解析逻辑。值为 $VAR 形式的会被当作环境变量占位（启用前请配置）。所有条目默认 enabled=false，需显式开启。",
+  "mcp_servers": [
+    {
+      "name": "example-stdio",
+      "enabled": false,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "some-mcp-server"],
+      "env": {
+        "API_KEY": "$EXAMPLE_MCP_API_KEY"
+      }
+    },
+    {
+      "name": "example-sse",
+      "enabled": false,
+      "type": "sse",
+      "url": "http://localhost:9100/sse",
+      "headers": {
+        "Authorization": "Bearer $EXAMPLE_MCP_TOKEN"
+      }
+    }
+  ],
+  "enabled_skills": ["example"]
 }
