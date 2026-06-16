@@ -5,7 +5,7 @@ description = "Deer-Flow Agent Harness"
 requires-python = ">=3.12"
 dependencies = [
     "langgraph>=1.0.0",
-    "langgraph-cli>=0.4.0",
+    "langgraph-cli[inmem]>=0.4.0",
     "langchain>=1.0.0",
     "langchain-openai>=0.3.0",
     "langchain-deepseek>=0.1.0",

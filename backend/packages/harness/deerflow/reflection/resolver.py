@@ -74,9 +74,20 @@ def resolve_class(path: str, base_class: type[T] | None = None) -> type[T]:
     Returns:
         类对象（未实例化）
     """
-    cls = resolve_variable(path, expected_type=type)
+    cls = resolve_variable(path)
+    # 确保解析得到的确实是一个类（而非实例或函数）
+    if not isinstance(cls, type):
+        raise TypeError(
+            f"{path} 解析得到的不是类，而是 {type(cls).__name__}"
+        )
     if base_class is not None and not issubclass(cls, base_class):
         raise TypeError(
             f"{cls.__name__} 不是 {base_class.__name__} 的子类"
         )
     return cls
+
+
+# notes:
+# "它是不是一个类"             isinstance(x, type) 
+# "它是不是某类的实例(实物)"	isinstance(x, 某类)
+# "它是不是某类的子类(亲戚)"	issubclass(类, 某类)

@@ -14,7 +14,3 @@ members = ["packages/harness"]
 
 [tool.uv.sources]
 deerflow-harness = { workspace = true }
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
