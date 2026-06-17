@@ -1,4 +1,4 @@
-# testing-setup.md — 测试怎么跑通的（环境踩坑 + hermetic 约定）
+# 2. testing-setup.md — 测试环境与 hermetic 约定
 
 > 一句话定位：记录把 mini-deer-flow 的测试**从「一个都跑不了」跑到「全绿」**过程中踩到的环境坑与解法，以及由此确立的 hermetic 测试约定。这份经验不是显而易见的——它卡了相当长时间，根因藏在 Python 3.14 的一处 site.py 改动里。
 

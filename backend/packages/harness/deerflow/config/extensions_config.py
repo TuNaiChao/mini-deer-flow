@@ -73,3 +73,18 @@ class ExtensionsConfig:
     def get_enabled_mcp_servers(self) -> dict[str, McpServerConfig]:
         """返回 {server_name: McpServerConfig} 仅包含 enabled=True 的服务器。"""
         return {s.name: s for s in self.mcp_servers if s.enabled}
+
+    def is_skill_enabled(self, skill_name: str, skill_category: str = "public") -> bool:
+        """判断某个技能是否启用（对齐 deer 语义）。
+
+        显式列入 enabled_skills → True；未显式配置的 public / custom 技能默认启用
+        （对齐 deer：未配置即放行，开箱即用）。M14 skills 落地后改为每次重读
+        extensions_config.json 的精确 enabled 状态。
+
+        Args:
+            skill_name: 技能名（目录名）。
+            skill_category: 技能类别（public 或 custom）。
+        """
+        if skill_name in self.enabled_skills:
+            return True
+        return skill_category in ("public", "custom")

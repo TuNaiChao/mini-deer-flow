@@ -1,4 +1,4 @@
-# 模型工厂（models）学习文档
+# 6. models.md — 模型工厂（thinking / tracing）
 
 > 对应模块：**M-models**（Phase 1）
 > 源码：`backend/packages/harness/deerflow/models/factory.py`、`models/__init__.py`

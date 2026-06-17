@@ -69,11 +69,11 @@ def build_middlewares(
 
     cfg = app_config or get_app_config()
 
-    # 各功能开关从配置读取（配置驱动）
-    # config.yaml 中 title/memory/loop_detection 都是 dict 类型，用 .get() 取值
-    enable_title = cfg.title.get("enabled", True) if isinstance(cfg.title, dict) else True
-    enable_memory = cfg.memory.get("enabled", True) if isinstance(cfg.memory, dict) else True
-    enable_loop_detection = cfg.loop_detection.get("enabled", True) if isinstance(cfg.loop_detection, dict) else True
+    # 各功能开关从配置读取（配置驱动，M0 类型化后子配置都是 pydantic model，
+    # 直接访问 .enabled 属性即可）
+    enable_title = cfg.title.enabled
+    enable_memory = cfg.memory.enabled
+    enable_loop_detection = cfg.loop_detection.enabled
 
     middlewares: list[AgentMiddleware] = []
 

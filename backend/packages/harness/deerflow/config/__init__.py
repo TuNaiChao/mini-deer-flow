@@ -1,21 +1,52 @@
-"""
-配置模块
+"""配置模块。
 
-提供统一的配置访问接口
+提供统一的配置访问接口。所有子配置已强类型化（pydantic BaseModel），见各 ``*_config.py``。
 """
 
 import os
 
-from .app_config import AppConfig, get_app_config, reload_config
+from .app_config import AppConfig, get_app_config, load_config_from_yaml, reload_config
+from .checkpointer_config import CheckpointerConfig
+from .database_config import DatabaseConfig
+from .extensions_config import ExtensionsConfig, McpServerConfig
+from .loop_detection_config import LoopDetectionConfig
+from .memory_config import MemoryConfig
 from .model_config import ModelConfig
-from .paths import PROJECT_ROOT, get_config_file, get_env_file
+from .paths import (
+    PROJECT_ROOT,
+    Paths,
+    existing_project_file,
+    get_config_file,
+    get_env_file,
+    get_paths,
+    project_root,
+    resolve_path,
+    runtime_home,
+)
+from .reload_boundary import (
+    STARTUP_ONLY_FIELDS,
+    format_field_description,
+    is_startup_only_field,
+    iter_startup_only_field_paths,
+)
+from .run_events_config import RunEventsConfig
+from .safety_finish_reason_config import SafetyDetectorConfig, SafetyFinishReasonConfig
+from .sandbox_config import SandboxConfig, VolumeMountConfig
+from .skill_evolution_config import SkillEvolutionConfig
+from .skills_config import SkillsConfig
+from .stream_bridge_config import StreamBridgeConfig
+from .subagents_config import SubagentsAppConfig
+from .summarization_config import ContextSize, SummarizationConfig
+from .title_config import TitleConfig
+from .token_usage_config import TokenUsageConfig
+from .tool_output_config import ToolOutputConfig
+from .tool_search_config import ToolSearchConfig
 
 
 def get_enabled_tracing_providers() -> list[str]:
     """返回显式启用的追踪 provider 列表。
 
-    通过环境变量 LANGSMITH_TRACING / LANGFUSE_TRACING 控制。
-    返回空列表表示无追踪。
+    通过环境变量 LANGSMITH_TRACING / LANGFUSE_TRACING 控制。返回空列表表示无追踪。
     """
     providers = []
     if os.getenv("LANGSMITH_TRACING", "").lower() == "true":
@@ -56,13 +87,52 @@ def get_tracing_config():
 
 
 __all__ = [
+    # app config
     "AppConfig",
     "get_app_config",
+    "load_config_from_yaml",
     "reload_config",
+    # model
     "ModelConfig",
+    # 子配置
+    "CheckpointerConfig",
+    "DatabaseConfig",
+    "LoopDetectionConfig",
+    "MemoryConfig",
+    "RunEventsConfig",
+    "SafetyDetectorConfig",
+    "SafetyFinishReasonConfig",
+    "SandboxConfig",
+    "SkillEvolutionConfig",
+    "SkillsConfig",
+    "StreamBridgeConfig",
+    "SubagentsAppConfig",
+    "SummarizationConfig",
+    "ContextSize",
+    "TitleConfig",
+    "TokenUsageConfig",
+    "ToolOutputConfig",
+    "ToolSearchConfig",
+    "VolumeMountConfig",
+    # extensions
+    "ExtensionsConfig",
+    "McpServerConfig",
+    # paths
     "PROJECT_ROOT",
+    "Paths",
+    "existing_project_file",
     "get_config_file",
     "get_env_file",
+    "get_paths",
+    "project_root",
+    "resolve_path",
+    "runtime_home",
+    # reload boundary
+    "STARTUP_ONLY_FIELDS",
+    "format_field_description",
+    "is_startup_only_field",
+    "iter_startup_only_field_paths",
+    # tracing
     "get_enabled_tracing_providers",
     "get_tracing_config",
     "validate_enabled_tracing_providers",

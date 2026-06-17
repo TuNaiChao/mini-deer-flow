@@ -19,11 +19,14 @@ mcp = ["deerflow-harness[mcp]"]
 
 # 开发依赖：测试、lint。blocking-IO gate 用 inline 实现（见
 # test/support/detectors/blocking_io_runtime.py），无需外部库。
+# langgraph-checkpoint-sqlite：sqlite checkpointer 的真实 Saver，测试做 aput/aget_tuple
+# 往返时需要它（红线 #24：它是可选 extra，生产 memory 模式不需，故放 dev 而非 core）。
 [dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
+    "langgraph-checkpoint-sqlite>=2.0",
 ]
 
 [tool.uv.workspace]

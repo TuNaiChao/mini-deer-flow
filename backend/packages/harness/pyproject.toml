@@ -15,6 +15,14 @@ dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    # SQLAlchemy 是 app 持久化层（runs/threads 元数据）的 ORM 框架，core 依赖：
+    # memory 模式下 engine 是 no-op（不创建连接），但模块导入与 ORM 模型定义本身
+    # 需要 sqlalchemy。[asyncio] extra 提供 async engine/session API。
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    # SQLite 异步驱动：sqlite 后端的 create_async_engine("sqlite+aiosqlite://...")
+    # 在建引擎时需要。memory/postgres 模式不加载它，但不安装则 sqlite 后端不可用。
+    # 对齐 deer-flow（core 依赖，非可选）。
+    "aiosqlite>=0.19",
 ]
 
 # 可选依赖：对应功能模块用 try/except ImportError 软加载（红线 #24）。
@@ -26,6 +34,7 @@ postgres = [
     "asyncpg>=0.29",
     "langgraph-checkpoint-postgres>=2.0",
     "psycopg[binary]>=3.3",
+    "psycopg-pool>=3.3",
 ]
 aiosqlite = ["aiosqlite>=0.19"]
 mcp = ["langchain-mcp-adapters>=0.2"]
