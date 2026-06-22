@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .checkpointer_config import CheckpointerConfig
+from .circuit_breaker_config import CircuitBreakerConfig
 from .database_config import DatabaseConfig
 from .loop_detection_config import LoopDetectionConfig
 from .memory_config import MemoryConfig
@@ -33,6 +34,7 @@ from .title_config import TitleConfig
 from .token_usage_config import TokenUsageConfig
 from .tool_output_config import ToolOutputConfig
 from .tool_search_config import ToolSearchConfig
+from .uploads_config import UploadsConfig
 
 
 class AppConfig(BaseModel):
@@ -72,6 +74,8 @@ class AppConfig(BaseModel):
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig, description="工具输出预算保护配置")
     tool_search: ToolSearchConfig = Field(default_factory=ToolSearchConfig, description="工具搜索 / 延迟加载配置")
 
+    uploads: UploadsConfig = Field(default_factory=UploadsConfig, description="文件上传 + markitdown 转换配置（M23）")
+
     # --- 技能 ---
     skills: SkillsConfig = Field(default_factory=SkillsConfig, description="技能系统配置")
     skill_evolution: SkillEvolutionConfig = Field(
@@ -94,6 +98,10 @@ class AppConfig(BaseModel):
     safety_finish_reason: SafetyFinishReasonConfig = Field(
         default_factory=SafetyFinishReasonConfig,
         description="provider 安全 finish_reason 拦截中间件配置",
+    )
+    circuit_breaker: CircuitBreakerConfig = Field(
+        default_factory=CircuitBreakerConfig,
+        description="LLM 调用熔断配置（连续失败短路，M16 LLMErrorHandlingMiddleware）",
     )
 
     # --- 沙箱（基础设施，需重启）---
@@ -165,6 +173,21 @@ class AppConfig(BaseModel):
             if m.name == name:
                 return m
         return None
+
+    def get_tool_config(self, name: str) -> dict[str, Any] | None:
+        """按名称查找工具配置（对应 config.yaml 中 tools[].name）。
+
+        mini 的 ``tools`` 当前是 ``list[dict]``（M15 落地时类型化为 ToolConfig），
+        所以这里返回**原始 dict**——调用方用 ``config.get("api_key", default)``
+        读「name/group/use」之外的额外字段。deer 用 pydantic ToolConfig 的
+        ``model_extra`` 承载这些额外字段；mini 直接读 dict，等价。
+
+        Args:
+            name: 工具名（如 ``"web_search"`` / ``"web_fetch"`` / ``"image_search"``）。
+        Returns:
+            匹配的工具配置 dict；未找到时返回 None。
+        """
+        return next((t for t in self.tools if isinstance(t, dict) and t.get("name") == name), None)
 
 
 # --- 全局配置单例 ---

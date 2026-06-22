@@ -5,15 +5,27 @@
 
 import os
 
+from .agents_config import (
+    AGENT_NAME_PATTERN,
+    SOUL_FILENAME,
+    AgentConfig,
+    list_custom_agents,
+    load_agent_config,
+    load_agent_soul,
+    resolve_agent_dir,
+    validate_agent_name,
+)
 from .app_config import AppConfig, get_app_config, load_config_from_yaml, reload_config
 from .checkpointer_config import CheckpointerConfig
+from .circuit_breaker_config import CircuitBreakerConfig
 from .database_config import DatabaseConfig
-from .extensions_config import ExtensionsConfig, McpServerConfig
+from .extensions_config import ExtensionsConfig, McpOAuthConfig, McpServerConfig
 from .loop_detection_config import LoopDetectionConfig
 from .memory_config import MemoryConfig
 from .model_config import ModelConfig
 from .paths import (
     PROJECT_ROOT,
+    VIRTUAL_PATH_PREFIX,
     Paths,
     existing_project_file,
     get_config_file,
@@ -92,10 +104,20 @@ __all__ = [
     "get_app_config",
     "load_config_from_yaml",
     "reload_config",
+    # agents_config（自定义 agent，M22）
+    "AGENT_NAME_PATTERN",
+    "SOUL_FILENAME",
+    "AgentConfig",
+    "list_custom_agents",
+    "load_agent_config",
+    "load_agent_soul",
+    "resolve_agent_dir",
+    "validate_agent_name",
     # model
     "ModelConfig",
     # 子配置
     "CheckpointerConfig",
+    "CircuitBreakerConfig",
     "DatabaseConfig",
     "LoopDetectionConfig",
     "MemoryConfig",
@@ -116,9 +138,11 @@ __all__ = [
     "VolumeMountConfig",
     # extensions
     "ExtensionsConfig",
+    "McpOAuthConfig",
     "McpServerConfig",
     # paths
     "PROJECT_ROOT",
+    "VIRTUAL_PATH_PREFIX",
     "Paths",
     "existing_project_file",
     "get_config_file",

@@ -1,145 +1,165 @@
-"""
-中间件模块——Agent 的行为骨架
+"""中间件模块——Agent 的行为骨架（M16，23 步生产中间件链）。
 
-提供中间件的管理和装配。
-中间件通过 AgentMiddleware hook 机制工作，
-按 build_middlewares() 中的顺序装配。
+``build_middlewares`` 按 ALIGNMENT_OUTLINE Part D 的 23 步顺序装配中间件链。顺序是**契约**
+不是建议——部分中间件有硬性先后约束（红线）：
+
+  - **#14 ClarificationMiddleware 永远最后**：它能中断整次执行，须在所有其它中间件处理后生效。
+  - **#2 ThreadData 先于 #4 Sandbox**：SandboxMiddleware / ToolOutputBudget 依赖 thread_data 里
+    已写好的路径。
+  - **#3 Uploads 先于 #4 Sandbox**：上传目录要在沙箱挂载前算好。
+  - **#18 DeferredToolFilter 在 #19 SubagentLimit 前**：延迟过滤要在子代理截断前定 schema。
+  - **所有 ``wrap_tool_call`` / ``wrap_model_call`` 必须 ``raise GraphBubbleUp``**（红线 #15）：
+    handler 抛 LangGraph 控制流信号（interrupt/pause/resume/Command goto）必须原样上抛，
+    否则 Clarification 的中断、subagent interrupt 全失效。
+
+链分两段：
+  - **共享段**（``build_lead_runtime_middlewares``，步骤 1-9）：lead 与 subagent 都要——
+    ToolOutputBudget / ThreadData / Uploads[仅 lead] / Sandbox / DanglingToolCall / LLMErrorHandling
+    / [Guardrail 跳过] / SandboxAudit / ToolErrorHandling。
+  - **lead-only 段**（``build_middlewares`` 本函数，步骤 10-23）：DynamicContext / SkillActivation
+    / Summarization / Todo[plan_mode] / TokenUsage / Title / Memory / ViewImage[vision]
+    / DeferredToolFilter / SubagentLimit / LoopDetection / custom / SafetyFinishReason / Clarification。
 """
+
+from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # 仅类型注解用，运行时不 import（避免循环导入 + 保持轻量）
+    # 仅类型注解用，运行时不 import（避免循环导入 + 保持轻量）。
+    from langchain.agents.middleware import AgentMiddleware
     from langchain_core.runnables import RunnableConfig
 
     from deerflow.config.app_config import AppConfig
-
-from langchain.agents.middleware import AgentMiddleware
-
-from .clarification_middleware import ClarificationMiddleware
-from .dynamic_context_middleware import DynamicContextMiddleware
-from .llm_error_handling_middleware import LLMErrorHandlingMiddleware
-from .loop_detection_middleware import LoopDetectionMiddleware
-from .memory_middleware import MemoryMiddleware
-from .title_middleware import TitleMiddleware
-from .tool_error_handling_middleware import ToolErrorHandlingMiddleware
-
-# ViewImageMiddleware 在阶段5 §步骤6 实现。为了让本阶段的 build_middlewares()
-# 提前具备多模态条件挂载能力（避免阶段5 还要回头改本文件），这里用 try/except
-# 做前向兼容：阶段5 创建该文件后即自动生效，阶段3 暂未创建时也不影响运行。
-try:
-    from .view_image_middleware import ViewImageMiddleware
-
-    _HAS_VIEW_IMAGE_MIDDLEWARE = True
-except ImportError:
-    ViewImageMiddleware = None  # type: ignore[assignment,misc]
-    _HAS_VIEW_IMAGE_MIDDLEWARE = False
+    from deerflow.tools.builtins.tool_search import DeferredToolSetup
 
 
 def build_middlewares(
-    config: "RunnableConfig | None" = None,
+    config: RunnableConfig | None = None,
     model_name: str | None = None,
-    *,
-    app_config: "AppConfig | None" = None,
+    agent_name: str | None = None,
     custom_middlewares: list[AgentMiddleware] | None = None,
+    *,
+    app_config: AppConfig | None = None,
+    available_skills: set[str] | None = None,
+    deferred_setup: DeferredToolSetup | None = None,
 ) -> list[AgentMiddleware]:
-    """
-    按严格顺序装配中间件链。
-
-    顺序的设计理由见下面的注释。
-    这是实际项目的标准装配方式——列表 append + 条件判断，
-    而非链式对象或注册表模式。各功能开关从 app_config 读取（配置驱动）。
+    """按 Part D 的 23 步严格顺序装配中间件链。
 
     Args:
-        config: LangGraph 运行时配置（含 configurable 选项，如 is_plan_mode）
-        model_name: 解析出的模型名（用于按模型能力决定是否挂某些中间件）
-        app_config: 应用配置；为 None 时读全局 get_app_config()
-        custom_middlewares: 额外的自定义中间件（插在 Clarification 之前）
+        config: LangGraph 运行时配置（含 configurable：is_plan_mode / subagent_enabled /
+            max_concurrent_subagents）。
+        model_name: 解析出的模型名（按 supports_vision 决定是否挂 ViewImageMiddleware）。
+        agent_name: 自定义 agent 名；MemoryMiddleware / DynamicContextMiddleware 用它做
+            per-agent 记忆 / 上下文。
+        custom_middlewares: 额外自定义中间件（插在 LoopDetection 与 SafetyFinishReason 之间，
+            Clarification 之前）。
+        app_config: 显式配置；None 用 ``get_app_config()``。
+        available_skills: 当前 agent 可见的技能白名单（SkillActivationMiddleware 据此过滤）。
+        deferred_setup: 延迟 MCP 工具装配（tool_search 启用才有）；非空则挂 DeferredToolFilter。
 
     Returns:
-        按顺序排列的中间件列表
-
-    Note:
-        本教学版只覆盖 7 个核心中间件。真实项目的 build_middlewares（位于
-        agents/lead_agent/agent.py:270-377 + tool_error_handling_middleware.py
-        的 build_lead_runtime_middlewares）覆盖约 19 个中间件，包括沙箱、
-        摘要、工具预算、延迟工具过滤、子代理限流等，全部从 app_config 驱动。
+        按顺序排列的中间件列表（Clarification 永远末位）。
     """
-    from ...config import get_app_config
+    from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+    from deerflow.agents.middlewares.dynamic_context_middleware import DynamicContextMiddleware
+    from deerflow.agents.middlewares.loop_detection_middleware import LoopDetectionMiddleware
+    from deerflow.agents.middlewares.memory_middleware import MemoryMiddleware
+    from deerflow.agents.middlewares.skill_activation_middleware import SkillActivationMiddleware
+    from deerflow.agents.middlewares.summarization_middleware import _create_summarization_middleware
+    from deerflow.agents.middlewares.title_middleware import TitleMiddleware
+    from deerflow.agents.middlewares.tool_error_handling_middleware import build_lead_runtime_middlewares
+    from deerflow.config import get_app_config
 
-    cfg = app_config or get_app_config()
+    resolved_app_config = app_config or get_app_config()
 
-    # 各功能开关从配置读取（配置驱动，M0 类型化后子配置都是 pydantic model，
-    # 直接访问 .enabled 属性即可）
-    enable_title = cfg.title.enabled
-    enable_memory = cfg.memory.enabled
-    enable_loop_detection = cfg.loop_detection.enabled
+    # 步骤 1-9：lead/subagent 共享前置中间件（含 Guardrail 跳过位）。
+    middlewares = build_lead_runtime_middlewares(app_config=resolved_app_config, lazy_init=True)
 
-    middlewares: list[AgentMiddleware] = []
+    # --- 步骤 10：DynamicContextMiddleware ---
+    # before_agent 里把日期 + 记忆经 ID-swap 注入首条 HumanMessage（保持系统提示静态 → prefix-cache 复用）。
+    middlewares.append(DynamicContextMiddleware(agent_name=agent_name, app_config=resolved_app_config))
 
-    # === 核心基础设施层 ===
+    # --- 步骤 11：SkillActivationMiddleware ---
+    # 用户输 /skill-name 时把对应 SKILL.md 注入当次模型调用。
+    middlewares.append(SkillActivationMiddleware(available_skills=available_skills, app_config=resolved_app_config))
 
-    # 0. LLM 错误处理（包装模型调用，捕获 API 错误）
-    middlewares.append(LLMErrorHandlingMiddleware())
+    # --- 步骤 12：SummarizationMiddleware（可选，config 驱动）---
+    summarization_middleware = _create_summarization_middleware(app_config=resolved_app_config)
+    if summarization_middleware is not None:
+        middlewares.append(summarization_middleware)
 
-    # 1. 动态上下文（在每个轮次前注入日期/记忆信息）
-    #    必须在模型调用之前执行
-    middlewares.append(DynamicContextMiddleware())
+    # --- 步骤 13：TodoMiddleware（plan_mode）---
+    cfg = _get_runtime_config(config)
+    is_plan_mode = cfg.get("is_plan_mode", False)
+    if is_plan_mode:
+        from deerflow.agents.middlewares.todo_middleware import TodoMiddleware
 
-    # === 工具处理层 ===
+        middlewares.append(TodoMiddleware())
 
-    # 2. 工具错误处理（捕获工具异常，转为错误消息）
-    #    在 LLM 错误处理之后，澄清拦截之前
-    middlewares.append(ToolErrorHandlingMiddleware())
+    # --- 步骤 14：TokenUsageMiddleware（token_usage.enabled）---
+    if resolved_app_config.token_usage.enabled:
+        from deerflow.agents.middlewares.token_usage_middleware import TokenUsageMiddleware
 
-    # === 质量/辅助功能层 ===
+        middlewares.append(TokenUsageMiddleware())
 
-    # 3. 标题生成（在首次对话后生成线程标题）
-    #    需要在 after_model 中读取模型输出
-    if enable_title:
-        middlewares.append(TitleMiddleware(max_words=10))
+    # --- 步骤 15：TitleMiddleware（config 驱动；内部读 title.enabled）---
+    middlewares.append(TitleMiddleware(app_config=resolved_app_config))
 
-    # 4. 记忆队列（将对话加入后台记忆更新队列）
-    #    需要在 after_agent 中收集对话对
-    if enable_memory:
-        middlewares.append(MemoryMiddleware())
+    # --- 步骤 16：MemoryMiddleware（在 Title 之后；内部读 memory.enabled）---
+    middlewares.append(MemoryMiddleware(agent_name=agent_name, memory_config=resolved_app_config.memory))
 
-    # 5. 循环检测（检测重复工具调用模式）
-    #    需要在 after_model 中分析工具调用
-    if enable_loop_detection:
-        middlewares.append(
-            LoopDetectionMiddleware(
-                warn_threshold=3,
-                hard_limit=5,
-            )
-        )
+    # --- 步骤 17：ViewImageMiddleware（仅模型 supports_vision）---
+    model_config = resolved_app_config.get_model_config(model_name) if model_name else None
+    if model_config is not None and model_config.supports_vision:
+        from deerflow.agents.middlewares.view_image_middleware import ViewImageMiddleware
 
-    # === 多模态层（条件挂载）===
-    # 6. 图片查看（仅当模型支持视觉时挂载）
-    #    ViewImageMiddleware 在阶段5 §步骤6 实现。本文件顶部用 try/except
-    #    做了前向兼容导入——阶段5 创建该文件后即自动生效。
-    #    这一步是"多模态使用 Qwen"链路的关键：没有它，即使配置了
-    #    qwen-vl（supports_vision: true），Agent 也看不到图片。
-    # 解析当前模型配置（用于按 supports_vision 决定是否挂 ViewImageMiddleware）
-    # model_name 为 None 时回退到默认模型（config.yaml 中第一个模型），
-    # 与 create_chat_model(name=None) 的默认行为对齐
-    model_config = None
-    if cfg.models:
-        if model_name:
-            matched = [m for m in cfg.models if m.name == model_name]
-            model_config = matched[0] if matched else cfg.models[0]
-        else:
-            # 未指定模型名 → 用默认（第一个）模型的能力判断
-            model_config = cfg.models[0]
-    if _HAS_VIEW_IMAGE_MIDDLEWARE and model_config is not None and getattr(model_config, "supports_vision", False):
         middlewares.append(ViewImageMiddleware())
 
-    # === 用户自定义中间件（可选）===
+    # --- 步骤 18：DeferredToolFilterMiddleware（tool_search 启用 + 有延迟工具）---
+    # 延迟名集合 + catalog_hash 来自 build 期 setup（工具策略过滤后装配）；提升状态从图状态读。
+    if deferred_setup is not None and deferred_setup.deferred_names:
+        from deerflow.agents.middlewares.deferred_tool_filter_middleware import DeferredToolFilterMiddleware
+
+        middlewares.append(DeferredToolFilterMiddleware(deferred_setup.deferred_names, deferred_setup.catalog_hash))
+
+    # --- 步骤 19：SubagentLimitMiddleware（subagent_enabled）---
+    subagent_enabled = cfg.get("subagent_enabled", False)
+    if subagent_enabled:
+        from deerflow.agents.middlewares.subagent_limit_middleware import SubagentLimitMiddleware
+
+        max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
+        middlewares.append(SubagentLimitMiddleware(max_concurrent=max_concurrent_subagents))
+
+    # --- 步骤 20：LoopDetectionMiddleware（loop_detection.enabled，from_config）---
+    loop_detection_config = resolved_app_config.loop_detection
+    if loop_detection_config.enabled:
+        middlewares.append(LoopDetectionMiddleware.from_config(loop_detection_config))
+
+    # --- 步骤 21：custom_middlewares（插在 Clarification 之前）---
     if custom_middlewares:
         middlewares.extend(custom_middlewares)
 
-    # === 7. 澄清拦截（必须排在最后！）===
-    #    确保所有其他中间件已处理完毕，且可以中断整个执行
+    # --- 步骤 22：SafetyFinishReasonMiddleware（safety_finish_reason.enabled，from_config）---
+    # 注册在 custom 之后：LangChain 的 after_model 按倒列表序分发，最后注册的最先观察模型输出。
+    # Safety 先看原始响应、命中则清 tool_calls，Loop / Subagent 再对清理后的消息计数不误触警。
+    safety_config = resolved_app_config.safety_finish_reason
+    if safety_config.enabled:
+        from deerflow.agents.middlewares.safety_finish_reason_middleware import SafetyFinishReasonMiddleware
+
+        middlewares.append(SafetyFinishReasonMiddleware.from_config(safety_config))
+
+    # --- 步骤 23：ClarificationMiddleware（永远最后，红线 #14）---
     middlewares.append(ClarificationMiddleware())
 
     return middlewares
+
+
+def _get_runtime_config(config: RunnableConfig | None) -> dict:
+    """从 RunnableConfig 抽 configurable dict（可能为空）。"""
+    if not config:
+        return {}
+    configurable = config.get("configurable")
+    if isinstance(configurable, dict):
+        return configurable
+    return {}

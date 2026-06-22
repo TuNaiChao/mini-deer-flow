@@ -58,3 +58,16 @@ class MemoryConfig(BaseModel):
         default="tiktoken",
         description="记忆注入预算的 token 计数策略。'tiktoken' 精确但首次使用时可能从公共网络端点下载 BPE 数据，在网络受限环境可能长时间阻塞（见 issue #3402/#3429）；'char' 用无网络的 CJK 感知字符估算，从不触碰 tiktoken。",
     )
+
+
+def get_memory_config() -> MemoryConfig:
+    """返回全局记忆配置（``get_app_config().memory`` 的便捷访问器）。
+
+    mini 不为 memory 维护独立单例——所有子配置都挂在 ``AppConfig`` 上，经
+    ``get_app_config()`` 走热重载边界（config.yaml 改动下次请求即生效）。本函数
+    只是把 ``get_app_config().memory`` 暴露成 deer 风格的 ``get_memory_config()``
+    调用点，让 memory 模块的对齐移植无需逐处改写。
+    """
+    from deerflow.config.app_config import get_app_config
+
+    return get_app_config().memory

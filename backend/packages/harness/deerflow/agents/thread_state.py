@@ -78,3 +78,12 @@ class ThreadState(AgentState):
     # --- 多模态图片 ---
     viewed_images: NotRequired[Annotated[dict, _merge_viewed_images]]
     """Agent 已查看的图片（Base64 编码），由 ViewImageMiddleware 写入（阶段5）"""
+
+    # --- 延迟工具提升（M15 tool_search / M16 DeferredToolFilterMiddleware）---
+    promoted: NotRequired[dict | None]
+    """``tool_search`` 把命中的延迟工具写回这里，供 DeferredToolFilterMiddleware 读取。
+
+    形如 ``{"catalog_hash": str, "names": [str, ...]}``——catalog_hash 把提升记录
+    scope 到本次工具目录，防陈旧提升暴露改名 / 漂移过的工具（M15）。DeferredToolFilter
+    据此把已提升的延迟工具 schema 重新暴露给模型绑定。
+    """

@@ -28,7 +28,8 @@ class SandboxConfig(BaseModel):
             仅用于完全可信的本地工作流。
 
     AioSandboxProvider 专属选项：image / port / replicas / container_prefix /
-    idle_timeout / mounts / environment。
+    idle_timeout / mounts / environment / provisioner_url（设了用 K8s 远端 backend，
+    不设用本地 Docker/Apple Container backend）。
     """
 
     use: str = Field(
@@ -48,6 +49,10 @@ class SandboxConfig(BaseModel):
     idle_timeout: int | None = Field(
         default=None,
         description="沙箱释放前的空闲秒数（默认 600 = 10 分钟）。设 0 禁用。",
+    )
+    provisioner_url: str | None = Field(
+        default=None,
+        description=("远端 provisioner 服务 URL（如 http://provisioner:8002）。设置后 AioSandboxProvider 用 RemoteSandboxBackend（K8s 动态建 Pod），否则用 LocalContainerBackend（本地 Docker/Apple Container）。"),
     )
     mounts: list[VolumeMountConfig] = Field(
         default_factory=list,

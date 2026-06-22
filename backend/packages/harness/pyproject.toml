@@ -40,6 +40,10 @@ aiosqlite = ["aiosqlite>=0.19"]
 mcp = ["langchain-mcp-adapters>=0.2"]
 tiktoken = ["tiktoken>=0.7"]
 uploads = ["markitdown>=0.0.1"]
+# AIO 沙箱（M10b）：agent-sandbox 是 AIO 容器的 HTTP client SDK（Fern 生成）；
+# requests 用于 backend 就绪轮询 + remote provisioner 通信。缺包时
+# AioSandboxProvider 不可用，回退 LocalSandboxProvider（可操作安装提示）。
+aio_sandbox = ["agent-sandbox>=0.0.1", "requests>=2.28"]
 
 [build-system]
 requires = ["hatchling"]

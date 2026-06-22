@@ -96,6 +96,14 @@ def _reset_singletons_between_tests():
     except ImportError:
         pass
 
+    # M20 mcp：重置工具缓存 + 会话池单例（避免跨测试泄漏持久会话 / 缓存 mtime 状态）。
+    try:
+        from deerflow.mcp.cache import reset_mcp_tools_cache
+
+        reset_mcp_tools_cache()
+    except ImportError:
+        pass
+
     yield
 
     for reset in resets:
