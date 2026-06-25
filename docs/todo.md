@@ -1,355 +1,117 @@
-# todo.md — mini-deer-flow 实现进度
+# todo.md — mini-deer-flow 进度与待办
 
-> 这份文档**只跟踪「做到哪了」**。每个模块要做成什么样（文件清单 / 依赖 / 可靠性要点 / 红线）查 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) 的 **Part C**（M-build / M0–M19 / **M10b / M20–M23** 各小节）。
->
-> **三交付** = 代码 + hermetic 测试（`test/test_<module>.py`）+ 学习文档（`docs/<module>.md`）。三齐 + 测试绿才算一个模块完成。
->
-> **基线命令**：`cd backend && make test && make lint` → 当前 **1316 passed, 1 skipped, 0 lint 错误**（M16 中间件落地后 +71 测试）。
->
-> **v1.2 全面对标（2026/06/21）**：执行「**全面对标 deer-flow，不裁剪核心功能**」——沙箱/subagent/memory/tool/skill/mcp 全面对齐。原「可选/裁剪」的 **AIO 沙箱/MCP/community/uploads/agents_config 全部提升为主线**（M10b / M20–M23）。详见 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) v1.2 修订日志。
+> **基线**：`cd backend && make test && make lint` → **1477 passed, 1 skipped, 0 lint**。
+> **三交付** = 代码 + hermetic 测试（`test/test_<module>.py`）+ 学习文档（`docs/<module>.md`）。
+> **设计规格**（文件清单 / 依赖 / 红线）查 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) Part C；**全模块学习文档**见 [README.md](README.md)（#1–#28）。
 
 ## 图例
 
-- ✅ 完成 — 三交付齐、测试绿
-- 🔶 部分 — 有代码/进度，但未达 outline 完整规格
-- 📋 规格 — 设计文档写了，代码未落地
-- ⬜ 未开始
+✅ 完成 · 🔶 部分 · 📋 规格 · ⬜ 未开始
 
 ---
 
-## 总览
+## 一、已完成（主线对标全部完成）
 
-| 状态 | 数量 | 模块 |
-|------|------|------|
-| ✅ 完成 | 25 | M-build、M0 config、M1 utils、M2 reflection、M3 user_context、M-models、M4 persistence、M5 checkpointer、M6 events/store、M7 journal、M8 stream_bridge、M9 serialization、**M10 sandbox**、**M10b AIO 沙箱**、**M11 subagents**、**M12 tracing**、**M22 agents_config**、**M13 memory**、**M14 skills**、**M20 mcp**、**M21 community**、**M15 tools**、**M23 uploads**、**M16 middlewares（23 步）**、测试质量基线 |
-| 🔶 部分 | 1 | M17 agent（精简版） |
-| 📋 规格 | 0 | — |
-| ⬜ 未开始 | 3 | M18 runs、M19 store、集成 |
+**Phase 0–8 全部 ✅**，对齐 deer-flow v1.2「全面对标、不裁剪核心功能」。harness 层核心（模型/沙箱/子代理/记忆/技能/MCP/联网/工具/上传/中间件 23 步/agent 装配/运行管理/Store/集成）零差距，1477 测试 + 28 篇文档。
 
-**Phase 0 + Phase 1 + Phase 2 + Phase 3(M13) + Phase 4(M14) + Phase 5(M20 + M21 + M15) + Phase 5.5(M23) + Phase 6(M16) 全部完成**（build + config + utils + reflection + user_context + models + persistence + checkpointer + events/store + journal + stream_bridge + serialization + sandbox + AIO 沙箱 + subagents + tracing + agents_config + memory + skills + mcp + community + tools + uploads + middlewares 23 步）。957 测试 + 十二篇文档。
+| Phase | 模块 | 文档 |
+|-------|------|------|
+| 0 | M-build 工程化 · M0 config · M1 utils · M2 reflection · M3 user_context | build / testing-setup / config / utils / user_context |
+| 1 | M-models · M4 persistence · M5 checkpointer · M6 events/store · M7 journal · M8 stream_bridge · M9 serialization | models / persistence / checkpointer / run_event_store / run_journal / stream_bridge / serialization |
+| 2 | M10 sandbox(7 工具) · M10b AIO 沙箱 · M11 subagents · M12 tracing · M22 agents_config | sandbox / aio_sandbox / subagents / tracing / agents_config |
+| 3 | M13 memory | memory |
+| 4 | M14 skills | skills |
+| 5 | M20 mcp · M21 community(12 provider) · M15 tools(9 内置) | mcp / community / tools |
+| 5.5 | M23 uploads | uploads |
+| 6 | M16 middlewares（23 步生产链） | middlewares |
+| 7 | M17 agent（SDK + config 双入口 + custom-agent 分支） | agents |
+| 8 | M18 runs（RunManager + worker）· M19 store + 集成装配（lifespan / langgraph.json / config.example） | runs / runtime_store / architecture |
 
-**v1.2 变更要点**：① **M10 sandbox 已 ✅**（7 工具 + provider + 审计 + search/lock/exceptions + 97 测试）；② **M10b AIO 沙箱已 ✅**（`community/aio_sandbox/`：SandboxInfo + SandboxBackend ABC + LocalContainerBackend[Docker/Apple] + RemoteSandboxBackend[K8s] + AioSandbox[HTTP client, soft-load agent_sandbox] + AioSandboxProvider[暖池+跨进程文件锁+idle 回收+孤儿收养+SIGTERM/INT/HUP 优雅关闭] + utils/network 端口分配 + sandbox_config.provisioner_url + 64 测试）；③ **M11 subagents 已 ✅**（`subagents/`：SubagentConfig + registry[built-in/custom/per-agent override 合并] + executor[**单 scheduler pool(3) + 持久隔离事件循环**，非双池] + status_contract[5 状态契约] + token_collector + builtins[general-purpose/bash] + config custom_agents/agents 覆盖 + contracts/subagent_status_contract.json + 72 测试）；④ **M12 tracing 已 ✅**（`tracing/`：factory[build_tracing_callbacks，env 驱动 LangSmith/Langfuse，未配置返回空] + metadata[build_langfuse_trace_metadata/inject_langfuse_metadata，session/user/name/tags 映射 + setdefault 调用方优先]；models 的 `attach_tracing=True` 路径自动生效；红线 #17 图内 attach_tracing=False + 26 测试）；⑤ **M22 agents_config 已 ✅**（`config/agents_config.py`：SOUL_FILENAME + AGENT_NAME_PATTERN[红线 #32] + AgentConfig[pydantic] + validate_agent_name + resolve_agent_dir[per-user 优先 + legacy 只读回退 + #3390 要 config.yaml 才认] + load_agent_config[剥未知字段] + load_agent_soul + list_custom_agents[并集 + per-user 覆盖]；Paths 加 user_dir/agents_dir/agent_dir/user_agents_dir/user_agent_dir[名称 .lower() 归一] + 83 测试）；⑥ **M13 memory 已 ✅**（`agents/memory/` 6 模块：storage[mtime 缓存 + 原子写 + per-user/agent 隔离] + message_processing[filter + correction/reinforcement 检测] + queue[去抖合并 + user_id 跨 Timer 捕获] + prompt[format_memory_for_injection 预算截断 + tiktoken 冷却降级] + updater[**同步 LLM 路径 #2615** + fact CRUD + JSON 容错 + 去重 + max_facts + 上传剔除]；MemoryMiddleware/DynamicContextMiddleware 重写[before_agent ID-swap 注入 + 跨午夜 + to_thread 5s 超时]；prompt _get_memory_context + Paths memory 辅助 + get_memory_config + 94 测试）；⑦ **M14 skills 已 ✅**（`skills/` 12 文件：types/parser/validation/slash[保留字 + 严格语法]/tool_policy[allowed-tools 白名单收紧]/permissions[沙箱只读 0o555/0o444]/security_scanner[LLM allow/warn/block + 保守回退]/installer[.skill ZIP 穿越拒绝/symlink 跳过/512MB zip 炸弹防御/原子搬入] + storage/[SkillStorage ABC + LocalSkillStorage + 反射工厂单例]；SkillActivationMiddleware[wrap_model_call 注入 SKILL.md + 幂等 + 读盘穿越拒绝 + html.escape]；prompt get_skills_prompt_section + 后台刷新缓存[lru_cache + daemon 线程 + per-config 隔离]；build_middlewares 挂 SkillActivation；M11 executor _load_skills 加载失败降级为无技能；skills/public/example/SKILL.md 示例 + 80 测试）；⑧ **M20 mcp 已 ✅**（`mcp/` 6 文件：client[build_server_params/build_servers_config，stdio/sse/http 三传输] + oauth[OAuthTokenManager 缓存+提前刷新 skew+双检锁 + build_oauth_tool_interceptor 头注入 + get_initial_oauth_headers，红线 #30] + session_pool[MCPSessionPool owner-task 生命周期[anyio same-task cancel-scope] + LRU 256 + 跨循环关闭 + 仅 stdio 入池，红线 #29] + tools[get_mcp_tools 发现+stdio 包会话池+http 不包+补同步入口+_convert_call_tool_result+soft-load adapter] + cache[_mcp_tools_cache + mtime 失效 + 懒加载 + reset 关池 + Python 3.14 get_running_loop]；config/extensions_config 扩展[McpOAuthConfig + oauth/description + resolve_config_path + resolve_env_variables + mcp_interceptors + deer/mini 双格式兼容]；tools/sync.make_sync_tool_wrapper 引入；tools/tools.py include_mcp 分支接 MCP；conftest autouse reset_mcp_tools_cache；91 测试）；⑨ **M21 community 已 ✅**（`community/` 12 provider + `_common.py` + `utils/readability.py`：核心 3[ddg_search 无需 key + CJK region 推断 / tavily search+fetch / jina_ai async reader] + 全量移植 5[image_search/brave/serper 同步 httpx + searxng/browserless 异步 httpx] + 软加载占位 3[firecrawl/exa SDK 缺包返安装提示 + infoquest compact client]；`_common`[normalize_search_result 归一 + truncate_content 4KB 截断 + coerce_bool/int/timeout/proxy 强转 + get_tool_extras + async post_json httpx 封装]；`utils/readability`[Article + ReadabilityExtractor，soft-load readabilipy/markdownify + 纯 Python 兜底剥 script/nav/标签]；`AppConfig.get_tool_config(name)` 新增[按 tools[].name 查 dict]；SDK 软加载红线 #24[模块顶层不 import SDK，函数内 try/except]；106 测试）；⑩ **M15 tools 已 ✅**（`tools/` 9 内置工具全收 + 框架：新建 `mcp_metadata`[tag_mcp_tool/is_mcp_tool/MCP_TOOL_METADATA_KEY] + `builtins/view_image_tool`[路径白名单+魔数+20MB] + `builtins/task_tool`[子代理委派+轮询+SSE+token 缓存] + `builtins/tool_search`[DeferredToolCatalog + assemble_deferred_tools fail-closed + get_deferred_tools_prompt_section] + `builtins/setup_agent_tool`+`update_agent_tool`[per-user 原子写，依赖 M22] + `builtins/invoke_acp_agent_tool`[soft-load acp] + `skill_manage_tool`[create/patch/edit/delete/write_file/remove_file + 安全扫描，依赖 M14]；`sync.py` 扩展[+ `_get_runnable_config_param` RunnableConfig 注入，M20 延后补]；`tools.py` 重写 `get_available_tools`[五类来源 + 按 name 去重 config>builtins>MCP>ACP 防 #1803 + host-bash 过滤 + name-mismatch 告警 + 条件加载 + MCP tag + ACP]；74 测试）；⑪ **M23 uploads 已 ✅**（`uploads/`：manager[路径安全两道防线 + symlink 防御 O_NOFOLLOW + 列表/删除 + 伴随 .md 清理 + 事件循环内复用 worker 编排] + conversion[markitdown/pymupdf4llm soft-load + PDF 双策略 + 大文件 to_thread + 大纲抽取]；config `UploadsConfig`[auto_convert_documents/pdf_converter 归一]；`Paths.sandbox_uploads_dir`/`thread_user_data_dir` 唯一真相源，`local_sandbox._thread_user_data_root` 改委托；100 测试）。⑫ **M16 middlewares 已 ✅**（`agents/middlewares/` 23 步生产链：新建 13 文件[tool_call_metadata helper + tool_output_budget/thread_data/dangling_tool_call 核心档 + uploads/summarization/token_usage/view_image/deferred_tool_filter/subagent_limit/todo 业务档 + safety_termination_detectors/safety_finish_reason 安全档] + 重做 8 文件[tool_error_handling 补 _stamp_task_subagent_status + build_lead/subagent_runtime_middlewares / clarification 补 options+context+图标+stable id / title config 驱动+结构化内容归一+async LLM / llm_error_handling 熔断+分类+GraphBubbleUp / loop_detection from_config+频率层+pending warnings]；`build_middlewares` 重写为 Part D 23 步[ThreadData→Uploads→Sandbox 不变量 / Clarification 末位红线 #14 / 所有 wrap_* 透传 GraphBubbleUp 红线 #15 / Safety 在 Loop 后倒序观察]；config `CircuitBreakerConfig`[failure_threshold/recovery_timeout_sec] + Paths sandbox_work_dir/outputs_dir/ensure_thread_dirs 唯一真相源 + thread_state.promoted 字段 + memory summarization_hook 抢拍接 M13；71 测试）。**仅剩 Guardrail/DeerFlowClient 真正可选**。**下次起点**：**Phase 7 M17 agent**（custom-agent 分支依赖 M22 + setup/update_agent 按上下文绑依赖 M15 + 工具白名单收紧依赖 M14 + tool_search 装配依赖 M15/M20 + build_middlewares 已就绪供 make_lead_agent 调用）。
-
----
-
-## 模块进度总表（按 Phase，一眼看完全部）
-
-| Phase | 模块 | 状态 | 代码 | 测试 | 文档 |
-|-------|------|------|------|------|------|
-| 0 | M-build 工程化 | ✅ | ✅ | ✅ | ✅ build.md + testing-setup.md |
-| 0 | M0 config（配置加载） | ✅ | ✅ | ✅ | ✅ config.md |
-| 0 | M1 utils | ✅ | ✅ | ✅ | ✅ utils.md |
-| 0 | M2 reflection | ✅ | ✅（既有） | ✅ | —（对齐 deer） |
-| 0 | M3 user_context | ✅ | ✅ | ✅ | ✅ user_context.md |
-| 1 | M-models（模型） | ✅ | ✅ | ✅ | ✅ models.md |
-| 1 | M4 persistence（持久化） | ✅ | ✅ | ✅ | ✅ persistence.md |
-| 1 | M5 checkpointer | ✅ | ✅ | ✅ | ✅ checkpointer.md |
-| 1 | M6 events/store | ✅ | ✅ | ✅ | ✅ run_event_store.md |
-| 1 | M7 journal | ✅ | ✅ | ✅ | ✅ run_journal.md |
-| 1 | M8 stream_bridge | ✅ | ✅ | ✅ | ✅ stream_bridge.md |
-| 1 | M9 serialization | ✅ | ✅ | ✅ | ✅ serialization.md |
-| 2 | M10 sandbox（local，7 工具） | ✅ | ✅（7 工具 + provider + 审计 + search/lock/exceptions） | ✅ | ✅ sandbox.md |
-| 2 | M10b AIO 沙箱（生产隔离，**v1.2 新增**） | ✅ | ✅（community/aio_sandbox/ 7 文件 + utils/network + config 字段） | ✅ | ✅ aio_sandbox.md |
-| 2 | M11 subagents（自定义子代理） | ✅ | ✅（subagents/ 7 模块 + config 扩展 + contracts json） | ✅ | ✅ subagents.md |
-| 2 | M12 tracing | ✅ | ✅（tracing/ factory + metadata，env 驱动） | ✅ | ✅ tracing.md |
-| 2 | M22 agents_config（自定义 agent，**v1.2 新增**） | ✅ | ✅（config/agents_config.py + Paths agent 辅助方法） | ✅ | ✅ agents_config.md |
-| 3 | M13 记忆 | ✅ | ✅（agents/memory/ 6 模块 + 两中间件重写 + prompt _get_memory_context + Paths memory 辅助 + get_memory_config） | ✅ | ✅ memory.md |
-| 4 | M14 skills | ✅ | ✅（skills/ 12 文件 + storage/ + SkillActivationMiddleware + prompt get_skills_prompt_section） | ✅ | ✅ skills.md |
-| 5 | M20 mcp（**v1.2 新增**） | ✅ | ✅（mcp/ 6 文件 + tools/sync + extensions_config 扩展） | ✅ | ✅ mcp.md |
-| 5 | M21 community（**v1.2 新增**，3 核心+5 全量+3 占位） | ✅ | ✅（community/ 12 provider + _common + utils/readability + app_config.get_tool_config） | ✅ | ✅ community.md |
-| 5 | M15 tools（9 内置工具） | ✅ | ✅（tools/builtins 7 新 + skill_manage + mcp_metadata + sync 扩展 + tools.py 重写） | ✅ | ✅ tools.md |
-| 5.5 | M23 uploads（**v1.2 新增**） | ✅ | ✅（uploads/ manager+conversion + config/uploads_config + Paths 扩展） | ✅ | ✅ uploads.md |
-| 6 | M16 middlewares（23 步含 Uploads） | ✅ | ✅（13 新 + 8 重做 + build_middlewares 23 步 + config/paths/thread_state 扩展 + memory summarization_hook） | ✅ | ✅ middlewares.md |
-| 7 | M17 agent（含 custom-agent 分支） | 🔶 | 部分（精简） | 部分 | — |
-| 8 | M18 runs（运行管理） | ⬜ | — | — | — |
-| 8 | M19 runtime/store | ⬜ | — | — | — |
-| 8 | 集成装配 | ⬜ | — | — | — |
+**质量加固**：Phase 1（M4–M9）+ Phase 7–8（M17/M18/M19/集成）已完成四维审查（设计 / bug / 适配 / 测试文档），结论均为「零严重 bug + 测试缺口 + 文档措辞，已补齐」。
 
 ---
 
-## ✅ 已完成（详情）
+## 二、未完成内容提纲（与 deer-flow/backend 差距，按可做性排序）
 
-### M-build 工程化（Phase 0）
-- **代码**：pyproject extras + dev 依赖(pytest/ruff) + Makefile + conftest（Python 3.14 sys.path 适配）+ 根 `pytest.ini`/`ruff.toml`（配置单源，覆盖 backend+test）
-- **测试**：`test_harness_boundary.py`（harness 不得 import app.\*）+ blocking-io gate（**inline 实现，不引 blockbuster**）smoke
-- **文档**：`docs/build.md` + `docs/testing-setup.md`
-- **基线**：130 passed, 0 lint 错误
+> 逐模块全量对比 `deer-flow/backend` 的结论。**主线 agent 核心零差距**；差距的 ~90% 代码量是 mini 设计上不 port 的 Gateway 层。
 
-### M0 config（配置类型化，Phase 0）
-- **代码**：17 个子配置 pydantic 化（database/memory/title/sandbox/loop_detection/summarization/checkpointer/run_events/stream_bridge/token_usage/tool_output/tool_search/safety_finish_reason/subagents/skills/skill_evolution + reload_boundary）+ `DatabaseConfig` 派生 sqlite_path/app_sqlalchemy_url + `paths.py` 补 resolve_path/runtime_home/get_paths（**替代 runtime_paths**）+ `extensions_config.is_skill_enabled` + `AppConfig` 字段类型化 + `config_version` + None→[] validator
-- **测试**：`test_config.py`（子配置默认值、空配置可启动红线 #25、database 派生、reload_boundary、paths、is_skill_enabled、loop_detection validator）
-- **文档**：`docs/config.md`
-- **改动**：`build_middlewares` 的 `isinstance(x, dict)` 防御写法改为属性访问（`.enabled`）
+### 2.1 真正可选（依赖独立外部包，按需）
 
-### M1 utils（公共工具，Phase 0）
-- **代码**：`utils/time.py`（`now_iso` / `coerce_iso`——归一 UTC ISO，兼容历史 unix 时间戳）+ `utils/messages.py`（`message_content_to_text` / `get_original_user_content_text`）
-- **测试**：`test_utils.py`（23 个，now_iso 时区、coerce_iso 各分支、消息三态抽取）
-- **文档**：`docs/utils.md`
+| 项 | deer 代码 | 依赖 | 说明 |
+|----|----------|------|------|
+| **Guardrail 中间件** | `guardrails/`（4 文件 191 行：provider + builtin + middleware） | `guardrails` / `neMo-guardrails` | M16 第 7 步跳过位；Pre-tool-call 授权（Allowlist/OAP/自定义 provider） |
+| **DeerFlowClient** | `client.py`（1327 行） | — | 嵌入式 in-process 客户端；mini 走 langgraph dev |
 
-### M3 user_context（用户上下文，Phase 0）
-- **代码**：`runtime/user_context.py`（ContextVar 三态 AUTO/str/None + `resolve_runtime_user_id` 三优先级 runtime.context > contextvar > default + `DEFAULT_USER_ID` + UUID→str 边界）
-- **测试**：`test_user_context.py`（23 个，三态解析、无 contextvar 回退、runtime 优先级、UUID 强转）
-- **文档**：`docs/user_context.md`
-- **配套**：conftest 的 `_auto_user_context` autouse fixture 已自动激活（M3 落地后每个测试注入默认用户）
+### 2.2 真实可用性缺口（建议补，按优先级）
 
-### M-models 模型（Phase 1）
-- **代码**：`models/factory.py`（thinking 四路径 + reasoning_effort 门控 + stream 默认值 + attach_tracing 懒加载）
-- **测试**：`test_model.py`（hermetic，`_Recorder` + monkeypatch）
-- **文档**：`docs/models.md`
+| 优先级 | 项 | 缺什么 | 为什么补 |
+|--------|----|--------|----------|
+| 🔴 高 | `models/vllm_provider.py` | `VllmChatModel`（子类化 ChatOpenAI，保留 vLLM `reasoning` 字段在 full response / streaming delta / follow-up tool-call turn） | **config.example 路径 C 注释引用 `deerflow.models.vllm_provider:VllmChatModel` 但 mini 无实现**——用户配 vLLM 会 ImportError。dangling 引用，必须消 |
+| 🟡 中 | `models/patched_*.py`（5） | DeepSeek / MIMO / MiniMax / OpenAI / StepFun 的流式 + reasoning 字段 workaround | 原生 langchain 类能跑，但这些 provider 有兼容 rough edges；视用户用哪些 |
+| 🟡 中 | `scripts/migrate_user_isolation.py` | legacy `memory.json`/`threads/`/`agents/` → per-user 布局迁移 | mini 已是 per-user（M13/M22），但用户**从 deer-flow 迁过来**时有用 |
+| 🟢 低 | `config/tracing_config.py` | `TracingConfig` 单例 + `reset_tracing_config` + `get_enabled_providers` | mini tracing 走 env 直读够用；缺配置单例 + 重置能力（管理层 nice-to-have） |
+| 🟢 低 | `config/runtime_paths.py` | `project_root` / `runtime_home`（`DEER_FLOW_HOME` env 覆盖） | mini 用 `config/paths.py`；缺 env 覆盖能力 |
+| 🟢 低 | `models/claude_provider.py` / `mindie_provider.py` / `openai_codex_provider.py` / `credential_loader.py` / `assistant_payload_replay.py` | 额外 provider 适配 / 凭证加载 / payload 回放 | langchain 已有 `ChatAnthropic` 等；mini 经 env/`$VAR` 直读；低 |
 
-### M4 persistence（持久化，Phase 1）
-- **前置（runs 基类层）**：`runtime/runs/schemas.py`（`RunStatus`/`DisconnectMode` 枚举）+ `runtime/runs/store/base.py`（`RunStore` ABC）。把 ABC 提前到 Phase 1 以打破「持久化 → 运行管理」循环依赖。
-- **代码**：`persistence/`（`base.Base(DeclarativeBase)` + `to_dict` + `engine`[init/close/get_session_factory，sqlite WAL 红线 #2 + memory no-op + auto-create + postgres auto-create-db] + `json_compat`[跨方言 JSON 过滤] + `models`[RunEventRow/RunRow] + `run/sql.RunRepository(RunStore)` + `thread_meta`[ThreadMetaStore ABC + MemoryThreadMetaStore 包 LangGraph BaseStore + ThreadMetaRepository + make_thread_store 工厂]）
-- **测试**：`test_persistence.py`（52 个，hermetic 全走 tmp sqlite：WAL PRAGMA 生效 + WAL 持久化文件头、memory no-op、auto-create、RunRepository CRUD + user 隔离 + rowcount 红线 #12 + 幂等 put + UUID→str 红线 #10 + aggregate_tokens、ThreadMeta 增删查改 + metadata 合并 + json_match search + check_access 双模式 + InvalidMetadataFilterError、MemoryThreadMetaStore 等价 + coerce_iso、make_thread_store 工厂、json_compat 校验器、Base.to_dict/repr、runs 枚举）
-- **文档**：`docs/persistence.md`
-- **改动**：harness `pyproject.toml` 新增 core 依赖 `sqlalchemy[asyncio]` + `aiosqlite`（对齐 deer；postgres 驱动 asyncpg 仍为可选 extra）
-- **裁剪**：feedback / user / channel_connections / migrations(Alembic) 本期不做
+### 2.3 设计上不 port（mini 是 harness 教学版，非全栈产品）
 
-### M5 checkpointer（检查点工厂，Phase 1）
-- **代码**：`runtime/store/_sqlite_utils.py`（`resolve_sqlite_conn_str` + `ensure_sqlite_parent_dir`，红线 #1912 父目录保护）+ `runtime/checkpointer/provider.py`（同步 `_sync_checkpointer_cm` + `get_checkpointer` 单例 + `reset_checkpointer` + `checkpointer_context` + 安装提示常量）+ `runtime/checkpointer/async_provider.py`（`make_checkpointer(app_config)` async cm，三级优先级 legacy `checkpointer:` > `database:`(非memory) > InMemorySaver；sqlite 路径 `asyncio.to_thread` 卸载红线 #1；postgres 连接池 keepalive）。**委托 LangGraph 内置 Saver 不自建**。
-- **测试**：`test_checkpointer.py`（26 个，hermetic：`_sqlite_utils` 各分支、make_checkpointer memory 默认/显式/sqlite(legacy+database) 真实 aput→aget_tuple 往返/优先级/database-memory 回退/postgres 缺包提示/未知类型、to_thread 卸载契约、同步单例+reset+context、同步 sqlite setup+put+get_tuple 往返、父目录保护、缺包提示可操作性）
-- **文档**：`docs/checkpointer.md`
-- **改动**：harness `pyproject.toml` postgres extra 补 `psycopg-pool>=3.3`（deer 对齐）；backend `pyproject.toml` dev 组补 `langgraph-checkpoint-sqlite`（测试做真实 sqlite 往返用；生产 memory 模式不需，故放 dev 而非 core，红线 #24）
+| 项 | 规模 | 性质 |
+|----|------|------|
+| **`app/` Gateway 层** | 61 .py（17 API 路由 + 13 文件 auth[JWT+密码+多 provider] + 16 文件 IM 渠道[feishu/slack/telegram/discord/dingtalk/wechat/wecom]） | FastAPI 应用层；mini 走 `langgraph dev` 或基于 `runtime_lifespan` bundle 自搭 |
+| **连带持久化** | `persistence/channel_connections/` / `feedback/` / `user/`（各 3 文件） | Gateway 专属 |
+| **连带 config** | `config/channel_connections_config.py` / `suggestions_config.py` / `agents_api_config.py` | Gateway 专属 |
+| **DB 迁移** | `persistence/migrations/`（alembic） | mini 走 `create_all`（教学简化） |
+| **顶层文件** | `Dockerfile` / `debug.py` / `sitecustomize.py` / `ruff.toml` | 部署 / 调试；mini 用 pyproject 内 ruff |
+| **backend/docs/** | 30 篇运维文档（API/AUTH_DESIGN/IM_CHANNEL/STREAMING…） | 多数对应不做的 Gateway；少数产品化时可参考 |
 
-### M6 events/store（运行事件存储，Phase 1）
-- **代码**：`runtime/events/store/base.py`（`RunEventStore` ABC，8 方法）+ `memory.py`（`MemoryRunEventStore` + message 投影 bisect 优化）+ `jsonl.py`（`JsonlRunEventStore`：`_SAFE_ID_PATTERN` 路径穿越防御红线 #4 + 每线程 `asyncio.Lock` 串行化红线 #3 + lazy seq 跨实例加载 + 全 IO `asyncio.to_thread` 红线 #1）+ `db.py`（`DbRunEventStore`：`SELECT max(seq) FOR UPDATE` / postgres `pg_advisory_xact_lock` 红线 #3 + trace 按 `max_trace_content` 截断 + JSON content 往返 + user_id stamp UUID→str 红线 #10）+ `__init__.make_run_event_store` 工厂（memory/jsonl/db；db engine 未就绪回退 memory）
-- **测试**：`test_events.py`（38 个，hermetic：memory seq 单调/分页/投影一致性/delete 清计数器；jsonl 跨实例持久化/路径穿越拒绝/并发写锁/跨 run 统一 seq/delete 清计数器锁/IO 卸载；db FOR UPDATE 单调/trace 截断/JSON 往返/user_id stamp+UUID→str/用户隔离/双向游标分页/put_batch 跨 thread 拒绝/UNIQUE 约束兜底；工厂各后端 + 未知后端报错）
-- **文档**：`docs/run_event_store.md`
-- **踩坑修正**：db 并发同-thread 写测试——sqlite 上 `FOR UPDATE` 是 no-op，靠 `UNIQUE(thread_id, seq)` 约束兜底；生产靠 RunJournal `put_batch` 单事务避开并发，postgres 靠 advisory lock。测试改为验证约束兜底 + 不同 thread 并发 OK
-
-### M9 serialization（序列化 + 转换，Phase 1，纯函数无依赖）
-- **代码**：`runtime/serialization.py`（`serialize_lc_object` 递归序列化 + `model_dump`/`dict`/`str` 兜底链；`serialize_channel_values` 剥 `__pregel_*`/`__interrupt__` 内部键；`strip_data_url_image_blocks` 只剥 hide_from_ui 消息的 `data:` image_url 块、保顺序/数量；`serialize_channel_values_for_api` 组合；`serialize_messages_tuple`/`serialize(mode)`）+ `runtime/converters.py`（`langchain_to_openai_message` 鸭子类型转 OpenAI 格式 + tool_calls args JSON 序列化 + `langchain_to_openai_completion` + `_infer_finish_reason` + 批量）。**纯函数无依赖**，故能插队到 M7/M8 之前。
-- **测试**：`test_serialization.py`（41 个，hermetic 无 IO：lc_object 标量/递归/pydantic/兜底；channel_values 剥 pregel+interrupt + 保留普通下划线键 + 递归；strip 只剥 hide_from_ui 的 data: 图片、保顺序数量、留 https/非隐藏；for_api 组合；messages_tuple；mode 分发；converters human/ai 文本/tool_calls/system/tool + list content + string args + 未知 role + finish_reason 推断 + completion 含/不含 usage）
-- **文档**：`docs/serialization.md`
-- **决策**：outline 标 converters「可后补先占位」——此处按 deer 参考完整移植（纯函数低风险），供后续端点直接用；当前未接入 RunJournal（它直接用 model_dump）
-
-### M8 stream_bridge（流桥，Phase 1）
-- **代码**：`runtime/stream_bridge/base.py`（`StreamEvent` frozen dataclass + `HEARTBEAT_SENTINEL`/`END_SENTINEL` + `StreamBridge` ABC + no-op `close`）+ `memory.py`（`MemoryStreamBridge`：每 run `_RunStream`(`events`+`asyncio.Condition`+`ended`+`start_offset`) + `queue_maxsize=256` 有界窗口 eviction 红线 #11 + id=`{ts_ms}-{seq}` + `_resolve_start_offset` Last-Event-ID 重连 + 落后从 start_offset 恢复 + 心跳防代理掐断）+ `async_provider.make_stream_bridge(app_config)` async cm（memory/redis；redis NotImplementedError）。
-- **测试**：`test_stream_bridge.py`（22 个，hermetic 纯 asyncio：基础 publish/subscribe+END、id 格式单调、有界 evict（maxsize 淘汰+start_offset 前移）、Last-Event-ID 续播（首条/中间/过期回放最早）、落后恢复（洪水发布后从 start_offset 恢复+丢失不补）、心跳（idle 发心跳/有事件不挡）、迟到订阅者回放+续接、cleanup(+delay)/close、make_stream_bridge 工厂 memory/redis/未知类型、StreamEvent frozen + 哨兵 + ABC 不可实例化）
-- **文档**：`docs/stream_bridge.md`
-- **适配**：`async_provider` 用 `get_app_config().stream_bridge` 而非 deer 的 `get_stream_bridge_config()` 单例（M0 既定，省一层间接）
-- **踩坑修正**：`memory.py._get_or_create_stream` 笔误 `not not in` → 改 `not in`
-
-### M7 journal（RunJournal 事件采集，Phase 1 收尾）
-- **代码**：`runtime/journal.py`（`RunJournal(BaseCallbackHandler)`，单文件 ~600 行）：回调 `on_chain_start/end/error`（根链发 run.start/end，嵌套忽略）、`on_chat_model_start`（抽首条 human + 跳过 summary + 存 llm_request）、`on_llm_end`（存 llm_response + token 按 run_id 去重防双计 + caller 分桶 lead/subagent/middleware + error fallback 检测 + total 从 input+output 补算）、`on_tool_end`（ToolMessage/Command.update.messages）；`_put`→buffer→达阈值 `_flush_sync`（同步回调内 `get_running_loop` + `create_task` 调度 async put_batch，无循环留 buffer）+ `_pending_flush_tasks` 防并发写（红线 #8）+ 失败 batch 回插；`_schedule_progress_flush` 节流（progress_reporter 注入，无模块循环）；`record_external_llm_usage_records`（外部 token 去重）、`record_middleware`、`get_completion_data`、`had_llm_error_fallback`。
-- **测试**：`test_journal.py`（36 个，hermetic：caller 识别、token 分桶 + 同 run_id 去重 + total 补算 + track_tokens 关闭 + 多 run 累加、sync→async flush 达阈值触发/未达留 buffer/flush 排空、失败 batch 回插重试不丢、error fallback 检测+降级到 reason/text、record_middleware 落盘、首条 human 抽取+只抽一次+跳 summary+截断、external usage 累加+去重+补算+跳 0、last_ai 只 lead 非空更新、生命周期 chain/tool 回调、message_count）
-- **文档**：`docs/run_journal.md`
-- **踩坑修正**：langchain `AIMessage` 要求 `usage_metadata.total_tokens` 字段在，测「total 补算」分支时传 `total_tokens=0`（非缺省）触发
-
-### M2 reflection（Phase 0）
-- **代码**：`reflection/resolver.py`（`resolve_class` + `resolve_variable`，既有）
-- **测试**：`test_reflection.py`（hermetic，stdlib + monkeypatch importlib）
-
-### M10 sandbox（local，7 工具，Phase 2）
-- **代码**：补齐 v1.1 缺件 + 拆分文件对齐 deer 结构：
-  - **新建** `sandbox/exceptions.py`（7 异常类：SandboxError + NotFound/Runtime/Command/File + File 的 Permission/FileNotFound 子类，带结构化 details）、`sandbox/file_operation_lock.py`（`get_file_operation_lock` 按 (sandbox_id,path) WeakValueDictionary 锁）、`sandbox/search.py`（`GrepMatch` + `find_glob_matches`/`find_grep_matches` + 57 忽略模式 + 二进制检测 + 防 ReDoS 长行跳过）、`sandbox/__init__.py`（导出 Sandbox/SandboxProvider/get_sandbox_provider）、`sandbox/local/list_dir.py`（树形列出，复用 search 忽略模式）、`sandbox/local/local_sandbox_provider.py`（**provider 拆出独立模块**：per-thread `local:{thread_id}` + LRU 256 + reset/shutdown + skills 静态映射）、`agents/middlewares/sandbox_audit_middleware.py`（`SandboxAuditMiddleware`：block/warn/pass 三档分级 + 复合命令 quote-aware 拆分 + 输入消毒 + 审计 JSON 日志）。
-  - **重写** `sandbox/sandbox.py`（抽象 `Sandbox` 补 `glob`/`grep`/`download_file` 至 8 抽象方法；异常移到 exceptions.py 后在此**再导出**保 `from deerflow.sandbox.sandbox import SandboxError` 兼容）、`sandbox/local/local_sandbox.py`（仅留 `LocalSandbox` + `PathMapping`；补 `glob`/`grep`/`download_file` 实现 + `_thread_user_data_root`/`ensure_thread_dirs` 路径布局 helper）。
-  - **修改** `sandbox/tools.py`（补 **glob/grep 两工具**至 **7 工具** bash/ls/glob/grep/read_file/write_file/str_replace + `_resolve_max_results`/`_format_glob_results`/`_format_grep_results` helper；移除内联锁改 import `file_operation_lock`；异常改 top-level import；docstring 5→7 工具、去裁剪）、`sandbox/local/__init__.py`（provider 从新模块导出）、`sandbox/security.py`（provider markers 加 `local_sandbox_provider` 路径 + 去裁剪表述）。
-- **关键设计**：虚拟路径 `/mnt/user-data/{workspace,uploads,outputs}` + `/mnt/skills`(只读) → 宿主 `PathMapping` 最长前缀翻译；输出反解析防泄露宿主布局（仅 agent 自写文件）；host-bash 默认禁用（非安全边界）；write_file 80KB 单次上限；同路径写串行化；SandboxMiddleware lazy_init + wrap_tool_call 贴 sandbox_id 回状态。
-- **测试**：`test_sandbox.py`（**97 个**，hermetic：`DEER_FLOW_HOME`→tmp_path 不碰宿主；异常层次/search glob+grep+ignore+truncation+binary/file_operation_lock 同 key 同锁/list_dir 树形/LocalSandbox 路径翻译+反解析+只读+glob+grep+download/Provider acquire+get+LRU+reset/7 工具含 host-bash 闸+穿越+size 上限/SandboxAuditMiddleware 分级+复合拆分+消毒/SandboxMiddleware lazy_init 贴回/security host-bash 准入）。
-- **文档**：`docs/sandbox.md`（#13，面向小白：虚拟路径系统 + provider 模式 + 7 工具 + 双中间件 + 为何本地非安全边界引出 M10b）。
-- **基线**：358 → **455 passed, 1 skipped, 0 lint 错误**。
-
-### M10b AIO 沙箱（生产容器隔离，Phase 2，v1.2 恢复）
-- **代码**：`community/aio_sandbox/`（7 文件）+ `utils/network.py` + `sandbox_config.provisioner_url` + pyproject `aio_sandbox` extra：
-  - **新建** `community/__init__.py`（社区扩展包，不 eager import 子模块）、`community/aio_sandbox/__init__.py`（导出 6 公共类）、`sandbox_info.py`（`SandboxInfo` dataclass，跨进程发现元数据 + to/from_dict）、`backend.py`（`SandboxBackend` ABC[create/destroy/is_alive/discover/list_running] + `wait_for_sandbox_ready[_async]` 轮询健康端点）、`local_backend.py`（`LocalContainerBackend`：Docker/Apple Container CLI 编排，确定性命名 `{prefix}-{sandbox_id}` + 端口冲突重试 + 名冲突→discover + 批量 inspect list_running + 环境变量脱敏日志）、`remote_backend.py`（`RemoteSandboxBackend`：K8s provisioner 薄 HTTP client，list/create/destroy/is_alive/discover）、`aio_sandbox.py`（`AioSandbox`：HTTP client Sandbox 实现，线程锁串行命令 + ErrorObservation 重试 + download 防 穿越/前缀/100MB + glob/grep 远端搜本端滤 + close 摸属性链关 httpx；**soft-load `agent_sandbox`**）、`aio_sandbox_provider.py`（`AioSandboxProvider`：四级缓存[进程内→暖池→跨进程文件锁 discover→create] + 暖池复用 + replicas 软上限淘汰 + idle 超时回收[锁内再验] + 启动收养孤儿 + SIGTERM/SIGINT/SIGHUP+atexit 优雅关闭[幂等] + remote vs local backend 选择）。
-  - **新建** `utils/network.py`（`PortAllocator` + `get_free_port`/`release_port`，bind 0.0.0.0 镜像 Docker wildcard 绑定）。
-  - **修改** `config/sandbox_config.py`（+ `provisioner_url` 字段）、`packages/harness/pyproject.toml`（+ `aio_sandbox` extra = agent-sandbox + requests）。
-- **关键设计**：复用 M10 的 `Sandbox` 抽象（8 方法）/ `SandboxProvider` ABC / `security.py`（`is_host_bash_allowed` 对非 local provider 返回 True）/ `search.py`（glob/grep 本端过滤）/ `local_sandbox.ensure_thread_dirs`（建线程目录）；红线 #33（跨进程锁 + 暖池 + idle + 优雅关闭 + release/destroy 关 HTTP client 防 #2872 套接字泄漏）；soft-load 红线 #24。
-- **测试**：`test_aio_sandbox.py`（**64 个**，hermetic：SandboxInfo 往返 / utils.network 端口分配 / backend 就绪轮询+ABC / soft-load ImportError / AioSandbox[mock SDK：exec+ErrorObservation 重试+download 穿越/前缀/上限+glob/grep+close 幂等] / RemoteSandboxBackend[mock requests] / LocalContainerBackend[mock subprocess：端口重试+名冲突发现+list_running 批量 inspect] / AioSandboxProvider[暖池+跨进程发现+replicas 淘汰+idle 回收+reconcile 孤儿+shutdown 幂等+remote vs local backend 选择]）。
-- **文档**：`docs/aio_sandbox.md`（#14，面向小白：为何需容器隔离 + backend/暖池/确定性 id/跨进程锁概念 + 缓存层级 + 各红线 + soft-load + 与 M10 关系）。
-- **基线**：455 → **519 passed, 1 skipped, 0 lint 错误**。
-
-### M11 subagents（自定义子代理，Phase 2）
-- **代码**：`subagents/`（7 模块）+ `config/subagents_config.py` 扩展 + `contracts/subagent_status_contract.json`：
-  - **新建** `subagents/__init__.py`（导出 SubagentConfig/Executor/Result/Status + registry 函数 + 后台任务函数 + MAX_CONCURRENT_SUBAGENTS）、`config.py`（`SubagentConfig` dataclass[name/description/system_prompt/tools/disallowed_tools/skills/model/max_turns/timeout_seconds] + `resolve_subagent_model_name`[显式 > 父 > config 第一模型] + `_default_model_name`）、`registry.py`（`get_subagent_config` built-in→custom→per-agent override 合并 + `get_subagent_names`/`list_subagents`/`get_available_subagent_names`[host-bash 未放行隐藏 bash]）、`status_contract.py`（`SUBAGENT_STATUS_KEY/ERROR_KEY` + `SUBAGENT_STATUS_VALUES`(5 值) + `extract_subagent_status`[按结果文本前缀映射] + `make_subagent_additional_kwargs`[空 error 丢弃 + 非法状态响亮报错]）、`token_collector.py`（`SubagentTokenCollector(BaseCallbackHandler)` 收 LLM usage 按 run_id 去重回灌父 RunJournal）、`executor.py`（`SubagentStatus` 枚举[7 态 + is_terminal] + `SubagentResult`[try_set_terminal 幂等终态] + **单 `_scheduler_pool=ThreadPoolExecutor(3)` + 持久化 `_isolated_subagent_loop`**[daemon 线程 `asyncio.new_event_loop()` 常驻，复用共享 async client，atexit 清理——**非双线程池**，红线 #34] + `_filter_tools` + `SubagentExecutor`[`_create_agent`/`_build_initial_state`/`_aexecute`/`execute`/`execute_async` + 子代理图 `checkpointer=False` + 协作取消在 astream 迭代边界 + 超时] + 后台任务存储 + `request_cancel`/`get`/`list`/`cleanup_background_task` + `MAX_CONCURRENT_SUBAGENTS=3`）、`builtins/__init__.py`（`BUILTIN_SUBAGENTS` = {general-purpose, bash}）、`builtins/general_purpose.py`（继承除 task/ask_clarification/present_files 外全部工具，max_turns=150）、`builtins/bash_agent.py`（5 沙箱工具，max_turns=60）。
-  - **新建** `contracts/subagent_status_contract.json`（5 状态 × 13 case 后端↔前端契约 fixture）。
-  - **修改** `config/subagents_config.py`（扩展 `SubagentsAppConfig`：+ `custom_agents` dict + `agents` per-agent 覆盖 + helper `get_timeout_for`/`get_model_for`/`get_max_turns_for`/`get_skills_for` + `CustomSubagentConfig`/`SubagentOverrideConfig`；保留 mini 的 `enabled`/`max_concurrent`）。
-  - **关键设计**：① **单 scheduler pool + 持久隔离事件循环**（红线 #34）——复用共享 async client，非双线程池；② 并发上限两道关（SubagentLimitMiddleware[M16] 截断 + scheduler pool 3 槽）；③ 子代理图 checkpointer=False（一次性，不继承父 run）；④ 协作取消在 astream 迭代边界（Future.cancel 杀不掉跑中的子代理线程）；⑤ 5 状态契约（红线 #35，结构化 additional_kwargs 替代脆弱的字符串前缀匹配）；⑥ token 回灌父 RunJournal；⑦ **Phase 2 骨架**：真实 agent 构造依赖 Phase 7 build_subagent_runtime_middlewares / Phase 5 tool_search / Phase 4 skills，用延迟导入 + 缺包降级处理，对应 Phase 落地后自动生效。
-- **测试**：`test_subagents.py`（**72 个**，hermetic：SubagentConfig 默认值 + resolve_model 三优先级 / SubagentsAppConfig 自定义+per-agent+helper / registry 合并[builtin→custom→override] + host-bash 隐藏 bash / status_contract 加载 contracts json 13 case 全映射 + make_kwargs 丢空 error + 非法状态报错 / token_collector 去重+多代累计+snapshot 副本 / executor 单 pool 非双[红线 #34 锁定断言] + 隔离循环复用 + daemon 线程 + _filter_tools + SubagentResult 幂等终态 + execute 成功/失败/无状态/隔离循环路径 + execute_async 后台生命周期 + 协作取消 + 取消前置 + list/cleanup[只清终态]/unknown noop / 降级[skills 空/tool_search 缺/fallback 中间件]）。
-- **文档**：`docs/subagents.md`（#15，面向小白：为何需子代理 + SubagentConfig/内置/自定义/per-agent 覆盖概念 + 单 pool+持久循环设计[为何非双池] + 5 状态契约 + token 回灌 + Phase 2 骨架说明）。
-- **基线**：519 → **591 passed, 1 skipped, 0 lint 错误**。
-
-### M12 tracing（链路追踪，Phase 2）
-- **代码**：`tracing/`（3 模块），env 驱动，未配置零开销：
-  - **新建** `tracing/__init__.py`（导出 `build_tracing_callbacks` / `build_langfuse_trace_metadata` / `inject_langfuse_metadata`）、`factory.py`（`build_tracing_callbacks()`：先 `validate_enabled_tracing_providers()`[缺凭证 ValueError] 再逐 provider 构造[异常包 RuntimeError]，未启用返回 `[]`；私有 `_create_langsmith_tracer`[延迟导 langchain_core LangChainTracer] / `_create_langfuse_handler`[延迟导 langfuse + langfuse.langchain.CallbackHandler，经 client 单例初始化凭证]）、`metadata.py`（`build_langfuse_trace_metadata()`：langfuse 未启用返回 `{}`，启用时映射 session_id=thread_id / user_id[user_id or DEFAULT_USER_ID 兜底] / trace_name[assistant_id or "lead-agent"] / tags[env:<DEER_FLOW_ENV>+model:<name>]；`inject_langfuse_metadata()`：就地 merge 进 `config["metadata"]`，`setdefault` 调用方优先，未启用 no-op；DEFAULT_USER_ID 延迟导 runtime.user_context 避免循环）。
-  - **关键设计**：① **图根注入**（lead_agent/worker 在图调用前 append 回调入 `config["callbacks"]`，单 run 一棵 trace 树）；② **红线 #17**——图内 `create_chat_model` 一律 `attach_tracing=False`，独立调用方 `attach_tracing=True` 经 models 的 `_maybe_build_tracing_callbacks` **懒导入** tracing（落地即自动生效，models 零改动）；③ provider 开关在 config（env `LANGSMITH_TRACING`/`LANGFUSE_TRACING` 驱动，mini 轻量化不占 config.yaml schema）；④ 构造失败响亮报错（追踪坏了得知道），但 `_maybe_build_tracing_callbacks` 吞异常返 `[]`（追踪是 nice-to-have，不能坏 agent 启动）；⑤ `setdefault` 让前端设的 langfuse_session_id 不被后端覆盖。
-- **测试**：`test_tracing.py`（**26 个**，hermetic：build_tracing_callbacks[未配置空/validate 缺凭证报错/langsmith 构造/langfuse 构造/双 provider/构造异常包 RuntimeError/真 langsmith tracer 构造/fake langfuse SDK 注入测真 handler] + metadata[未启用 {} / 字段映射 / DEFAULT_USER_ID 兜底 / tags env+model / 部分 tags] + inject[未启用 no-op / merge / setdefault 调用方优先 / 保留无关 metadata / 建 metadata key] + models attach_tracing 联动[`_maybe_build` 懒导入/启用返回调/吞错 / attach=False 不调 build / attach=True 调 build+挂回调 / build 空[]不挂]）。
-- **文档**：`docs/tracing.md`（#16，面向小白：为何需追踪 + trace/span/callback 概念 + 两 provider + 图根注入为何 + 红线 #17 attach_tracing 分层 + Langfuse 元数据映射 + setdefault 调用方优先 + 构造失败两层语义 + 与 models 懒导入关系）。
-- **基线**：591 → **617 passed, 1 skipped, 0 lint 错误**。
-
-### M22 agents_config（自定义 agent，Phase 2，v1.2 纳入主线）
-- **代码**：`config/agents_config.py`（1 模块）+ `config/paths.py`（Paths 扩展），per-user 隔离 + legacy 只读回退：
-  - **新建** `config/agents_config.py`（`SOUL_FILENAME="SOUL.md"` + `AGENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")`[红线 #32] + `AgentConfig`(pydantic：name/description/model/tool_groups/skills[None 全部/[] 无/白名单]) + `validate_agent_name`[None 透传 / 非字符串报错 / fullmatch 强校验，被 setup/update_agent + memory + client 共用] + `resolve_agent_dir`[per-user 优先 + legacy 只读回退，**要求 config.yaml 才认 agent 目录**——防 #3390：memory 首轮写入的只含 memory.json 的残缺目录不算 agent 目录] + `load_agent_config`[读 config.yaml，缺文件 FileNotFoundError，YAML 错 ValueError，**剥未知字段向前兼容**（legacy prompt_file 等），缺 name 字段从目录名推断] + `load_agent_soul`[读 SOUL.md，strip，空→None，默认 agent 读 base_dir] + `list_custom_agents`[扫 per-user + legacy 并集，per-user 覆盖 legacy，按 name 排序，坏 config 记 warning 跳过不抛]）。
-  - **修改** `config/paths.py`（Paths 加 `user_dir(user_id)` + `agents_dir` 属性 + `agent_dir(name)` + `user_agents_dir(user_id)` + `user_agent_dir(user_id, name)`——**名称一律 `.lower()` 归一**：AGENT_NAME_PATTERN 允许大写但磁盘目录小写化，防 macOS APFS 大小写不敏感碰撞 + 对齐 deer；校验后原名保留在 AgentConfig.name）；`config/__init__.py`（导出 agents_config 全部符号 + __all__）。
-  - **关键设计**：① **per-user 隔离**（`{base_dir}/users/{user_id}/agents/{name}/`，一用户的 agent 不影响另一用户，user_id 来自 get_effective_user_id 兜底 default）；② **legacy 只读回退**（`{base_dir}/agents/{name}/`，兼容 per-user-isolation 之前安装，新写一律 per-user）；③ **#3390 防御**（resolve 要 config.yaml 才认，memory 写残留不冒充 agent 目录）；④ **名称小写归一**（防碰撞 + 对齐 deer）；⑤ **剥未知字段**（向前兼容废弃字段）；⑥ **坏配置不炸列表**（list_custom_agents 记 warning 跳过）。
-- **测试**：`test_agents_config.py`（**83 个**，hermetic：`DEER_FLOW_HOME`→tmp_path + resolve 在前保证路径相等；validate[None/合法参数化/非法参数化：空/下划线/空格/斜杠/点/符号/穿越/中文/换行/非字符串参数化] + pattern 常量锁定 + AgentConfig[最小/全量/dict/skills 三态/未知字段丢弃] + Paths[agents_dir/agent_dir 小写/user_dir/user_agents_dir/user_agent_dir 小写/防碰撞/legacy vs per-user 不同] + resolve_agent_dir[都不存在→per-user 占位/per-user 优先/legacy 回退/**#3390 memory-only 回退**/config+memory 胜/memory-only 无 legacy→占位/默认 user_id 上下文/显式 user_id 覆盖] + load_agent_config[None→None/合法/legacy 回退/per-user 优先/#3390 端到端回退/缺目录/缺 config.yaml/推断 name/config name 胜/剥未知字段/tool_groups/skills 空/skills 缺省/YAML 错/非法名/空 yaml 推断] + load_agent_soul[per-user 读/缺失 None/空白 None/strip/默认 agent 读 base_dir/默认缺失 None/legacy 回退/per-user 优先] + list_custom_agents[空/多发现 per-user/legacy/跳过无 config/跳过非目录/排序/per-user 覆盖 legacy/并集不同名/跳过坏 config/默认 user_id/用户隔离] + 集成[SOUL_FILENAME 常量/get_paths 跟 HOME/全往返]）。
-- **文档**：`docs/agents_config.md`（#17，面向小白：自定义 agent 是什么[SOUL.md 人格 + config.yaml 能力] + skills 三态 + per-user 隔离 + legacy 回退 + 为何要 AGENT_NAME_PATTERN[路径穿越/注入面] + 名称小写归一[macOS 碰撞] + #3390 防御 + 剥未知字段向前兼容 + 完整 per-user+legacy 例子 + 与 M13/M15/M17 关系）。
-- **基线**：617 → **700 passed, 1 skipped, 0 lint 错误**。
-
-### M13 memory（记忆系统，Phase 3）
-- **代码**：`agents/memory/`（6 模块）+ 两中间件重写 + prompt `_get_memory_context` + Paths memory 辅助 + get_memory_config，真记忆——LLM 抽取 + 去抖队列 + per-user 原子存储 + 预算注入：
-  - **新建** `agents/memory/__init__.py`（导出全部公共 API）、`storage.py`（`MemoryStorage` ABC + `FileMemoryStorage`[mtime 缓存按 (user_id, agent_name) 分桶 + 原子写 temp+rename + 损坏 JSON 回退空] + `get_memory_storage`[storage_class 配置加载失败回退 FileMemoryStorage] + `create_empty_memory` + `utc_now_iso_z`）、`message_processing.py`（`filter_messages_for_memory`[只留 user 输入+最终 AI 回复，跳 tool-call AI / 纯上传消息剥光后跳] + `detect_correction`/`detect_reinforcement`[最近 6 条，中英双语模式]）、`queue.py`（`ConversationContext` + `MemoryUpdateQueue`[**去抖合并**同 (thread,user,agent) 取最新 + correction/reinforcement 取或 + **user_id 跨 Timer 捕获**进 ConversationContext] + `add`/`add_nowait`/`flush`/`clear` + `get_memory_queue`/`reset_memory_queue`）、`prompt.py`（`MEMORY_UPDATE_PROMPT`/`FACT_EXTRACTION_PROMPT` + `format_memory_for_injection`[token 预算截断：先 user/history 段，facts 按置信度降序逐条加，超预算按比例截断] + `format_conversation_for_update`[剥上传块/截长/角色] + `_count_tokens`[**tiktoken 冷却降级**：失败缓存 600s 期间走 CJK 感知字符估算，`token_counting: char` 完全跳过] + `warm_tiktoken_cache`）、`updater.py`（`MemoryUpdater`[**同步 LLM 路径防 #2615**：`model.invoke()` + 专用 ThreadPoolExecutor 卸载，不起第二事件循环，不碰共享 async httpx 池] + `aupdate_memory`[asyncio.to_thread 委托同步路径] + `_parse_memory_update_response`[容错解析：围栏/思考包裹/散文里抽 JSON + 不安全部分更新防御 factsToRemove+坏 newFacts 抛] + `_apply_updates`[fail-closed：shouldUpdate 门控 + fact casefold 去重 + 置信度阈值 + max_facts 按置信度留 top + factsToRemove] + `_strip_upload_mentions_from_memory`[收窄正则剥上传句子，不误删 CSV 相关 fact] + fact CRUD `create_memory_fact`/`delete_memory_fact`/`update_memory_fact`/`clear_memory_data`/`get_memory_data`/`reload_memory_data`/`import_memory_data`）。
-  - **重写** `agents/middlewares/memory_middleware.py`（after_agent：filter→detect correction/reinforcement→**捕获 user_id**[请求上下文活着时]→`get_memory_queue().add`；enabled/无 thread_id/无 messages/无 user 或 assistant 跳过）、`agents/middlewares/dynamic_context_middleware.py`（before_agent：**ID-swap 冻结首条 HumanMessage**[复用 ID 原地替换 + 派生 `{id}__user` 紧随，缓存友好] + 记忆+日期注入 + **跨午夜**日期更新提醒 + `asyncio.to_thread` + `wait_for` 5s 超时降级防 tiktoken 卡死）。
-  - **修改** `agents/lead_agent/prompt.py`（+ `_get_memory_context`[延迟导入 memory + user_context 防循环，吞异常返 ""，记忆是 nice-to-have]）、`config/paths.py`（Paths 加 `memory_file`/`user_memory_file`/`agent_memory_file`/`user_agent_memory_file`，名称沿用 agent 辅助的 `.lower()` 归一）、`config/memory_config.py`（+ `get_memory_config()` = `get_app_config().memory` 访问器，mini 不维护独立单例）。
-  - **关键设计**：① **同步 LLM 路径**（红线，防 #2615 跨循环连接复用）；② **去抖合并**（同 key 多次入队合并，省 LLM 调用）；③ **user_id 跨 Timer 捕获**（ContextVar 不跨裸线程，必须入队时存）；④ **原子写**（temp+rename 防写一半崩溃）；⑤ **JSON 容错 + 不安全部分更新防御**；⑥ **fact 去重 + 置信度阈值 + max_facts 裁剪**；⑦ **上传记忆剔除**（session-scoped 不进长期）；⑧ **ID-swap 注入**（缓存友好）；⑨ **tiktoken 冷却降级 + char 模式**（防网络阻塞）；⑩ **summarization_hook 未建**（依赖 M16 SummarizationMiddleware，待 M16 接入）。
-- **测试**：`test_memory.py`（**94 个**，hermetic：`DEER_FLOW_HOME`→tmp_path + autouse 重置 queue/storage 单例 + `_patch_mem_config` 注入所有消费模块[import 绑定不传播] + updater fake model + middleware get_config 替身；storage[空结构/load 缺失/往返/per-user 隔离/per-agent/损坏 JSON 回退/原子写无 temp 残留/mtime 缓存失效/reload 强制/绝对 storage_path 退出隔离/agent_name 校验红线 #32/单例/坏 class 回退] + message_processing[filter 跳 tool-call/纯上传/剥上传留余 + correction/reinforcement 中英] + prompt[注入空/段/fact 置信度排序/预算截断/增量 fit/char 模式/correction sourceError/空摘要跳过 + format_conversation 剥上传/截断/角色 + _count_tokens char/CJK/tiktoken 不可用回退] + updater[parse 干净/围栏/思考包裹/损坏抛/不安全部分更新抛/丢非法 fact/confidence 字符串强转 + apply shouldUpdate/去重 casefold/置信度阈值/max_facts 裁剪/factsToRemove/thread_id source + 上传剔除剥摘要/删 fact/保留 CSV + fact CRUD + clear + finalize fake model 全链路/禁用/空对话/坏 JSON 吞] + queue[pending/同 key 合并/不同 key 分开/correction 取或/user_id 捕获/add_nowait/禁用跳过/clear/flush fake updater/单例] + middleware[enabled/无 thread_id/无 messages/无 assistant 跳过 + user_id 捕获/agent_name 传递/correction 检测] + dynamic_context[_get_memory_context 禁用/空/有记忆/异常吞 + 首轮 ID-swap/同天 no-op/跨午夜/injection 门控/空消息/is_reminder]）。
-- **文档**：`docs/memory.md`（#18，面向小白：为何需记忆 + memory.json 数据结构 + 四步流水线 + per-user/agent 隔离 + 去抖队列 + **同步 LLM 路径防 #2615**[为何不用 async] + 原子写 + user_id 跨 Timer 捕获 + 注入预算 + ID-swap 缓存友好 + to_thread 5s 超时 + JSON 容错 + fact 去重/阈值/裁剪 + 上传剔除 + correction/reinforcement + 文件结构 + 排错 FAQ）。
-- **基线**：700 → **794 passed, 1 skipped, 0 lint 错误**。
-
-### M14 skills（技能系统，Phase 4）
-- **代码**：`skills/`（12 文件）+ `SkillActivationMiddleware` + prompt `get_skills_prompt_section` + build_middlewares 挂载，SKILL.md 协议：发现 / 按需激活 / 安全安装：
-  - **新建** `skills/types.py`（`Skill` dataclass + `SkillCategory`(PUBLIC/CUSTOM) + `SKILL_MD_FILE`）、`parser.py`（`parse_skill_file`[YAML frontmatter 围栏解析 + 缺字段返回 None + YAML 错友好提示] + `parse_allowed_tools`[None/list/[]/非法]）、`validation.py`（`_validate_skill_frontmatter`[命名约定 hyphen-case / 未知 key / 角括号 / 长度上限]）、`slash.py`（`parse_slash_skill_reference`[严格 `/skill-name<空白或行尾>` 语法] + `resolve_slash_skill`[启用+白名单] + `RESERVED_SLASH_SKILL_NAMES`[new/help/memory/models/status/bootstrap]）、`tool_policy.py`（`allowed_tool_names_for_skills`[无声明→None 全放行 / 有声明→并集] + `filter_tools_by_skill_allowed_tools`）、`permissions.py`（`make_skill_*_sandbox_readable`[目录 0o555 / 文件 0o444，剥 sandbox 写位，跳 symlink] + 穿越校验）、`security_scanner.py`（`scan_skill_content`[LLM allow/warn/block + JSON 容错解析 + **不可用保守回退 block**] + `ScanResult`）、`installer.py`（`is_unsafe_zip_member`[绝对/穿越] + `is_symlink_member` + `safe_extract_skill_archive`[**512MB zip 炸弹上限** + resolve+is_relative_to] + `resolve_skill_dir_from_archive`[滤 macOS/dotfile] + `_move_staged_skill_into_reserved_target`[预占 0o700 + 原子搬入 + 失败回滚] + `_scan_skill_archive_contents_or_raise`[SKILL.md + scripts + references/templates 逐文件审，嵌套 SKILL.md 禁止] + 异常 `SkillAlreadyExistsError`/`SkillSecurityScanError`）、`storage/__init__.py`（`get_or_new_skill_storage`[反射工厂 + 进程单例 + per-config 新实例] + `reset_skill_storage`）、`storage/skill_storage.py`（`SkillStorage` ABC[`load_skills` 模板[每次重读 extensions_config enabled] + `validate_skill_name` + `validate_relative_path`[穿越拒绝] + `ensure_safe_support_path`[白名单子目录] + 路径 helper]）、`storage/local_skill_storage.py`（`LocalSkillStorage`[_iter_skill_files 遍历 + read/write_custom_skill 原子写 + ainstall_skill_from_archive[async to_thread 卸载] + delete + history JSONL]）、`__init__.py`（导出公共 API）。
-  - **新建** `agents/middlewares/skill_activation_middleware.py`（`SkillActivationMiddleware`[wrap_model_call：用户输 `/skill-name` → 注入 SKILL.md 全文为隐藏 HumanMessage；**幂等**[__slash_activation ID + 标志检测]；**读盘穿越拒绝**[resolve+relative_to(skills_root)]；**html.escape 防注入**；未安装/未启用/不在白名单 → 友好 AIMessage 失败；async to_thread 卸载]）。
-  - **修改** `agents/lead_agent/prompt.py`（+ `get_skills_prompt_section`[渲染技能段 + 白名单过滤 + 自演化段] + **后台刷新缓存**[`_enabled_skills_cache` 进程单例 + daemon 线程 `_refresh_enabled_skills_cache_worker` + `_enabled_skills_by_config_cache` 按 AppConfig 隔离 + `lru_cache` 渲染段 + miss 非阻塞读返回 [] 触发后台刷新 + `clear_skills_system_prompt_cache`/`refresh_skills_system_prompt_cache_async` 失效]）、`agents/middlewares/__init__.py`（build_middlewares 挂 SkillActivationMiddleware，在 ToolErrorHandling 之后）。
-  - **修改** `subagents/executor.py`（`_load_skills` 加载失败**降级为无技能**返回 []——M14 落地前靠 ImportError 短路，现由 except 统一兜底；技能是子代理可选项，不让加载失败拖垮子代理）。
-  - **已有** `skills/public/example/SKILL.md`（示例技能，验证发现/激活流）。
-  - **关键设计**：① **slash 严格语法 + 保留字过滤**；② **读盘穿越拒绝**（resolve+relative_to，两处：激活读盘 + storage 写入）；③ **html.escape 防注入**；④ **zip 炸弹防御**（512MB + 穿越/symlink 拒绝）；⑤ **LLM 安全审查**（allow/warn/block，可执行须 allow，不可用回退 block）；⑥ **权限收紧**（沙箱只读）；⑦ **原子搬入**（预占 + 回滚）；⑧ **后台刷新缓存**（非阻塞读）；⑨ **enabled 每次重读**（他进程改动立即生效）；⑩ **allowed-tools 白名单收紧**（一旦有声明取并集）。
-  - **延后**：`filter_tools_by_skill_allowed_tools` 在 agent 工厂收紧工具集 + `_available_skill_names`（bootstrap/custom-agent 可见性）→ M17 lead_agent 全量重写时统一做。
-- **测试**：`test_skills.py`（**80 个**，hermetic：`LocalSkillStorage(host_path=tmp)` 绕单例 + monkeypatch scan + ModelRequest 桩 + prompt 缓存每测前 clear；parser[合法/缺字段/无 frontmatter/allowed-tools None-list-[]-非法] + validation[合法/缺 name/未知 key/大写名/连字符/角括号/超长] + slash[合法/无任务/保留字/大写拒/前导空白拒/resolve 启用-禁用-白名单] + tool_policy[无技能-无声明→None/并集/过滤/空列表禁全部] + storage[发现 public+custom/排序/enabled 过滤/空根/穿越拒绝 relative_path/穿越拒绝 support_path/错误子目录/名称校验/写读自定义/历史追加读/历史缺失空/async to_thread 卸载] + permissions[文件只读/目录只读/穿越拒] + installer[unsafe 绝对-穿越/安全 normal/拒穿越/zip 炸弹上限/resolve 单层嵌套-扁平-空/已存在 SkillAlreadyExistsError] + security_scanner[JSON 干净-围栏-嵌入-无/allow/不可解析回退 block/不可用 executable block] + activation[注入/幂等不重注/未安装失败/不在白名单失败/无 slash 不激活/读盘穿越拒/html.escape] + prompt[空/列出技能/白名单过滤/白名单全不中空/自演化段/缓存失效]）。
-- **文档**：`docs/skills.md`（#19，面向小白：为何需技能 + SKILL.md 协议 + 三流[发现/激活/安装] + allowed-tools 收紧 + slash 保留字 + 权限收紧 + LLM 安全审查 + 路径穿越防御两处 + html.escape + 后台刷新缓存 + enabled 每次重读 + 原子搬入 + 文件结构 + 排错 FAQ）。
-- **基线**：794 → **874 passed, 1 skipped, 0 lint 错误**。
-- 6 个旧测试重写为 hermetic（reflection/config/tools/middlewares/agent/agent_with_middlewares），对齐 deer 风格
-
-### M20 mcp（MCP 集成，Phase 5，v1.2 纳入主线）
-- **代码**：`mcp/`（6 文件）+ `tools/sync.py`（M20 引入，M15 扩展 RunnableConfig 注入）+ `config/extensions_config.py` 扩展 + `tools/tools.py` 接 MCP，外部 MCP 服务器工具发现 + 调用（stdio/sse/http 三传输 + OAuth + 有状态会话池 + mtime 缓存失效）：
-  - **新建** `mcp/__init__.py`（导出 build/get/initialize/reset 全套公共 API）、`mcp/client.py`（`build_server_params`[单服务器：stdio→command/args/env，sse/http→url/headers，缺字段报错，未知传输报错] + `build_servers_config`[遍历启用服务器，坏配置记 warning 跳过不拖垮其它]）、`mcp/oauth.py`（`OAuthTokenManager`[from_extensions_config + 每 server 一把 asyncio.Lock + 双检锁防并发刷新 + 过期前 refresh_skew_seconds 提前刷新，红线 #30 + grant_type 校验 client_credentials/refresh_token] + `_OAuthToken` 缓存 + `build_oauth_tool_interceptor`[无 OAuth→None / 有→request.override 注入 Authorization 头] + `get_initial_oauth_headers`[server 连接初始化鉴权头]；httpx 软加载）、`mcp/session_pool.py`（`MCPSessionPool`[按 (server_name, thread_id) 维护有状态 stdio 会话 + **owner-task 生命周期**[专属 _run_session task 进 __aenter__→initialize→发布 ready→等 close_evt→__aexit__，进出同 task 满足 anyio cancel-scope 约束] + threading.Lock 线程/async 双路径安全 + 在建去重 join + LRU 256 淘汰[红线 #29] + 跨循环关闭路由[同循环 await/跨循环 run_coroutine_threadsafe/空闲信号] + close_scope/close_server/close_all/close_all_sync] + `get_session_pool`/`reset_session_pool` 单例）、`mcp/tools.py`（`get_mcp_tools`[读 extensions_config→build_servers_config→注入初始 OAuth 头→构造 MultiServerMCPClient[tool_interceptors=oauth+自定义 + tool_name_prefix=True]→发现工具→**仅 stdio 包 _make_session_pool_tool**[http/sse 不包防 #3203 TaskGroup 跨 task 崩]→补同步入口 make_sync_tool_wrapper；soft-load langchain-mcp-adapters 缺包返 [] + 可操作安装提示；自定义 mcpInterceptors 经 resolve_variable 加载，坏拦截器跳过；异常返 []] + `_make_session_pool_tool`[StructuredTool 包持久会话 + 拦截器链 + MCP call meta 透传头] + `_extract_thread_id`[runtime.context→runtime.config→get_config→default] + `_convert_call_tool_result`[MCP content block→LangChain content block，ToolMessage/Command 透传，isError 抛 ToolException]）、`mcp/cache.py`（`_mcp_tools_cache` 全局 + `_get_config_mtime`[extensions_config mtime] + `_is_cache_stale`[mtime 变化检测] + `initialize_mcp_tools`[asyncio.Lock 幂等初始化] + `get_cached_mcp_tools`[**Python 3.14 安全**：get_running_loop 检测，运行中→卸线程开新循环，无→asyncio.run；mtime 过期→reset 重载；懒加载] + `reset_mcp_tools_cache`[清缓存 + close_all_sync 关持久会话 + reset_session_pool]）。
-  - **新建** `tools/sync.py`（`make_sync_tool_wrapper`[异步工具协程→同步入口；运行中循环→_SYNC_TOOL_EXECUTOR 线程池开新循环 + copy_context；无循环→asyncio.run；异常透传]；M20 引入供 MCP 工具补 func，M15 扩展补 RunnableConfig 参数注入）。
-  - **修改** `config/extensions_config.py`（+ `McpOAuthConfig` dataclass[enabled/token_url/grant_type/client_id/secret/refresh_token/scope/audience/token_field/token_type_field/expires_in_field/default_token_type/refresh_skew_seconds/extra_token_params + extra 未知字段] + `McpServerConfig`[+ oauth/description/extra + from_dict 处理 transport→type 别名 + 未知字段进 extra] + `ExtensionsConfig`[+ `mcp_interceptors` + `resolve_config_path` classmethod[param>env>项目根>default_path>None] + `resolve_env_variables`[$VAR 展开，未解析→空字符串] + `from_dict` 兼容 deer dict[mcpServers/skills] 与 mini list[mcp_servers/enabled_skills] 双格式 + `get_oauth_servers` 过滤]；is_skill_enabled 向后兼容 M14）、`config/__init__.py`（导出 McpOAuthConfig）、`tools/tools.py`（`get_available_tools` 的 include_mcp 分支接 `get_cached_mcp_tools`，try/except Exception 软加载兜底）、`test/conftest.py`（autouse `_reset_singletons_between_tests` 加 `reset_mcp_tools_cache` 软加载重置）。
-  - **关键设计**：① **三传输**（stdio/sse/http，build_server_params 组装）；② **会话池仅 stdio**（http/sse 的 anyio TaskGroup 跨 task 关闭崩 #3203，故不池化）；③ **owner-task 生命周期**（anyio cancel-scope 同 task 约束——专属 task 进出，杜绝同步路径跨 task 崩 #3379）；④ **LRU 256 防泄漏**（红线 #29）；⑤ **OAuth 提前刷新 skew + 双检锁**（红线 #30）；⑥ **mtime 缓存失效**（改配置不重启）；⑦ **soft-load adapter**（缺包返 [] + 安装提示，红线 #24）；⑧ **Python 3.14 get_running_loop**（替代废弃的 get_event_loop）；⑨ **deer/mini 双格式兼容**（from_dict 归一）；⑩ **tool_name_prefix 防撞**（红线 #18 延伸）；⑪ **坏配置/坏拦截器不拖垮**（记 warning 跳过）。
-  - **延后**：`tag_mcp_tool`/`is_mcp_tool`（MCP_TOOL_METADATA_KEY）→ M15（tool_search 延迟装配标记）；`_get_runnable_config_param` RunnableConfig 注入 → M15（tools/sync 扩展）。
-- **测试**：`test_mcp.py`（**91 个**，hermetic：`langchain-mcp-adapters`/`mcp`/`httpx` 均**未安装**——`sys.modules` 注入 fake 模块 + monkeypatch，零网络零子进程；extensions_config[McpOAuthConfig from_dict 已知/未知字段/默认 + McpServerConfig transport 别名/type 优先/oauth/unknown 进 extra/name from key + from_dict deer dict/mini list/skills dict+list/mcpInterceptors str→list/invalid 过滤 + get_oauth_servers 过滤 + resolve_env_variables str/unset→空/plain/递归 + resolve_config_path param/env/missing 报错 + from_file missing→空/deer 格式 + is_skill_enabled 向后兼容] + client[stdio command/args/env/无 env 省略/缺 command 报错/sse+http 参数化/缺 url 报错/未知传输报错/默认 stdio + servers_config 空/多服务器/坏跳过/disabled 排除] + oauth[无 OAuth servers/None header + fetch+cache token/client_credentials 表单 + 缓存复用不二次 fetch + refresh_skew 触发刷新 + refresh_token 缺报错/unsupported grant/client_credentials 缺 id/secret + interceptor 无 OAuth→None/注入头保留原头/无 header 透传 + initial_headers 空/有 server] + session_pool[常量 256/5s + 单例/reset + close_all/close_all_sync 空 noop + get_session 创建+initialize + 复用同 scope + 隔离不同 scope + 同 task 进出 + close_scope 只关该 scope + close_server 只关该 server + LRU 淘汰[小 MAX monkeypatch] + close_all 排空] + tools[soft-load 缺包→[] + 无服务器→[] + 发现多服务器 + stdio 包 StructuredTool + http 不包 + 补 sync func + 自定义拦截器加载 + 坏拦截器跳过 + 异常→[] + extract_thread_id runtime context/config/default] + sync[无循环同步跑/运行中循环卸线程/异常透传] + cache[mtime None/float + stale 未初始化 False/mtime 前进 True/不变 False + initialize 幂等 + reset 清空 + get_cached 懒加载/失败→[]/mtime 变化重新初始化] + 集成[get_available_tools 无 MCP 服务器不加额外工具]）。
-- **文档**：`docs/mcp.md`（#20，面向小白：MCP 是什么[USB 协议类比] + 三传输对比[stdio 有状态/http/sse 无状态] + 核心数据流 + 四大工程问题[会话池 owner-task/OAuth skew 刷新/mtime 失效/soft-load] + 文件结构 + 设计原理[为何仅 stdio 池化/owner task 不任意 cancel/mtime 而非事件通知/双检锁/get_event_loop 3.14 陷阱] + 与 M15/M16 关系 + 排错 FAQ + 应用方法）。
-- **基线**：874 → **965 passed, 1 skipped, 0 lint 错误**。
-
-### M21 community（联网搜索/抓取 provider 框架，Phase 5，v1.2 纳入主线）
-- **代码**：`community/`（12 provider + `_common.py`）+ `utils/readability.py` + `config/app_config.py` 扩展，web 搜索/抓取 provider 框架 + 核心 provider 实现，agent 联网能力的核心来源：
-  - **新建** `community/_common.py`（**共享层**——outline 明确要求建：`MAX_FETCH_CHARS=4096` + `normalize_search_result`[title/url/snippet 归一，content_key 可切 content/snippet] + `truncate_content`[4KB 截断，None 安全] + `coerce_bool`/`coerce_int`/`coerce_timeout`/`coerce_proxy`[config 字符串值安全强转] + `get_tool_extras`[读 AppConfig.get_tool_config 返回 dict，None→{}] + `post_json`[async httpx 封装，异常归一 "Error:" 前缀，httpx 软加载]）。
-  - **新建** `utils/readability.py`（对齐 deer：`Article`[title/html_content/to_markdown 含 markdownify 软加载] + `ReadabilityExtractor.extract_article`[soft-load readabilipy 优先 / ImportError→**纯 Python 兜底**：剥 head/script/style/nav/footer/header 标签 + 抽 `<title>` + 去标签 + 实体解码 + 折叠空白]；保证缺重包时 jina/browserless 仍产出可读文本）。
-  - **核心 provider（完整实现）**：`community/ddg_search/`[`web_search_tool` 同步，**无需 key**，soft-load ddgs；`_infer_wikipedia_region` 按 Unicode 字符块推断 CJK/西里尔/希腊/希伯来/阿拉伯 region；`_resolve_ddgs_region` 处理 wikipedia backend 的语言子域名；backend auto/duckduckgo/wikipedia]）、`community/tavily/`[`web_search_tool`+`web_fetch_tool` 同步，soft-load tavily；extract failed_results→Error / 4KB 截断]）、`community/jina_ai/`[`web_fetch_tool` **async** + `jina_client.py`[JinaClient.crawl 走 _common.post_json，JINA_API_KEY 可选注入 Authorization 头]；readability 提取卸线程 to_thread]）。
-  - **全量移植 provider（httpx/ddgs 驱动）**：`community/image_search/`[ddgs 图搜，size/type/layout 过滤]、`community/brave/`[同步 httpx REST，count clamp [1,20]，BRAVE_SEARCH_API_KEY]、`community/serper/`[同步 httpx，经 Serper 调 Google]、`community/searxng/`[`searxng_client.py` SearxngClient async httpx + tools，自托管 base_url]、`community/browserless/`[`browserless_client.py` BrowserlessClient async httpx headless Chrome 渲染 + waitForEvent/Selector + tools 经 readability 提取]）。
-  - **软加载占位 provider（SDK 缺包返可操作错误）**：`community/firecrawl/`[soft-load firecrawl，search+fetch]、`community/exa/`[soft-load exa_py，search+fetch]、`community/infoquest/`[`infoquest_client.py` compact InfoQuestClient[web_search/fetch/image_search，requests 驱动，INFOQUEST_API_KEY 检查] + tools]）。
-  - **修改** `config/app_config.py`（+ `get_tool_config(name) -> dict | None`[按 tools[].name 查，mini 用 list[dict] 故返回原始 dict，调用方 .get(key, default)；等价 deer pydantic ToolConfig.model_extra]）、`community/__init__.py`（docstring 更新：12 provider 列表 + 不 eager import 约定）。
-  - **关键设计**：① **provider 框架可插拔**（换 provider 只改 config.yaml 的 `tools[].use:` 一行，结果归一后 agent 无感知）；② **`_common` 共享层**（normalize/truncate/coerce/post_json 12 provider 共用，DRY 单源）；③ **结果归一**（ddg href/body、tavily url/content、brave url/description → 统一 {title,url,snippet}）；④ **4KB 截断**（防 prompt 爆炸，`MAX_FETCH_CHARS` 单源）；⑤ **SDK 软加载红线 #24**（模块顶层不 import SDK，函数内 try/except，缺包返安装提示——`tools[].use:` 路径永远能 resolve）；⑥ **readability 纯 Python 兜底**（缺 readabilipy/markdownify 不崩，降级提取）；⑦ **CJK region 推断**（wikipedia backend + 全球 region 时按字符块选语言子域名）；⑧ **异常归一 "Error:" 前缀**（jina/browserless 工具不抛异常打断 agent）；⑨ **async 抓取卸线程**（readability CPU 密集 → to_thread）；⑩ **参数强转**（config 字符串值 coerce_bool/int/timeout/proxy 容错）；⑪ **12 provider 全量对齐 deer**（不删接口，3 占位按需补全）。
-  - **延后**：community 工具经 M15 `get_available_tools` 遍历 `config.tools[]` 调 `resolve_variable(cfg["use"], BaseTool)` 加载——M15 落地后自动生效（本模块不挂载，只提供 provider + 经测试锁定 resolve 路径）。
-- **测试**：`test_community.py`（**106 个**，hermetic：`ddgs`/`tavily`/`firecrawl`/`exa_py` 均**未安装**——`sys.modules` 注入 fake 模块；`httpx`/`requests` 已安装——monkeypatch 替 `httpx.Client`/`httpx.AsyncClient`；config 经 monkeypatch `_common.get_app_config` 注入 `_FakeConfig`；零网络零子进程。_common[MAX_FETCH_CHARS=4096 + normalize 默认/snippet key/None→空 + truncate 默认/自定义/None + coerce_bool 参数化[yes/true/1/on/no/false/0/off/bool/None/非法] + coerce_int 参数化[str/int/float/bool→default/非法/空白] + coerce_timeout 别名 + coerce_proxy 参数化 + get_tool_extras 无配置→{}/找到/默认值 + post_json[200 返文本/非 200→Error/空响应→Error/请求异常→Error]] + readability[Article to_markdown 含 title/空内容占位 + extractor 纯 Python 兜底剥 script/title 提取/剥 nav-footer/缺 title→Untitled] + AppConfig.get_tool_config[找到含 extras/未找到 None/空 tools/多工具选对] + ddg[CJK region 参数化[日/韩/中/西里尔/希腊/希伯来/阿拉伯/拉丁→默认] + resolve worldwide 推断/非 wikipedia 透传/无 dash 默认/语言别名 + backend 归一 None/list/空/str + 缺包→[] + 注入 fake ddgs 发现+归一 + 无结果 + config 覆盖 max_results/region/backend] + tavily[缺包→安装提示 + 注入 fake search 归一 snippet + config max_results + fetch 4KB 截断+标题 + failed_results→Error + 无结果] + jina[fetch markdown+4KB + Error 透传 + JINA_API_KEY 注入 Authorization + config timeout/proxy/trust_env 强转] + image_search[缺包→无图 + 注入 fake images 返 thumbnail_url] + brave[无 key→Error + max_results clamp[100→20/0→1/非法→default/"7"] + mock httpx 归一 + HTTP 503 错 + 无结果] + serper[无 key→Error + mock httpx 归一 + 空 organic→No results] + searxng[mock AsyncClient 归一 + 请求错→Error JSON] + browserless[mock AsyncClient markdown+4KB + 非 200→Error] + 占位[firecrawl/exa 缺 SDK→安装提示 + infoquest 无 key→Error] + resolve 路径[12 provider 经 resolve_variable 全部 resolve 成 BaseTool]）。
-- **文档**：`docs/community.md`（#21，面向小白：为何需联网[训练数据 cutoff] + provider 框架[12 provider 取舍表] + `tools[].use:` 加载机制 + 选哪个 provider + `_common` 共享层 + readability 可读性提取 + 4KB 截断 + CJK region 推断 + 软加载 + 文件结构 + 设计原理[为何抽 _common/get_tool_extras 返 dict/readability 纯 Python 兜底/异常归一 Error 前缀/参数强转] + 与 M15 关系 + 排错 FAQ + 应用方法）。
-- **基线**：965 → **1071 passed, 1 skipped, 0 lint 错误**。
-
-### M15 tools（9 内置工具 + 工具组装，Phase 5）
-- **代码**：`tools/builtins/`（7 新）+ `tools/skill_manage_tool.py` + `tools/mcp_metadata.py` + `tools/sync.py` 扩展 + `tools/tools.py` 重写，对齐 deer 工具组装——9 内置工具全收 + 五类来源汇总 + 去重 + 条件加载（v1.2 全面对标，不再裁剪）：
-  - **新建** `tools/mcp_metadata.py`（`MCP_TOOL_METADATA_KEY="deerflow_mcp"` + `tag_mcp_tool`[就地标记+链式返回] + `is_mcp_tool`；叶子模块只依赖 BaseTool，供 tool_search + agent 构建识别 MCP 来源）、`tools/builtins/view_image_tool.py`（`view_image`：路径白名单 `/mnt/user-data/{workspace,uploads,outputs}` + 扩展名 jpg/jpeg/png/webp + 魔数双校验防欺骗 + 20MB 上限 + 写 `viewed_images` 状态经 reducer 合并；仅 supports_vision）、`tools/builtins/task_tool.py`（`task`：子代理委派，`SubagentExecutor.execute_async` 后台执行 + 5s 轮询 + SSE 事件[task_started/running/completed/failed/cancelled/timed_out] + token 按 tool_call_id 缓存[供 TokenUsageMiddleware 回灌] + 取消时协作取消 + 延迟清理；仅 subagent_enabled；依赖 M11）、`tools/builtins/tool_search.py`（`DeferredToolCatalog`[不可变 frozen dataclass + cached_property names/hash + search select/keyword/+token/非法正则降级] + `build_tool_search_tool`[闭包 catalog，提升写图状态 Command] + `build_deferred_tool_setup`/`assemble_deferred_tools`[fail-closed，必须策略过滤后调] + `get_deferred_tools_prompt_section`[渲染 `<available-deferred-tools>`]；依赖 M20 mcp_metadata）、`tools/builtins/setup_agent_tool.py`（`setup_agent`：写 SOUL.md+config.yaml 到 per-user 目录，空 soul 拒绝防 #3549，失败回滚新建目录；依赖 M22；仅 is_bootstrap 由 M17 绑）、`tools/builtins/update_agent_tool.py`（`update_agent`：部分更新 + temp+rename 原子写[两文件全成才 rename] + 未知 model 前置拒 + nullish 字符串归一[防 "null"/"none"/"undefined" 误传] + legacy 布局检测；依赖 M22；仅 agent_name 非 bootstrap 由 M17 绑）、`tools/builtins/invoke_acp_agent_tool.py`（`build_invoke_acp_agent_tool`：描述列配置的 agent + per-thread `/mnt/acp-workspace` + MCP servers 透传[build_acp_mcp_servers 转 ACP 线格式] + 权限自动批准；**soft-load `acp`** 缺包返安装提示；mini 适配：acp_agents 从 AppConfig.extra 读 + workspace 内联计算[mini 无 paths.acp_workspace_dir]）、`tools/skill_manage_tool.py`（`skill_manage`：create/patch/edit/delete/write_file/remove_file + per-skill WeakValueDictionary async 锁 + 写前 scan_skill_content[block 抛错/可执行须 allow] + 全程记 `.history/<name>.jsonl` + 刷新 lead_agent 技能提示缓存 + 补同步入口 make_sync_tool_wrapper；依赖 M14；仅 skill_evolution.enabled）。
-  - **修改** `tools/sync.py`（+ `_get_runnable_config_param`[扫类型注解找 RunnableConfig 参数名，解 partial] + `make_sync_tool_wrapper` 扩展[检测到 config 参数则包装暴露 `config: RunnableConfig` 转发，覆盖 invoke_acp_agent；M20 延后补]）、`tools/tools.py`（**重写 `get_available_tools`**：① 配置工具经 `resolve_variable(cfg["use"], BaseTool)` 加载[含 M21 community web 工具] + host-bash 过滤[`_is_host_bash_tool`/`is_host_bash_allowed`，LocalSandbox 活跃时不暴露] + name-mismatch 告警[#1803 根因]；② 条件加 builtins[always present_file/ask_clarification；skill_evolution→skill_manage；subagent_enabled→task；supports_vision→view_image]；③ MCP 加载[`get_cached_mcp_tools`+`tag_mcp_tool`，try/except 软加载]；④ ACP[`acp_agents` 配置了才加，soft-load]；⑤ 按 name 去重[config>builtins>MCP>ACP，防 #1803] + 全程 `_ensure_sync_invocable_tool` 补同步入口）、`tools/builtins/__init__.py`（导出 9 工具 + tool_search 装配 API + build_invoke_acp_agent_tool）。
-  - **关键设计**：① **按 name 去重 config>builtins>MCP>ACP**（防 #1803 重名让 LLM 收到模糊/拼接 schema）；② **host-bash 过滤**（LocalSandbox 非安全边界，不暴露宿主 bash）；③ **name-mismatch 告警**（config name ≠ tool .name 是 #1803 根因）；④ **sync 包装**（async-only 工具补 func 同步入口）；⑤ **MCP 标记 + 延迟装配**（tool_search，MCP 工具体量大默认延迟，fail-closed）；⑥ **条件加载**（view_image/task/skill_manage/tool_search/setup/update_agent 各按开关/上下文）；⑦ **soft-load MCP/ACP**（缺包软加载 + 安装提示，红线 #24）；⑧ **setup/update_agent 不在 get_available_tools**（按运行时上下文由 M17 factory 绑，非配置开关）；⑨ **tool_search catalog_hash** scope per-thread 提升防目录变误用；⑩ **update_agent 原子 temp+rename** 防部分写。
-  - **延后**：setup_agent/update_agent 真正绑定 + tool_search 真实延迟过滤 → M17 lead_agent factory（按 runtime.context 绑 setup/update + assemble_deferred_tools）+ M16 DeferredToolFilterMiddleware（按 thread 提升延迟工具）。
-- **测试**：`test_tools.py`（**78 个** = 4 原有 + 74 新，hermetic：`get_available_tools(app_config=...)` 注入显式配置；配置工具 monkeypatch 桩 resolve_variable；MCP/ACP 缺包软加载；setup/update_agent/skill_manage 用 `DEER_FLOW_HOME`→tmp_path + LocalSkillStorage(host_path=tmp) 绕单例 + 扫描器桩 allow/block；runtime 用 SimpleNamespace 直接调 `.func()` 绕 args_schema Runtime 校验。get_available_tools[dedupe config 胜/host-bash 过滤+保留/name-mismatch 告警/view_image 条件/task 条件/skill_manage 条件/MCP 软加载→空/ACP 条件/include_mcp=False] + mcp_metadata[tag+is+key 常量+保留原 metadata+无 metadata attr] + sync[_get_runnable_config_param 有/无/partial + wrapper 无 config 跑/有 config 转发] + tool_search[search select/keyword/description/+token/bare+/空/非法正则降级 + hash 稳定/变 + names cached + assemble disabled 空/无 MCP 空/有 MCP 延迟+加 tool_search/fail-closed + prompt section 空/排序] + view_image[路径白名单+魔数参数化] + setup_agent[写 SOUL+config/空 soul 拒/默认 agent 写 base_dir] + update_agent[无字段错/无 agent_name 错/未知 model 拒/部分更新 soul only/更新 desc+model/nullish 归一/不存在] + skill_manage[create+历史/重复错/patch/patch 未找到/edit/delete/write+remove_file/安全 block/不支持 action/有 sync func] + invoke_acp[描述列 agent/缺包安装提示/未知 agent/duck-typed attr] + task_tool[未知类型错/bash 无 host-bash 禁用] + sync 包装[async-only 补 func/sync 不变] + _is_host_bash_tool）。
-- **文档**：`docs/tools.md`（#22，重写自 legacy：工具五类来源 + 9 内置工具逐一 + `get_available_tools` 组装流程 + `tools[].use:` 加载机制 + MCP 标记 + tool_search 延迟装配[fail-closed] + sync 包装 + 文件结构 + 设计原理[为何去重 config 优先/host-bash 过滤/MCP 延迟/fail-closed/setup-update 不在 get_available_tools/ACP soft-load] + 与各模块关系 + 排错 FAQ + 应用方法）。
-- **基线**：1071 → **1145 passed, 1 skipped, 0 lint 错误**。
-
-### M23 uploads（文件上传 + markitdown 转换，Phase 5.5，v1.2 纳入主线）
-- **代码**：`uploads/`（manager + conversion）+ `config/uploads_config.py` + `config/paths.py` 扩展 + `config/app_config.py` 接字段，文件上传 + markitdown 文档转换 + 安全加固（路径穿越 + symlink + 唯一文件名）：
-  - **新建** `uploads/manager.py`（纯业务逻辑，无 FastAPI/HTTP 依赖：`PathTraversalError`/`UnsafeUploadPathError` 异常 + `validate_thread_id`[thread_id 只允许 `[A-zA-Z0-9._-]` 防路径分隔符注入] + `get_uploads_dir`/`ensure_uploads_dir`[per-user per-thread 隔离，user_id 来自 get_effective_user_id] + `normalize_filename`[只取 basename + 拒 `.`/`..`/反斜杠 + 255 UTF-8 字节上限] + `claim_unique_filename`[碰撞追加 `_N` 后缀 + 自动入 seen] + `validate_path_traversal`[resolve().relative_to() 兜底，含 symlink] + `open_upload_file_no_symlink`[**POSIX O_NOFOLLOW** 拒 symlink 目标 + O_NONBLOCK 挡特殊文件 + fstat 复核 nlink==1 / Windows 退化 lstat+fstat 双校验缩 TOCTOU，红线 #29] + `write_upload_file_no_symlink`[流式写封装] + `list_files_in_dir`[scandir + follow_symlinks=False，只列文件] + `delete_file_safe`[穿越校验 + 可选伴随 .md 清理 missing_ok] + `upload_virtual_path`/`upload_artifact_url`[percent-encode 文件名] + `enrich_file_listing`[补 virtual_path/artifact_url] + `make_conversion_pool`/`convert_with_pool`[**事件循环内复用单 worker 线程池**跑 asyncio.run，避免反复建拆循环]）。
-  - **新建** `uploads/conversion.py`（`CONVERTIBLE_EXTENSIONS`[pdf/ppt/pptx/xls/xlsx/doc/docx] + `_do_convert` + `convert_file_to_markdown`[async，>1MB 走 to_thread #1569，失败返 None 保留原文件] + **PDF 双策略**[auto: pymupdf4llm 优先，输出 <50字/页 或 <200字判定图片 PDF 回退 markitdown；pymupdf4llm 强制不回退；markitdown 跳过 pymupdf] + `_pymupdf_output_too_sparse`[每页字符数判定] + `extract_outline`[标准#/纯粗体结构性**ITEM 1. BUSINESS**/拆分粗体**1** **Introduction** 三风格 + MAX_OUTLINE_ENTRIES=50 + truncated 哨兵]；**markitdown/pymupdf4llm 双 soft-load**[函数内 import，缺包即回退/跳过]）。
-  - **新建** `uploads/__init__.py`（导出 manager 全部公共 API + conversion 的 CONVERTIBLE_EXTENSIONS/convert_file_to_markdown/extract_outline + 异常类）。
-  - **新建** `config/uploads_config.py`（`UploadsConfig`：`auto_convert_documents=True` + `pdf_converter="auto"` + `normalized_pdf_converter()`[小写归一 + 非法值回退 auto，防 AUTO/MarkItDown 变体静默走错]）。
-  - **修改** `config/paths.py`（`Paths` 加 `thread_user_data_dir(user_id, thread_id)` + `sandbox_uploads_dir(thread_id, *, user_id)` —— **唯一路径真相源**）、`config/app_config.py`（+ `uploads: UploadsConfig` 字段）、`sandbox/local/local_sandbox.py`（`_thread_user_data_root` 改**委托** `Paths.thread_user_data_dir`，消除 uploads/sandbox 双拼路径漂移风险）。
-  - **关键设计**：① **纯业务逻辑无 HTTP 依赖**（router/client 共用一份存取真相源）；② **路径安全两道防线**（normalize_filename 剥目录成分 + validate_path_traversal resolve+relative_to 兜底含 symlink）；③ **symlink 防御核心红线 #29**（O_NOFOLLOW 拒跟随 symlink 目标防沙箱逃逸/提权写，Windows 退化双校验诚实标 TOCTOU 残留）；④ **soft-load 贯穿**（markitdown/pymupdf4llm 缺包 → 转换跳过但上传仍可用，红线 #24 同款）；⑤ **PDF 双策略**（pymupdf4llm 优先，图片 PDF 回退 markitdown OCR，每页字符数判定）；⑥ **事件循环内复用 worker**（活动循环里单 worker 线程池跑 asyncio.run，防 RuntimeError + 省建拆循环开销）；⑦ **per-user per-thread 物理隔离**（虚拟路径统一 `/mnt/user-data/uploads`，物理三段隔离）；⑧ **伴随 .md 清理**（删原文顺带删转换 markdown 防孤儿）；⑨ **唯一路径真相源**（Paths 集中，local_sandbox 委托）；⑩ **大文件卸线程**（#1569）；⑪ **大纲抽取**（供 M16 UploadsMiddleware 注入文档结构提示）。
-  - **延后**：UploadsMiddleware（把上传清单 + 文档大纲注入对话）→ M16 第 3 步；真实 markitdown/pymupdf4llm 转换依赖装包，soft-load 保证缺包不崩。
-- **测试**：`test_uploads.py`（**100 个**，hermetic：`DEER_FLOW_HOME`→tmp_path 隔离物理路径 + monkeypatch 模拟转换器缺包/成功（不依赖真实 markitdown/pymupdf4llm 安装）+ autouse user 上下文。normalize_filename[safe/剥目录/拒空/拒../剥分隔符/拒反斜杠/拒超长/允许 255/CJK 字节] + claim_unique[无碰撞/单/三连/mutates seen/多段后缀] + validate_thread_id[合法参数化/非法参数化] + validate_path_traversal[界内/越界/..路径/symlink 逃逸] + open_no_symlink[新文件/返回 dest/覆写普通文件/拒 symlink 目标/拒目录/穿越中和/ O_NONBLOCK 标志/Windows 回退成功/Windows 回退拒 symlink] + write_no_symlink[写字节/覆写/拒 symlink] + list_files[空/不存在/多文件排序/字段完整/忽略子目录/忽略 symlink] + delete_safe[存在/不存在抛/穿越抛/伴随 .md 清理/仅 convertible 才清/不传 convertible 留 md/md 缺失 ok] + enrich/virtual_path/artifact_url[格式/percent-encode/安全字符/补字段/就地改] + uploads_dir 布局[per-user/per-thread 隔离/无副作用/ensure 创建/invalid thread_id 拒/Paths 与 local_sandbox 一致] + CONVERTIBLE_EXTENSIONS + convert_file_to_markdown[soft-load 缺包→None 原文件保留/成功写 md/大文件 to_thread/小文件 inline/失败保留原文件] + PDF 双策略[auto 用 pymupdf 稠密/稀疏回退/pymupdf 强制不回退/markitdown 跳过 pymupdf/非 PDF 用 markitdown] + 稀疏检测 + extract_outline[标准/粗体结构性/拆分粗体/截断哨兵/空文件/不可读] + conversion_pool[循环外 None/循环内单 worker/pool=None 直接 asyncio.run/pool 复用单 worker 线程/循环内不抛 RuntimeError] + UploadsConfig[默认/合法/UPPER 归一/非法回退/auto/AppConfig 字段] + 集成[上传→列表→删除全流程 + 批量同名 claim 不互相覆盖]）。
-- **文档**：`docs/uploads.md`（#23，面向小白：上传解决什么问题[隔离/看不懂 PDF/文件名藏雷/symlink 攻击] + 文件结构 + 虚拟 vs 物理路径 + 路径安全两道防线 + symlink 防御为何危险[O_NOFOLLOW/Windows 回退/TOCTOU] + markitdown soft-load + PDF 双策略 + 事件循环内复用 worker + 列表/删除/虚拟路径 + 完整上传流程 + 配置 + 与各模块关系 + 设计要点 + 排错 FAQ）。
-- **基线**：1145 → **1245 passed, 1 skipped, 0 lint 错误**。
-
-### M16 middlewares（23 步生产中间件链，Phase 6，v1.2 全面对标）
-- **代码**：`agents/middlewares/` 23 步生产链 + config/paths/thread_state/memory 扩展，对齐 deer-flow `build_middlewares` + `build_lead/subagent_runtime_middlewares`：
-  - **新建 13 文件**：`tool_call_metadata.py`（`clone_ai_message_with_tool_calls`——结构化 + raw additional_kwargs + finish_reason 三者一处同步，防截断分支忘同步 raw payload）+ 核心档 `tool_output_budget_middleware.py`（外置磁盘 + 预览 / 回退截断 / host-disk vs 沙箱内直写两路径 / exempt read_file 防循环）+ `thread_data_middleware.py`（算/建 workspace/uploads/outputs，委托 Paths 唯一真相源）+ `dangling_tool_call_middleware.py`（wrap_model_call 给悬空 tool_call 补占位 ToolMessage 防 provider 400）+ 业务档 `uploads_middleware.py`（接 M23：注入 `<uploaded_files>` + 文档大纲，abefore_agent 卸线程 run_in_executor）+ `summarization_middleware.py`（继承 langchain SummarizationMiddleware + before_summarization 钩子派发[接 M13 memory_flush_hook 抢拍] + 技能文件抢救 + TAG_NOSTREAM 防幽灵消息 + `_create_summarization_middleware` 工厂）+ `token_usage_middleware.py`（记 token + 子代理 token 按 tool_call_id 合并进派发 AIMessage + write_todos 动作归因单一真相源）+ `view_image_middleware.py`（supports_vision：view_image 完成后注入 base64 图片块，hide_from_ui 幂等）+ `deferred_tool_filter_middleware.py`（接 M15/M20：延迟 MCP 工具未提升前剔 schema / 阻未提升调用，catalog_hash scope 防陈旧提升）+ `subagent_limit_middleware.py`（接 M11：截断超额 task 调用 clamp [2,4]）+ `todo_middleware.py`（继承 TodoListMiddleware + write_todos 上下文丢失检测 + 阻止过早退出[jump_to model + 重试上限 2]）+ 安全档 `safety_termination_detectors.py`（Protocol + 3 内置检测器[OpenAI content_filter / Anthropic refusal / Gemini SAFETY 等]）+ `safety_finish_reason_middleware.py`（after_model：检测器命中 + 带 tool_calls → 剥 tool_calls + 用户说明 + safety_termination 可观测字段 + audit 事件，工具参数刻意不记）。
-  - **重做 8 文件**：`tool_error_handling_middleware.py`（补 `_stamp_task_subagent_status` 集中贴标 issue #3146 + `_build_runtime_middlewares`/`build_lead_runtime_middlewares`/`build_subagent_runtime_middlewares` 三工厂）+ `clarification_middleware.py`（options JSON 归一 + context + clarification_type 图标 + 确定性 id `clarification:{tool_call_id}` 替换不追加）+ `title_middleware.py`（config 驱动 + 结构化内容归一 list/dict + _strip_think_tags + async LLM + 本地兜底 + 过滤 dynamic-context reminder + middleware:title tag）+ `llm_error_handling_middleware.py`（分类 quota/auth/transient/busy/generic + 熔断器[CircuitBreakerConfig closed/half_open/open + 探测] + Retry-After 头 + StreamChunkTimeout 专门文案 + 透传 GraphBubbleUp 红线 #15）+ `loop_detection_middleware.py`（from_config + 哈希层[顺序无关] + 频率层[同工具类型不同参数] + 每工具覆盖 + LRU 线程驱逐 + pending-warning 跨 run 清理 + 警告延迟到 wrap_model_call 注入防破配对 + list-content 安全追加）。
-  - **修改**：`middlewares/__init__.py`（`build_middlewares` 重写为 Part D 23 步：1-9 共享段 `build_lead_runtime_middlewares` + 10-23 lead-only 段；config 驱动 gating；agent_name/available_skills/deferred_setup 新参）。
-  - **config 扩展**：新建 `config/circuit_breaker_config.py`（`CircuitBreakerConfig` failure_threshold/recovery_timeout_sec）+ 接 `AppConfig.circuit_breaker`；`config/paths.py` 加 `sandbox_work_dir`/`sandbox_outputs_dir`/`ensure_thread_dirs`（**唯一真相源**，local_sandbox.ensure_thread_dirs 改委托）；`agents/thread_state.py` 加 `promoted: NotRequired[dict | None]`（tool_search 写回 / DeferredToolFilter 读）；`agents/memory/summarization_hook.py` 新建 `memory_flush_hook`（摘要前抢拍 filter→correction/reinforcement→add_nowait）+ memory `__init__` 导出。
-  - **关键设计**：① **顺序是契约**（ThreadData→Uploads→Sandbox 不变量 / Clarification 永远末位红线 #14 / Safety 在 Loop 后注册利用倒序 after_model 让 Safety 先看模型输出）；② **所有 wrap_tool_call/wrap_model_call 透传 GraphBubbleUp 红线 #15**（ToolErrorHandling + LLMErrorHandling 都保留 `except GraphBubbleUp: raise`）；③ **config 驱动 gating**（9 步条件挂载：Summarization/Todo/TokenUsage/ViewImage/DeferredToolFilter/SubagentLimit/LoopDetection/Safety + Guardrail 真正可选跳过）；④ **洋葱 vs 前后**（wrap_* 改入参出参重试 / before_*/after_* 只返回状态更新）；⑤ **阻塞 IO 卸线程**（ToolOutputBudget 沙箱 IO to_thread / Uploads.abefore_agent run_in_executor，红线 #1）；⑥ **熔断 + 分类重试**（LLMErrorHandling 按错误类型不同策略）；⑦ **双层循环检测**（哈希 + 频率，警告延迟注入防破配对）；⑧ **延迟工具 catalog_hash scope**（防陈旧提升）；⑨ **安全终止仅在有 tool_calls 时介入**（截断参数不当完整派发）；⑩ **lead/subagent 共享前 9 步**（build_lead_runtime_middlewares 复用，subagent 不含 uploads/动态上下文）。
-- **测试**：`test_middlewares.py`（**76 个**，hermetic：SimpleNamespace 造假 state/runtime/request + `_FakeRequest` 带 override + autouse user 上下文 + monkeypatch create_chat_model 桩。默认链 16 步含核心 + Clarification 末位 / ThreadData→Uploads→Sandbox 不变量 / custom 在 Clarification 前 / Safety 在 custom 后 / 各 config gating[title/memory no-op + loop/safety/token_usage/summarization 禁用 + plan_mode + subagent + vision + deferred] / GraphBubbleUp 透传[ToolErrorHandling sync+async] / tool_call_metadata 同步 raw+清 finish_reason / _stamp_task task 终态贴标 / loop 哈希顺序无关+warn→hard+剥 tool_calls+频率层+from_config / safety 检测器命中剥 tool_calls+无 tool_calls 放行+from_config 拒空 detectors+None 用内置 / subagent clamp+截断+忽略非 task / deferred 隐藏/提升/陈旧 hash 拒/阻未提升/允已提升 / dangling 补占位+完整 no-op+invalid 内容 / tool_output 文本抽取+snap+外置+小放行+exempt / thread_data 算路径+要求 thread_id+贴 run_id / uploads 无文件 no-op+穿越过滤+有文件注入块 / title 归一+strip think+首轮判定+兜底 / llm 分类+熔断开/重置+fallback+重试瞬时 / build_subagent_runtime 不含 uploads+含 safety）+ `test_subagents.py` 适配（`_make_app_config` 补 circuit_breaker/safety/memory/get_model_config + degradation 测试改测真实路径 + ImportError 分支单测）。
-- **文档**：`docs/middlewares.md`（#24，面向小白：23 步顺序契约 + AgentMiddleware 钩子机制 + 为何这个顺序[ThreadData→Sandbox / Clarification 末位 / GraphBubbleUp 透传 / Safety 在 Loop 后] + config gating + 关键中间件详解[ToolOutputBudget/Dangling/LLMError/DynamicContext/Summarization/LoopDetection/Safety/Clarification] + 与各模块关系 + 设计要点 + 排错 FAQ）。
-- **基线**：1245 → **1316 passed, 1 skipped, 0 lint 错误**。
-
-### Phase 1 质量审查加固（对照 deer-flow 四维审查）
-对照 deer-flow 参考对 Phase 1 六模块做「设计思想对齐 + bug + 适配正确性 + 测试/文档质量」四维审查。**结论：实现层面零严重 bug，六模块全部高度对齐**（persistence/checkpointer/journal/stream_bridge/serialization 5/5，events/store 4/5），设计思想（三态 user_id / 委托 Saver / seq 单调锁 / sync→async 桥 / 有界窗口 / 单一序列化真相源）全部正确落地。问题集中在测试覆盖缺口 + 个别文档措辞，本次全部补齐，**生产代码零改动**：
-- **M7 journal +8 测试**：progress 节流（snapshot 上报 / interval 内不重复 / flush 取消 delayed 不额外上报——原审查重点项却零覆盖）、on_tool_end 的 `Command.update.messages` 分支、on_llm_error、latency_ms（有/无 on_chat_model_start）、多 batch 抽首条 human。加固 2 处弱断言（message_count `>=1`→`==1`、external_records 补 total_input/output 防双计 false-pass）。
-- **M6 events/store +5 测试**：postgres advisory-lock SQL 分支（FakeSession，锁住 `pg_advisory_xact_lock` + 聚合 SELECT 不带 FOR UPDATE——sqlite 上无法验证、只在生产暴露的正确性盲区）、message/trace 交错 cursor 边界（锁住 bisect_left/right 排他语义）、list-content 往返（`content_is_dict` 是 dict 专属 flag）。
-- **文档措辞 2 处**：run_journal.md「on_chat_model_start 存 llm_request」→实际发 `llm.human.input`；persistence.md RunStore ABC 签名补 user_id 三态注脚。（stream_bridge `__init__` 审查报的「based on asyncio.Queue」实测为误报，mini 实为 `asyncio.Condition`，未改。）
-- **基线**：345 → **358 passed, 1 skipped, 0 lint 错误**。
+> **若要做薄 Gateway demo**（~3 文件，~200 行）：`app/main.py`（挂 `runtime_lifespan` bundle）+ `app/routers/runs.py`（POST `/threads/{id}/runs/stream` SSE + `/wait`）+ `app/routers/threads.py`（列表 + DELETE）。**不碰** auth / IM channels / feedback / artifacts。仅当要把 mini 当产品底座时才做——否则用上游 deer-flow 更省事。
 
 ---
 
-## 待办（按 Phase，下次从这里继续）
+## 三、质量加固（四维代码审查 + 第五维：文档深度审查）
 
-> 铁律：严格按 Phase 0→8 顺序，每完成一步跑 `make test && make lint` 确认绿。每条只给「做什么 + 测试 + 参考」；完整文件清单/依赖/红线查 ALIGNMENT_OUTLINE.md Part C 对应小节。
+> **统一要求——适用于全部 Phase，含已审的 Phase 1 + 7–8：**
+>
+> 1. **同步检查对应文档**。审查某个模块时，必须同时审 `docs/<module>.md`，**不能只审代码**。
+> 2. **文档深度标准（新增第五维）**：
+>    - **面向小白**——每个名词第一次出现都要解释，不假设读者会 LangGraph / deer-flow；
+>    - **逐文件分析**——讲清该模块下**每个代码文件的作用**（不是只贴一段代码片段），每个文件一段「它做什么、为什么单独成文件」；
+>    - **代码架构**——画出 / 讲清**各模块下的代码架构**：文件关系、调用链、数据流、状态机，谁依赖谁、谁触发谁；
+>    - **目标**：读者看完能复述「这个文件做什么、在模块里处在哪一环、为什么这么拆」。
+> 3. **已审 Phase 也要重做**。Phase 1（M4–M9）+ Phase 7–8（M17/M18/M19/集成）之前只做了
+>    「设计对齐 / bug / 适配正确性 / 测试」**四维代码审查**，**缺文档深度维度**；按新标准补审其对应的
+>    9 篇文档（persistence / checkpointer / run_event_store / run_journal / stream_bridge /
+>    serialization / agents / runs / runtime_store + architecture），**代码侧「零严重 bug」的结论不变，仅补文档**。
 
-### Phase 0 — 地基（✅ 全部完成）
+### 3.1 审查范围与优先级（代码 + 文档双维度）
 
-~~M-build / M0 config / M1 utils / M2 reflection / M3 user_context~~ — 全部 ✅。
+| 档 | Phase / 模块 | 代码审查 | 文档审查 | 重点（代码 + 文档） |
+|----|-------------|---------|---------|---------------------|
+| 🔴 高 | Phase 2: **M16 middlewares** | ⬜ | ⬜ | 23 步链顺序契约 / GraphBubbleUp 透传（#15）/ 倒序 after_model（Safety 在 Loop 后）/ Clarification 末位（#14）；wrap_* 异常吞噬、config gating 组合 |
+| 🔴 高 | Phase 2: **M11 subagents** | ⬜ | ⬜ | 持久隔离事件循环（#34）/ 协作取消在 astream 边界 / 并发（#35）/ 5 状态契约；单 pool 非双池、token 回灌去重 |
+| 🔴 高 | Phase 5: **M15 tools** | ⬜ | ⬜ | name 去重防 #1803 / soft-load（#24）/ tool_search 延迟装配 fail-closed / host-bash 过滤 |
+| 🟡 中 | Phase 3: M13 memory · Phase 4: M14 skills | ⬜ | ⬜ | 同步 LLM 路径（#2615）/ user_id 跨 Timer（#20）/ JSON 部分更新 fail-closed（#21）；installer zip 炸弹 + symlink（#23）/ 安全扫描保守回退 |
+| 🟡 中 | Phase 5: M20 mcp · M21 community · Phase 5.5: M23 uploads | ⬜ | ⬜ | OAuth skew（#30）/ session_pool（#29）/ mtime 缓存失效；token 刷新竞态 |
+| 🟡 中 | Phase 2: M12 tracing · M22 agents_config | ⬜ | ⬜ | 追踪图根注入（#17）/ agents_config 三分支装配 |
+| 🟢 低 | Phase 2: M10 / M10b sandbox | ⬜ | ⬜ | 路径翻译 / 跨进程锁（#33）/ 优雅关闭；已较成熟 |
+| 🟢 补审 | **Phase 1（M4–M9）+ Phase 7–8（M17/M18/M19/集成）** | ✅ 已审（零严重 bug） | ⬜ **仅补文档** | 9 篇文档按「面向小白 / 逐文件 / 架构图」标准重审，代码不改 |
 
-### Phase 1 — 持久化 + 运行时基础（✅ 全部完成）
-
-- ~~**M4 持久化**~~（下次起点，大件）— ✅ 已完成（见「已完成详情」）。
-- ~~**M5 checkpointer**~~（下次起点）— ✅ 已完成（见「已完成详情」）。
-- ~~**M6 events/store**~~（下次起点）— ✅ 已完成（见「已完成详情」）。
-- ~~**M9 serialization**~~（下次起点，纯函数无依赖，可插队）— ✅ 已完成（见「已完成详情」）。
-- ~~**M8 stream_bridge**~~（下次起点）— ✅ 已完成（见「已完成详情」）。
-- ~~**M7 journal**~~（下次起点，Phase 1 收尾）— ✅ 已完成（见「已完成详情」）。
-
-### Phase 2 — 沙箱 / 子代理 / 追踪 / 自定义 agent（✅ 全部完成）
-
-- ✅ **M10 sandbox（local，7 工具）** — 已完成（见「已完成详情」）。
-- ✅ **M10b AIO 沙箱（v1.2 恢复）** — 已完成（见「已完成详情」）。
-- ✅ **M11 subagents（自定义子代理）** — 已完成（见「已完成详情」）。
-- ✅ **M12 tracing** — 已完成（见「已完成详情」）。
-- ✅ **M22 agents_config（v1.2 新增）** — 已完成（见「已完成详情」）。
-
-### Phase 3 — 记忆（✅ 全部完成）
-
-- ✅ **M13 记忆** — 已完成（见「已完成详情」）。
-
-### Phase 4 — skill（✅ 全部完成）
-
-- ✅ **M14 skills** — 已完成（见「已完成详情」）。
-
-### Phase 5 — 工具 + MCP + 联网
-
-- ✅ **M20 mcp（v1.2 新增）** — 已完成（见「已完成详情」）。
-- ✅ **M21 community（v1.2 新增）** — 已完成（见「已完成详情」）。
-- ✅ **M15 tools（9 内置）** — 已完成（见「已完成详情」）。
-
-### Phase 5.5 — 上传（✅ 全部完成）
-
-- ✅ **M23 uploads（v1.2 新增）** — 已完成（见「已完成详情」）。
-
-### Phase 6 — 中间件（✅ 全部完成）
-
-- ✅ **M16 中间件** — 已完成（见「已完成详情」）。`build_middlewares` 重写为 **23 步**（顺序见 outline Part D；第 3 步 Uploads 接 M23 / 第 18 步 DeferredToolFilter 接 M15·M20 / 第 17 步 ViewImage 接 M15 / 第 19 步 SubagentLimit 接 M11 / 第 12 步 Summarization 的 before_summarization 钩子接 M13 抢拍；Clarification 永远最后红线 #14；ThreadData→Uploads→Sandbox 不变量）。所有 `wrap_tool_call` / `wrap_model_call` 透传 `GraphBubbleUp`（红线 #15）。
-
-### Phase 7 — agent
-
-- 🔶 **M17 agent** — `features.py`（RuntimeFeatures + @Next/@Prev）+ `thread_state` 类型化 reducer（fail-closed 红线 #16）+ factory（features/extra_middleware/plan_mode）+ lead_agent（tracing 图根注入 + 工具策略 + **custom-agent 分支[依赖 M22]** + bootstrap 分支）+ prompt（条件段 gating：skills/deferred/subagent/soul/self_update/acp）。**现有精简版**。测试 `test_agent.py` 扩展。
-
-### Phase 8 — 运行管理 + 集成
-
-- ⬜ **M18 runs** — `runs/`（naming + store/memory + manager[asyncio 锁/busy 重试红线 #2/orphan 恢复红线 #7/shutdown drain 红线 #6] + worker[注入 runtime/journal、rollback 红线 #5、abort、LLM 兜底]）。测试 `test_run_manager.py` + `test_worker.py`。
-- ⬜ **M19 runtime/store** — `runtime/store/`（LangGraph BaseStore 工厂，先做 memory）。测试 `test_store.py`。
-- ⬜ **集成装配** — lifespan（init_engine + make_checkpointer + make_stream_bridge + make_thread_store + RunManager + reconcile + shutdown drain）+ 对齐 `langgraph.json`（补 checkpointer 段）+ `config.example.yaml` 增补（bump config_version）。端到端冒烟 `test_integration.py`。
-
-### 真正可选（按需，不阻塞主线）
-
-- ⬜ **Guardrail 中间件**（依赖 `guardrails` 独立模块，M16 第 7 步跳过）/ ⬜ **DeerFlowClient**（嵌入式客户端，mini 走 langgraph dev + 未来 Gateway）
-- > v1.2 起 mcp / community / uploads / agents_config / AIO 沙箱**已全部进主线**（见上 Phase 2 / 5 / 5.5），不再在此列「不做」。
+**经验**：两轮代码审查结论都是「零严重 bug + 测试缺口 + 文档措辞」。代码侧建议优先做高 ROI 三件（M16 / M11 / M15）；**文档侧——全部 Phase 都要按新标准过一遍**（含已审的 Phase 1 + 7–8，仅补文档不改代码）。
 
 ---
 
-## 下次开工
+## 四、下次开工
 
-1. `cd backend && make test && make lint` 确认 **1316 passed + 0 lint 错误**基线绿。
-2. **Phase 0 + 1 + 2 + 3(M13) + 4(M14) + 5(M20 + M21 + M15) + 5.5(M23) + 6(M16) 全部 ✅ 完成**（build + config + utils + reflection + user_context + models + persistence + checkpointer + events/store + journal + stream_bridge + serialization + sandbox + AIO 沙箱 + subagents + tracing + agents_config + memory + skills + mcp + community + tools + uploads + middlewares 23 步：本地 7 工具 + AIO 容器隔离 + 审计中间件 + 子代理委派 + 链路追踪 + 自定义 agent + 记忆[LLM 抽取 + 去抖队列 + per-user 原子存储 + 同步 LLM 路径防 #2615 + ID-swap 注入] + 技能[SKILL.md 协议 + 发现/激活/安装 + allowed-tools 收紧 + slash 严格语法 + 安全审查 + 后台刷新缓存] + MCP[三传输 + owner-task 会话池 + OAuth skew 刷新 + mtime 缓存失效 + soft-load] + 联网[12 provider + `_common` 共享层 + readability 软加载兜底 + CJK region 推断 + `tools[].use:` 可插拔 + 4KB 截断 + SDK 软加载] + 工具[9 内置 + 五类来源 + 按 name 去重防 #1803 + host-bash 过滤 + 条件加载 + tool_search 延迟装配 fail-closed + sync 包装 + soft-load MCP/ACP] + 上传[路径安全两道防线 + symlink 防御 O_NOFOLLOW + markitdown/pymupdf4llm soft-load + PDF 双策略 + 事件循环内复用 worker + per-user per-thread 隔离] + 中间件[23 步生产链 + ToolOutputBudget 防爆 + Dangling 补悬空 + LLM 熔断重试 + 循环双层检测 + 安全终止拦截 + 延迟工具过滤 + 子代理限流 + 摘要前抢拍 + config gating + GraphBubbleUp 透传] + 957 测试 + 十二篇文档）。
-3. **下次起点：Phase 7 M17 agent**（M16 build_middlewares 已就绪供 make_lead_agent 调用）：`agents/features.py`（RuntimeFeatures + @Next/@Prev）+ `thread_state` 类型化 reducer（fail-closed merge_sandbox 红线 #16 + promoted + promoted reducer）+ factory（features/extra_middleware/plan_mode/checkpointer/name + _assemble_from_features + _insert_extra）+ lead_agent（tracing 图根注入 + 工具策略过滤 + deferred 装配 + **custom-agent 分支[依赖 M22]** + bootstrap 分支 + setup/update_agent 按上下文绑[依赖 M15]）+ prompt（条件段 gating：skills/deferred/subagent/soul/self_update/acp）。规格见 ALIGNMENT_OUTLINE.md M17 小节。
-4. M17 后依序：Phase 8 M18 runs / M19 store / 集成装配（lifespan + langgraph.json checkpointer 段 + config.example.yaml bump + 端到端冒烟）。
-5. 每完成一个模块，回到本文件把对应行的状态 / 代码 / 测试 / 文档列打 ✅，并更新本「下次开工」段。
+**推荐主线**（按价值/紧急度）：
 
-> Phase 6（M16 middlewares 23 步）已完成。M15 的 setup_agent/update_agent 真正绑定 + tool_search 真实延迟过滤 + MemoryMiddleware/TitleMiddleware 真实挂载 → M17 lead_agent factory（按 runtime.context 绑 setup/update + assemble_deferred_tools + 调 build_middlewares 组装链）。M16 的 build_subagent_runtime_middlewares 已被 M11 executor 自动接入。
-> v1.2 起「全面对标」：mcp(M20)/community(M21)/tools(M15)/uploads(M23)/middlewares(M16) 已进 Phase 5/5.5/6 主线，不再是「可选不做」。仅剩 Guardrail/DeerFlowClient 真正可选。
+1. 🔴 **补 `models/vllm_provider.py`**（§2.2 高优先）——消除 config.example 的 dangling 引用（当前配 vLLM 会 ImportError）。从 deer-flow `models/vllm_provider.py` 移植 `VllmChatModel`（子类化 `ChatOpenAI`，保留 vLLM `reasoning` 字段在 full response / streaming delta / follow-up tool-call turn）+ 补 hermetic 测试 + config.example 路径 C 验证。**最小、最具体的「现在就坏」缺口。**
+
+2. 🔴 **M16 middlewares 全维审查（代码四维 + 文档第五维）**（§3.1 高 ROI）——23 步链最复杂、最易藏 bug。对照 deer `agents/middlewares/` 查顺序契约 / GraphBubbleUp 透传 / config gating 组合，补测试缺口；**同步把 `docs/middlewares.md` 按 §三 标准（面向小白 + 逐文件 + 架构图）重写**。
+
+3. 🟡 **M11 subagents + M15 tools 全维审查**（§3.1 高 ROI 后续）——持久事件循环 + name 去重 fail-closed；同样带文档维度（重写 `docs/subagents.md` / `docs/tools.md`）。
+
+4. 🟢 **Phase 1 + 7–8 文档深度补审**（§3.1 补审档）——代码已审过（零严重 bug），仅把 9 篇文档（persistence / checkpointer / run_event_store / run_journal / stream_bridge / serialization / agents / runs / runtime_store + architecture）按新标准补一遍。可穿插在 2/3 之后或并行。
+
+**先做 1（vllm_provider）还是 2（M16 审查）？** 1 是「修复 dangling 引用」（小、紧急），2 是「质量加固」（大、不紧急）。建议**先 1 后 2**——先把坏的修了，再做加固。
+
+> 每完成一项，回 §二 / §三 / §3.1 把对应行标 ✅，更新本「下次开工」段。

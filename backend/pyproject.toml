@@ -1,7 +1,8 @@
 [project]
-name = "deer-flow"
+name = "mini-deer-flow"
 version = "0.1.0"
-description = "LangGraph-based AI agent system"
+description = "mini-deer-flow — a teaching reimplementation of bytedance/deer-flow (MIT). See ../NOTICE."
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "deerflow-harness",

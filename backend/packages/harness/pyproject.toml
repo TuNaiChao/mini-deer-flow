@@ -1,7 +1,8 @@
 [project]
 name = "deerflow-harness"
 version = "0.1.0"
-description = "Deer-Flow Agent Harness"
+description = "mini-deer-flow harness — teaching reimplementation of bytedance/deer-flow (MIT). See NOTICE."
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     # langgraph 下限锁到 1.1：需要 Runtime / ToolRuntime / configurable["__pregel_runtime"]

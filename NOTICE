@@ -1,0 +1,31 @@
+mini-deer-flow
+==============
+
+This project is a **teaching reimplementation** of [bytedance/deer-flow](https://github.com/bytedance/deer-flow)
+("DeerFlow"), an open-source LangGraph super-agent harness.
+
+  - Upstream project:  https://github.com/bytedance/deer-flow
+  - Upstream license:  MIT (see upstream LICENSE)
+
+A substantial portion of the code in this repository is derived from, or
+directly ported from, deer-flow. In accordance with deer-flow's MIT license,
+the original copyright notices are retained in this project's [LICENSE](./LICENSE):
+
+    Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
+    Copyright (c) 2025-2026 DeerFlow Authors
+
+Modifications and additions specific to mini-deer-flow (simplifications,
+teaching-oriented documentation, module restructuring) are:
+
+    Copyright (c) 2026 mini-deer-flow contributors
+
+Intent
+------
+mini-deer-flow exists for **learning purposes**: it rebuilds deer-flow's agent
+harness with smaller code and more detailed, beginner-friendly documentation
+(see `docs/`, in simplified Chinese). It is **not** a fork intended to replace
+deer-flow, nor is it affiliated with or endorsed by Bytedance. For any
+production use, please refer to the upstream deer-flow project.
+
+All third-party dependencies retain their respective licenses (declared in
+`backend/packages/harness/pyproject.toml`).

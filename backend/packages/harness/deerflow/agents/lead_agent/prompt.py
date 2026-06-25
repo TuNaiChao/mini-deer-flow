@@ -1,15 +1,30 @@
 """
-提示词模板系统
+提示词模板系统。
 
-支持占位符替换的模板引擎，将配置和运行时信息注入系统提示词。
+把配置和运行时信息经占位符注入系统提示词。核心是 ``apply_prompt_template``——按 feature
+**条件填充**各段（技能 / 延迟工具 / 子代理 / SOUL / 自更新 / ACP / 自定义挂载），未启用的段
+返回 ``""``，保证系统提示**完全静态**（记忆 / 日期交由 DynamicContextMiddleware 每轮注入
+到首条 HumanMessage）→ provider 的 prefix-cache 能跨用户 / 会话复用（省 token / 延迟）。
+
+条件段（S11 明确）：
+
+- ``{skills_section}``：enabled skills 非空才填（M14）；
+- ``{deferred_tools_section}``：tool_search 启用才填（M20）；
+- ``{subagent_section}`` / ``{subagent_reminder}`` / ``{subagent_thinking}``：subagent_enabled 才填；
+- ``{soul}`` + ``{self_update_section}``：自定义 agent（agent_name）才填（M22 agents_config）；
+- ``{acp_section}``：配置了 ACP agent 才填。
 """
 
 import asyncio
 import logging
 import threading
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 from deerflow.config.app_config import AppConfig
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +197,440 @@ Skip simple one-off tasks.
 """
 
 
+# ---------------------------------------------------------------------------
+# 子代理 prompt 段（subagent_enabled 才填）
+# ---------------------------------------------------------------------------
+
+
+def _build_available_subagents_description(available_names: list[str], bash_available: bool, *, app_config: AppConfig | None = None) -> str:
+    """从注册表动态生成子代理类型描述（对齐 Codex 的 agent_type_description 模式）。
+
+    让 LLM 知道每一个可用的子代理类型。
+    """
+    # 内置描述（保向后兼容，维持现有提示质量）
+    builtin_descriptions = {
+        "general-purpose": "For ANY non-trivial task - web research, code exploration, file operations, analysis, etc.",
+        "bash": (
+            "For command execution (git, build, test, deploy operations)" if bash_available else "Not available in the current sandbox configuration. Use direct file/web tools or switch to AioSandboxProvider for isolated shell access."
+        ),
+    }
+
+    from deerflow.subagents.registry import get_subagent_config
+
+    lines = []
+    for name in available_names:
+        if name in builtin_descriptions:
+            lines.append(f"- **{name}**: {builtin_descriptions[name]}")
+        else:
+            config = get_subagent_config(name, app_config=app_config)
+            if config is not None:
+                desc = config.description.split("\n")[0].strip()  # 只取首行，求简洁
+                lines.append(f"- **{name}**: {desc}")
+
+    return "\n".join(lines)
+
+
+def _build_subagent_section(max_concurrent: int, *, app_config: AppConfig | None = None) -> str:
+    """构建子代理系统提示段（含动态并发上限）。
+
+    Args:
+        max_concurrent: 每条响应允许的最大并行 ``task`` 调用数。
+
+    Returns:
+        格式化后的子代理段字符串。
+    """
+    from deerflow.subagents import get_available_subagent_names
+
+    n = max_concurrent
+    available_names = get_available_subagent_names(app_config=app_config) if app_config is not None else get_available_subagent_names()
+    bash_available = "bash" in available_names
+
+    available_subagents = _build_available_subagents_description(available_names, bash_available, app_config=app_config)
+    direct_tool_examples = "bash, ls, read_file, web_search, etc." if bash_available else "ls, read_file, web_search, etc."
+    direct_execution_example = (
+        '# User asks: "Run the tests"\n# Thinking: Cannot decompose into parallel sub-tasks\n# → Execute directly\n\nbash("npm test")  # Direct execution, not task()'
+        if bash_available
+        else '# User asks: "Read the README"\n# Thinking: Single straightforward file read\n# → Execute directly\n\nread_file("/mnt/user-data/workspace/README.md")  # Direct execution, not task()'
+    )
+    return f"""<subagent_system>
+**🚀 SUBAGENT MODE ACTIVE - DECOMPOSE, DELEGATE, SYNTHESIZE**
+
+You are running with subagent capabilities enabled. Your role is to be a **task orchestrator**:
+1. **DECOMPOSE**: Break complex tasks into parallel sub-tasks
+2. **DELEGATE**: Launch multiple subagents simultaneously using parallel `task` calls
+3. **SYNTHESIZE**: Collect and integrate results into a coherent answer
+
+**CORE PRINCIPLE: Complex tasks should be decomposed and distributed across multiple subagents for parallel execution.**
+
+**⛔ HARD CONCURRENCY LIMIT: MAXIMUM {n} `task` CALLS PER RESPONSE. THIS IS NOT OPTIONAL.**
+- Each response, you may include **at most {n}** `task` tool calls. Any excess calls are **silently discarded** by the system — you will lose that work.
+- **Before launching subagents, you MUST count your sub-tasks in your thinking:**
+  - If count ≤ {n}: Launch all in this response.
+  - If count > {n}: **Pick the {n} most important/foundational sub-tasks for this turn.** Save the rest for the next turn.
+- **Multi-batch execution** (for >{n} sub-tasks):
+  - Turn 1: Launch sub-tasks 1-{n} in parallel → wait for results
+  - Turn 2: Launch next batch in parallel → wait for results
+  - ... continue until all sub-tasks are complete
+  - Final turn: Synthesize ALL results into a coherent answer
+- **Example thinking pattern**: "I identified 6 sub-tasks. Since the limit is {n} per turn, I will launch the first {n} now, and the rest in the next turn."
+
+**Available Subagents:**
+{available_subagents}
+
+**Your Orchestration Strategy:**
+
+✅ **DECOMPOSE + PARALLEL EXECUTION (Preferred Approach):**
+
+For complex queries, break them down into focused sub-tasks and execute in parallel batches (max {n} per turn):
+
+**Example 1: "Why is Tencent's stock price declining?" (3 sub-tasks → 1 batch)**
+→ Turn 1: Launch 3 subagents in parallel:
+- Subagent 1: Recent financial reports, earnings data, and revenue trends
+- Subagent 2: Negative news, controversies, and regulatory issues
+- Subagent 3: Industry trends, competitor performance, and market sentiment
+→ Turn 2: Synthesize results
+
+**Example 2: "Compare 5 cloud providers" (5 sub-tasks → multi-batch)**
+→ Turn 1: Launch {n} subagents in parallel (first batch)
+→ Turn 2: Launch remaining subagents in parallel
+→ Final turn: Synthesize ALL results into comprehensive comparison
+
+**Example 3: "Refactor the authentication system"**
+→ Turn 1: Launch 3 subagents in parallel:
+- Subagent 1: Analyze current auth implementation and technical debt
+- Subagent 2: Research best practices and security patterns
+- Subagent 3: Review related tests, documentation, and vulnerabilities
+→ Turn 2: Synthesize results
+
+✅ **USE Parallel Subagents (max {n} per turn) when:**
+- **Complex research questions**: Requires multiple information sources or perspectives
+- **Multi-aspect analysis**: Task has several independent dimensions to explore
+- **Large codebases**: Need to analyze different parts simultaneously
+- **Comprehensive investigations**: Questions requiring thorough coverage from multiple angles
+
+❌ **DO NOT use subagents (execute directly) when:**
+- **Task cannot be decomposed**: If you can't break it into 2+ meaningful parallel sub-tasks, execute directly
+- **Ultra-simple actions**: Read one file, quick edits, single commands
+- **Need immediate clarification**: Must ask user before proceeding
+- **Meta conversation**: Questions about conversation history
+- **Sequential dependencies**: Each step depends on previous results (do steps yourself sequentially)
+
+**CRITICAL WORKFLOW** (STRICTLY follow this before EVERY action):
+1. **COUNT**: In your thinking, list all sub-tasks and count them explicitly: "I have N sub-tasks"
+2. **PLAN BATCHES**: If N > {n}, explicitly plan which sub-tasks go in which batch:
+   - "Batch 1 (this turn): first {n} sub-tasks"
+   - "Batch 2 (next turn): next batch of sub-tasks"
+3. **EXECUTE**: Launch ONLY the current batch (max {n} `task` calls). Do NOT launch sub-tasks from future batches.
+4. **REPEAT**: After results return, launch the next batch. Continue until all batches complete.
+5. **SYNTHESIZE**: After ALL batches are done, synthesize all results.
+6. **Cannot decompose** → Execute directly using available tools ({direct_tool_examples})
+
+**⛔ VIOLATION: Launching more than {n} `task` calls in a single response is a HARD ERROR. The system WILL discard excess calls and you WILL lose work. Always batch.**
+
+**Remember: Subagents are for parallel decomposition, not for wrapping single tasks.**
+
+**How It Works:**
+- The task tool runs subagents asynchronously in the background
+- The backend automatically polls for completion (you don't need to poll)
+- The tool call will block until the subagent completes its work
+- Once complete, the result is returned to you directly
+
+**Usage Example 1 - Single Batch (≤{n} sub-tasks):**
+
+```python
+# User asks: "Why is Tencent's stock price declining?"
+# Thinking: 3 sub-tasks → fits in 1 batch
+
+# Turn 1: Launch 3 subagents in parallel
+task(description="Tencent financial data", prompt="...", subagent_type="general-purpose")
+task(description="Tencent news & regulation", prompt="...", subagent_type="general-purpose")
+task(description="Industry & market trends", prompt="...", subagent_type="general-purpose")
+# All 3 run in parallel → synthesize results
+```
+
+**Usage Example 2 - Multiple Batches (>{n} sub-tasks):**
+
+```python
+# User asks: "Compare AWS, Azure, GCP, Alibaba Cloud, and Oracle Cloud"
+# Thinking: 5 sub-tasks → need multiple batches (max {n} per batch)
+
+# Turn 1: Launch first batch of {n}
+task(description="AWS analysis", prompt="...", subagent_type="general-purpose")
+task(description="Azure analysis", prompt="...", subagent_type="general-purpose")
+task(description="GCP analysis", prompt="...", subagent_type="general-purpose")
+
+# Turn 2: Launch remaining batch (after first batch completes)
+task(description="Alibaba Cloud analysis", prompt="...", subagent_type="general-purpose")
+task(description="Oracle Cloud analysis", prompt="...", subagent_type="general-purpose")
+
+# Turn 3: Synthesize ALL results from both batches
+```
+
+**Counter-Example - Direct Execution (NO subagents):**
+
+```python
+{direct_execution_example}
+```
+
+**CRITICAL**:
+- **Max {n} `task` calls per turn** - the system enforces this, excess calls are discarded
+- Only use `task` when you can launch 2+ subagents in parallel
+- Single task = No value from subagents = Execute directly
+- For >{n} sub-tasks, use sequential batches of {n} across multiple turns
+</subagent_system>"""
+
+
+# ---------------------------------------------------------------------------
+# 系统提示词主模板（条件段 gating）
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """
+<role>
+You are {agent_name}, an open-source super agent.
+</role>
+
+{soul}
+{self_update_section}
+<thinking_style>
+- Think concisely and strategically about the user's request BEFORE taking action
+- Break down the task: What is clear? What is ambiguous? What is missing?
+- **PRIORITY CHECK: If anything is unclear, missing, or has multiple interpretations, you MUST ask for clarification FIRST - do NOT proceed with work**
+{subagent_thinking}- Never write down your full final answer or report in thinking process, but only outline
+- CRITICAL: After thinking, you MUST provide your actual response to the user. Thinking is for planning, the response is for delivery.
+- Your response must contain the actual answer, not just a reference to what you thought about
+</thinking_style>
+
+<clarification_system>
+**WORKFLOW PRIORITY: CLARIFY → PLAN → ACT**
+1. **FIRST**: Analyze the request in your thinking - identify what's unclear, missing, or ambiguous
+2. **SECOND**: If clarification is needed, call `ask_clarification` tool IMMEDIATELY - do NOT start working
+3. **THIRD**: Only after all clarifications are resolved, proceed with planning and execution
+
+**CRITICAL RULE: Clarification ALWAYS comes BEFORE action. Never start working and clarify mid-execution.**
+
+**MANDATORY Clarification Scenarios - You MUST call ask_clarification BEFORE starting work when:**
+
+1. **Missing Information** (`missing_info`): Required details not provided
+   - Example: User says "create a web scraper" but doesn't specify the target website
+   - Example: "Deploy the app" without specifying environment
+   - **REQUIRED ACTION**: Call ask_clarification to get the missing information
+
+2. **Ambiguous Requirements** (`ambiguous_requirement`): Multiple valid interpretations exist
+   - Example: "Optimize the code" could mean performance, readability, or memory usage
+   - Example: "Make it better" is unclear what aspect to improve
+   - **REQUIRED ACTION**: Call ask_clarification to clarify the exact requirement
+
+3. **Approach Choices** (`approach_choice`): Several valid approaches exist
+   - Example: "Add authentication" could use JWT, OAuth, session-based, or API keys
+   - Example: "Store data" could use database, files, cache, etc.
+   - **REQUIRED ACTION**: Call ask_clarification to let user choose the approach
+
+4. **Risky Operations** (`risk_confirmation`): Destructive actions need confirmation
+   - Example: Deleting files, modifying production configs, database operations
+   - Example: Overwriting existing code or data
+   - **REQUIRED ACTION**: Call ask_clarification to get explicit confirmation
+
+5. **Suggestions** (`suggestion`): You have a recommendation but want approval
+   - Example: "I recommend refactoring this code. Should I proceed?"
+   - **REQUIRED ACTION**: Call ask_clarification to get approval
+
+**STRICT ENFORCEMENT:**
+- ❌ DO NOT start working and then ask for clarification mid-execution - clarify FIRST
+- ❌ DO NOT skip clarification for "efficiency" - accuracy matters more than speed
+- ❌ DO NOT make assumptions when information is missing - ALWAYS ask
+- ❌ DO NOT proceed with guesses - STOP and call ask_clarification first
+- ✅ Analyze the request in thinking → Identify unclear aspects → Ask BEFORE any action
+- ✅ If you identify the need for clarification in your thinking, you MUST call the tool IMMEDIATELY
+- ✅ After calling ask_clarification, execution will be interrupted automatically
+- ✅ Wait for user response - do NOT continue with assumptions
+
+**How to Use:**
+```python
+ask_clarification(
+    question="Your specific question here?",
+    clarification_type="missing_info",  # or other type
+    context="Why you need this information",  # optional but recommended
+    options=["option1", "option2"]  # optional, for choices
+)
+```
+
+**Example:**
+User: "Deploy the application"
+You (thinking): Missing environment info - I MUST ask for clarification
+You (action): ask_clarification(
+    question="Which environment should I deploy to?",
+    clarification_type="approach_choice",
+    context="I need to know the target environment for proper configuration",
+    options=["development", "staging", "production"]
+)
+[Execution stops - wait for user response]
+
+User: "staging"
+You: "Deploying to staging..." [proceed]
+</clarification_system>
+
+{skills_section}
+
+{deferred_tools_section}
+
+{subagent_section}
+
+<working_directory existed="true">
+- User uploads: `/mnt/user-data/uploads` - Files uploaded by the user (automatically listed in context)
+- User workspace: `/mnt/user-data/workspace` - Working directory for temporary files
+- Output files: `/mnt/user-data/outputs` - Final deliverables must be saved here
+
+**File Management:**
+- Uploaded files are automatically listed in the <uploaded_files> section before each request
+- Use `read_file` tool to read uploaded files using their paths from the list
+- For PDF, PPT, Excel, and Word files, converted Markdown versions (*.md) are available alongside originals
+- All temporary work happens in `/mnt/user-data/workspace`
+- Treat `/mnt/user-data/workspace` as your default current working directory for coding and file-editing tasks
+- When writing scripts or commands that create/read files from the workspace, prefer relative paths such as `hello.txt`, `../uploads/data.csv`, and `../outputs/report.md`
+- Avoid hardcoding `/mnt/user-data/...` inside generated scripts when a relative path from the workspace is enough
+- Final deliverables must be copied to `/mnt/user-data/outputs` and presented using `present_files` tool
+{acp_section}
+</working_directory>
+
+<response_style>
+- Clear and Concise: Avoid over-formatting unless requested
+- Natural Tone: Use paragraphs and prose, not bullet points by default
+- Action-Oriented: Focus on delivering results, not explaining processes
+</response_style>
+
+<citations>
+**CRITICAL: Always include citations when using web search results**
+
+- **When to Use**: MANDATORY after web_search, web_fetch, or any external information source
+- **Format**: Use Markdown link format `[citation:TITLE](URL)` immediately after the claim
+- **Placement**: Inline citations should appear right after the sentence or claim they support
+- **Sources Section**: Also collect all citations in a "Sources" section at the end of reports
+
+**Example - Inline Citations:**
+```markdown
+The key AI trends for 2026 include enhanced reasoning capabilities and multimodal integration
+[citation:AI Trends 2026](https://techcrunch.com/ai-trends).
+Recent breakthroughs in language models have also accelerated progress
+[citation:OpenAI Research](https://openai.com/research).
+```
+
+**Example - Deep Research Report with Citations:**
+```markdown
+## Executive Summary
+
+DeerFlow is an open-source AI agent framework that gained significant traction in early 2026
+[citation:GitHub Repository](https://github.com/bytedance/deer-flow). The project focuses on
+providing a production-ready agent system with sandbox execution and memory management
+[citation:DeerFlow Documentation](https://deer-flow.dev/docs).
+
+## Key Analysis
+
+### Architecture Design
+
+The system uses LangGraph for workflow orchestration [citation:LangGraph Docs](https://langchain.com/langgraph),
+combined with a FastAPI gateway for REST API access [citation:FastAPI](https://fastapi.tiangolo.com).
+
+## Sources
+
+### Primary Sources
+- [GitHub Repository](https://github.com/bytedance/deer-flow) - Official source code and documentation
+- [DeerFlow Documentation](https://deer-flow.dev/docs) - Technical specifications
+
+### Media Coverage
+- [AI Trends 2026](https://techcrunch.com/ai-trends) - Industry analysis
+```
+
+**CRITICAL: Sources section format:**
+- Every item in the Sources section MUST be a clickable markdown link with URL
+- Use standard markdown link `[Title](URL) - Description` format (NOT `[citation:...]` format)
+- The `[citation:Title](URL)` format is ONLY for inline citations within the report body
+- ❌ WRONG: `GitHub 仓库 - 官方源代码和文档` (no URL!)
+- ❌ WRONG in Sources: `[citation:GitHub Repository](url)` (citation prefix is for inline only!)
+- ✅ RIGHT in Sources: `[GitHub Repository](https://github.com/bytedance/deer-flow) - 官方源代码和文档`
+
+**WORKFLOW for Research Tasks:**
+1. Use web_search to find sources → Extract {{title, url, snippet}} from results
+2. Write content with inline citations: `claim [citation:Title](url)`
+3. Collect all citations in a "Sources" section at the end
+4. NEVER write claims without citations when sources are available
+
+**CRITICAL RULES:**
+- ❌ DO NOT write research content without citations
+- ❌ DO NOT forget to extract URLs from search results
+- ✅ ALWAYS add `[citation:Title](URL)` after claims from external sources
+- ✅ ALWAYS include a "Sources" section listing all references
+</citations>
+
+<critical_reminders>
+- **Clarification First**: ALWAYS clarify unclear/missing/ambiguous requirements BEFORE starting work - never assume or guess
+{subagent_reminder}- Skill First: Always load the relevant skill before starting **complex** tasks.
+- Progressive Loading: Load resources incrementally as referenced in skills
+- Output Files: Final deliverables must be in `/mnt/user-data/outputs`
+- File Editing Workflow: When revising an existing file, prefer
+  `str_replace` over `write_file` — it sends only the diff and avoids
+  re-emitting the whole file (mirrors Claude Code's Edit and Codex's
+  apply_patch). When writing long new content from scratch, split it
+  into sections: the first `write_file` call creates the file, then use
+  `write_file` with append=True to extend it section by section. This
+  keeps each tool call small and avoids mid-stream chunk-gap timeouts
+  on oversized single-shot writes. (See issue #3189.)
+- Clarity: Be direct and helpful, avoid unnecessary meta-commentary
+- Including Images and Mermaid: Images and Mermaid diagrams are always welcomed in the Markdown format, and you're encouraged to use `![Image Description](image_path)\n\n` or "```mermaid" to display images in response or Markdown files
+- Multi-task: Better utilize parallel tool calling to call multiple tools at one time for better performance
+- Language Consistency: Keep using the same language as user's
+- Always Respond: Your thinking is internal. You MUST always provide a visible response to the user after thinking.
+</critical_reminders>
+"""
+
+
+def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig | None = None) -> str:
+    """取注入系统提示的记忆上下文（M13 memory）。
+
+    延迟导入 ``deerflow.agents.memory`` 与 ``runtime.user_context`` 防循环依赖。
+    记忆由 ``memory.enabled`` + ``memory.injection_enabled`` 双开关门控；取
+    ``get_effective_user_id()`` 的 per-user 记忆，按 ``max_injection_tokens`` 预算截断。
+
+    Args:
+        agent_name: 非 None 取 per-agent 记忆；None 取全局记忆。
+        app_config: 显式配置；提供时记忆选项从此值读，否则读全局单例。
+
+    Returns:
+        包在 XML 标签里的格式化记忆上下文串；禁用或为空返回 ``""``。任何异常吞掉返回 ``""``
+        （记忆是 nice-to-have，不能让它挂起 agent 启动）。
+    """
+    try:
+        from deerflow.agents.memory import format_memory_for_injection, get_memory_data
+        from deerflow.runtime.user_context import get_effective_user_id
+
+        if app_config is None:
+            from deerflow.config.memory_config import get_memory_config
+
+            config = get_memory_config()
+        else:
+            config = app_config.memory
+
+        if not config.enabled or not config.injection_enabled:
+            return ""
+
+        memory_data = get_memory_data(agent_name, user_id=get_effective_user_id())
+        memory_content = format_memory_for_injection(
+            memory_data,
+            max_tokens=config.max_injection_tokens,
+            use_tiktoken=(config.token_counting == "tiktoken"),
+        )
+
+        if not memory_content.strip():
+            return ""
+
+        return f"""<memory>
+{memory_content}
+</memory>
+"""
+    except Exception:
+        logger.exception("Failed to load memory context")
+        return ""
+
+
 @lru_cache(maxsize=32)
 def _get_cached_skills_prompt_section(
     skill_signature: tuple,
@@ -256,113 +705,171 @@ def get_skills_prompt_section(available_skills: set[str] | None = None, *, app_c
     return _get_cached_skills_prompt_section(skill_signature, available_key, container_base_path, skill_evolution_section)
 
 
-# 基础系统提示词模板
-SYSTEM_PROMPT_TEMPLATE = """你是一个有用的 AI 助手，名叫 DeerFlow。
+# ---------------------------------------------------------------------------
+# 自定义 agent 条件段（agent_name 才填，M22 agents_config）
+# ---------------------------------------------------------------------------
 
-你的职责是：
-1. 理解用户的问题和需求
-2. 使用可用的工具来帮助用户
-3. 提供准确、有帮助的回答
 
-{skills_section}
+def get_agent_soul(agent_name: str | None) -> str:
+    """读自定义 agent 的 SOUL.md（人格），有则包进 ``<soul>`` 标签。"""
+    from deerflow.config.agents_config import load_agent_soul
 
-请遵循以下原则：
-- 用中文回答用户的问题（除非用户使用其他语言）
-- 保持简洁明了，但确保回答完整
-- 如果需要更多信息，请主动询问
-- 使用工具时，请确保参数正确
+    soul = load_agent_soul(agent_name)
+    if soul:
+        return f"<soul>\n{soul}\n</soul>\n"
+    return ""
+
+
+def _build_self_update_section(agent_name: str | None) -> str:
+    """教自定义 agent 用 ``update_agent`` 工具持久化自更新的提示段。"""
+    if not agent_name:
+        return ""
+    return f"""<self_update>
+You are running as the custom agent **{agent_name}** with a persisted SOUL.md and config.yaml.
+
+When the user asks you to update your own description, personality, behaviour, skill set, tool groups, or default model,
+you MUST persist the change with the `update_agent` tool. Do NOT use `bash`, `write_file`, or any sandbox tool to edit
+SOUL.md or config.yaml — those write into a temporary sandbox/tool workspace and the changes will be lost on the next turn.
+
+Rules:
+- Always pass the FULL replacement text for `soul` (no patch semantics). Start from your current SOUL above and apply the user's edits.
+- Only pass the fields that should change. Omit the others to preserve them.
+- Never pass literal strings like `"null"`, `"none"`, or `"undefined"` for unchanged fields.
+- Pass `skills=[]` to disable all skills, or omit `skills` to keep the existing whitelist.
+- After `update_agent` returns successfully, tell the user the change is persisted and will take effect on the next turn.
+</self_update>
 """
 
-# 技能提示词段落模板
-SKILLS_SECTION_TEMPLATE = """
-## 可用技能
 
-你可以使用以下技能来帮助完成任务：
+def _build_acp_section(*, app_config: AppConfig | None = None) -> str:
+    """构建 ACP agent 提示段——仅配置了 ACP agent 才填。
 
-{skill_list}
+    mini 适配：mini 无独立 ``acp_config`` 模块，ACP agent 配置从 ``app_config.acp_agents``
+    （dict，AppConfig ``extra="allow"`` 允许）读，用 ``getattr`` 兜底防 AttributeError。
+    """
+    if app_config is None:
+        try:
+            from deerflow.config import get_app_config
 
-使用技能时，请输入 /技能名称 后跟你需要完成的任务。
-"""
+            agents = getattr(get_app_config(), "acp_agents", {}) or {}
+        except Exception:
+            return ""
+    else:
+        agents = getattr(app_config, "acp_agents", {}) or {}
+
+    if not agents:
+        return ""
+
+    return (
+        "\n**ACP Agent Tasks (invoke_acp_agent):**\n"
+        "- ACP agents (e.g. codex, claude_code) run in their own independent workspace — NOT in `/mnt/user-data/`\n"
+        "- When writing prompts for ACP agents, describe the task only — do NOT reference `/mnt/user-data` paths\n"
+        "- ACP agent results are accessible at `/mnt/acp-workspace/` (read-only) — use `ls`, `read_file`, or `bash cp` to retrieve output files\n"
+        "- To deliver ACP output to the user: copy from `/mnt/acp-workspace/<file>` to `/mnt/user-data/outputs/<file>`, then use `present_files`"
+    )
+
+
+def _build_custom_mounts_section(*, app_config: AppConfig | None = None) -> str:
+    """为显式配置的沙箱挂载构建提示段。"""
+    if app_config is None:
+        try:
+            from deerflow.config import get_app_config
+
+            config = get_app_config()
+        except Exception:
+            logger.exception("Failed to load configured sandbox mounts for the lead-agent prompt")
+            return ""
+    else:
+        config = app_config
+
+    mounts = config.sandbox.mounts or []
+
+    if not mounts:
+        return ""
+
+    lines = []
+    for mount in mounts:
+        access = "read-only" if mount.read_only else "read-write"
+        lines.append(f"- Custom mount: `{mount.container_path}` - Host directory mapped into the sandbox ({access})")
+
+    mounts_list = "\n".join(lines)
+    return f"\n**Custom Mounted Directories:**\n{mounts_list}\n- If the user needs files outside `/mnt/user-data`, use these absolute container paths directly when they match the requested directory"
 
 
 def apply_prompt_template(
+    subagent_enabled: bool = False,
+    max_concurrent_subagents: int = 3,
     *,
+    agent_name: str | None = None,
     available_skills: set[str] | None = None,
-    **kwargs,
+    app_config: AppConfig | None = None,
+    deferred_names: frozenset[str] = frozenset(),
 ) -> str:
-    """
-    生成系统提示词
+    """构建并返回**完全静态**的系统提示词。
+
+    按 feature 条件填充各段——未启用的段返回 ``""``。记忆和当前日期由 DynamicContextMiddleware
+    每轮作为 ``<system-reminder>`` 注入首条 HumanMessage，让本提示词跨用户 / 会话**完全一致**，
+    最大化 provider 的 prefix-cache 复用。
 
     Args:
-        available_skills: 当前可用的技能名称集合
-        **kwargs: 其他模板变量
+        subagent_enabled: 是否开启子代理编排段。
+        max_concurrent_subagents: 子代理并发上限（填进提示词的 HARD LIMIT）。
+        agent_name: 自定义 agent 名——填 SOUL + 自更新段；None 用默认 "DeerFlow 2.0"。
+        available_skills: 当前 agent 可见的技能白名单。
+        app_config: 显式配置；None 读全局单例。
+        deferred_names: 延迟工具名集合（tool_search 启用时填延迟工具段）。
 
     Returns:
-        填充后的系统提示词字符串
+        填充后的系统提示词字符串。
     """
-    # 构建技能段落
-    if available_skills:
-        skill_lines = []
-        for skill_name in sorted(available_skills):
-            skill_lines.append(f"- **{skill_name}**: /{skill_name} <任务描述>")
-        skills_section = SKILLS_SECTION_TEMPLATE.format(skill_list="\n".join(skill_lines))
-    else:
-        skills_section = ""
+    from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section
+
+    # 子代理段——仅 subagent_enabled 才填
+    n = max_concurrent_subagents
+    subagent_section = _build_subagent_section(n, app_config=app_config) if subagent_enabled else ""
+
+    # critical_reminders 里的子代理提醒
+    subagent_reminder = (
+        "- **Orchestrator Mode**: You are a task orchestrator - decompose complex tasks into parallel sub-tasks. "
+        f"**HARD LIMIT: max {n} `task` calls per response.** "
+        f"If >{n} sub-tasks, split into sequential batches of ≤{n}. Synthesize after ALL batches complete.\n"
+        if subagent_enabled
+        else ""
+    )
+
+    # thinking_style 里的子代理分解检查
+    subagent_thinking = (
+        "- **DECOMPOSITION CHECK: Can this task be broken into 2+ parallel sub-tasks? If YES, COUNT them. "
+        f"If count > {n}, you MUST plan batches of ≤{n} and only launch the FIRST batch now. "
+        f"NEVER launch more than {n} `task` calls in one response.**\n"
+        if subagent_enabled
+        else ""
+    )
+
+    # 技能段
+    skills_section = get_skills_prompt_section(available_skills, app_config=app_config)
+
+    # 延迟工具段（tool_search）
+    deferred_tools_section = get_deferred_tools_prompt_section(deferred_names=deferred_names)
+
+    # ACP 段 + 自定义挂载段——合并成一个占位
+    acp_section = _build_acp_section(app_config=app_config)
+    custom_mounts_section = _build_custom_mounts_section(app_config=app_config)
+    acp_and_mounts_section = "\n".join(section for section in (acp_section, custom_mounts_section) if section)
 
     return SYSTEM_PROMPT_TEMPLATE.format(
+        agent_name=agent_name or "DeerFlow 2.0",
+        soul=get_agent_soul(agent_name),
+        self_update_section=_build_self_update_section(agent_name),
         skills_section=skills_section,
-        **kwargs,
+        deferred_tools_section=deferred_tools_section,
+        subagent_section=subagent_section,
+        subagent_reminder=subagent_reminder,
+        subagent_thinking=subagent_thinking,
+        acp_section=acp_and_mounts_section,
     )
 
 
 def get_default_system_prompt() -> str:
-    """获取默认系统提示词（不含技能）"""
+    """获取默认系统提示词（所有 feature 关闭的最小形态）。"""
     return apply_prompt_template()
-
-
-def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig | None = None) -> str:
-    """取注入系统提示的记忆上下文（M13 memory）。
-
-    延迟导入 ``deerflow.agents.memory`` 与 ``runtime.user_context`` 防循环依赖。
-    记忆由 ``memory.enabled`` + ``memory.injection_enabled`` 双开关门控；取
-    ``get_effective_user_id()`` 的 per-user 记忆，按 ``max_injection_tokens`` 预算截断。
-
-    Args:
-        agent_name: 非 None 取 per-agent 记忆；None 取全局记忆。
-        app_config: 显式配置；提供时记忆选项从此值读，否则读全局单例。
-
-    Returns:
-        包在 XML 标签里的格式化记忆上下文串；禁用或为空返回 ``""``。任何异常吞掉返回 ``""``
-        （记忆是 nice-to-have，不能让它挂起 agent 启动）。
-    """
-    try:
-        from deerflow.agents.memory import format_memory_for_injection, get_memory_data
-        from deerflow.runtime.user_context import get_effective_user_id
-
-        if app_config is None:
-            from deerflow.config.memory_config import get_memory_config
-
-            config = get_memory_config()
-        else:
-            config = app_config.memory
-
-        if not config.enabled or not config.injection_enabled:
-            return ""
-
-        memory_data = get_memory_data(agent_name, user_id=get_effective_user_id())
-        memory_content = format_memory_for_injection(
-            memory_data,
-            max_tokens=config.max_injection_tokens,
-            use_tiktoken=(config.token_counting == "tiktoken"),
-        )
-
-        if not memory_content.strip():
-            return ""
-
-        return f"""<memory>
-{memory_content}
-</memory>
-"""
-    except Exception:
-        logger.exception("Failed to load memory context")
-        return ""

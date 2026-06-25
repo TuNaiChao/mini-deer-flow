@@ -3,6 +3,10 @@
 # ============================================================
 # 将此文件复制为 config.yaml 并修改配置
 
+# 配置 schema 版本（低于 config.example.yaml 时启动告警；缺失视为 0）。
+# 改 schema 时同步 bump 此值。
+config_version: 1
+
 # --- 日志级别 ---
 log_level: info
 
@@ -142,8 +146,52 @@ loop_detection:
 # ============================================================
 # 数据库配置
 # ============================================================
+# backend:
+#   memory —— 进程内（默认，红线 #25：空 config 必须 memory 起步，开箱即用）
+#   sqlite —— 持久化到本地文件（需 langgraph-checkpoint-sqlite）
+#   postgres —— 持久化到 PostgreSQL（装 deerflow-harness[postgres]）
 database:
-  backend: sqlite
+  backend: memory
+
+# ============================================================
+# Checkpointer 配置（LangGraph 状态快照 + Store 共用后端）
+# ============================================================
+# 省略此段时 checkpointer 用 InMemorySaver、Store 用 InMemoryStore（重启丢失）。
+# checkpointer:
+#   type: sqlite                       # memory / sqlite / postgres
+#   connection_string: .deer-flow/checkpoints.db   # sqlite 文件路径；postgres DSN 必填
+
+# ============================================================
+# Run 事件存储（run_journal 写消息 + 轨迹）
+# ============================================================
+# backend:
+#   memory —— 进程内（默认）
+#   jsonl —— 每线程一个 .jsonl 文件
+#   db —— 需 database.backend=sqlite/postgres
+run_events:
+  backend: memory
+  track_token_usage: true
+
+# ============================================================
+# Stream Bridge（SSE 生产者-消费者解耦 + 重连补播）
+# ============================================================
+# type:
+#   memory —— 进程内（默认）；省略此段同 memory
+#   redis —— 跨进程（需 redis_url）
+stream_bridge:
+  type: memory
+
+# ============================================================
+# 技能自演化（agent 完成任务后自动创建/更新技能，默认关）
+# ============================================================
+skill_evolution:
+  enabled: false
+
+# ============================================================
+# 安全终止拦截（provider content_filter/refusal/SAFETY 时剥 tool_calls）
+# ============================================================
+safety_finish_reason:
+  enabled: true
 
 # ============================================================
 # 追踪配置（可选）

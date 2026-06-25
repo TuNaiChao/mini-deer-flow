@@ -2,7 +2,7 @@
 
 > mini-deer-flow 是 deer-flow 的**教学化对齐版**：用更小的代码量、更细的讲解重写 deer-flow，但**行为上全面对标、不裁剪核心功能**（v1.2 起：沙箱 / subagent / memory / tool / skill / mcp / 联网 / 上传 / 自定义 agent 全部纳入主线，见 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) v1.2 修订日志）。这份索引按「依赖顺序」列出**已完成**模块的学习文档——从「怎么把代码跑起来」一路读到「运行时基础全部就位」。每篇都**面向小白**，每个名词第一次出现都会解释。
 >
-> 按 **1 → 24** 顺序读最省事。每篇开头标题已标注它在顺序里的位置（如 `# 9. run_event_store.md — ...`），单独打开某篇也能知道它排第几。
+> 按 **1 → 28** 顺序读最省事。每篇开头标题已标注它在顺序里的位置（如 `# 9. run_event_store.md — ...`），单独打开某篇也能知道它排第几。
 
 ---
 
@@ -70,14 +70,26 @@
 |---|------|-----------|
 | 24 | [middlewares.md](middlewares.md) | 中间件链（23 步生产链 + AgentMiddleware 钩子机制 + 顺序契约[ThreadData→Uploads→Sandbox / Clarification 末位 / Safety 在 Loop 后] + config 驱动 gating + GraphBubbleUp 透传 + 关键中间件详解[ToolOutputBudget 防爆 / Dangling 补悬空 / LLM 熔断重试 / 循环双层检测 / 安全终止拦截 / 延迟工具过滤 / 子代理限流 / 摘要前抢拍]） |
 
-## 待写文档（v1.2 全面对标，Phase 7–8，按落地顺序）
+## Phase 7 — Agent 装配
 
-> 下列模块**尚未实现**，文档随代码落地而写（三交付之一）。规格见 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) Part C，进度见 [todo.md](todo.md)。每写好一篇，回填到上面对应 Phase 表。
+| # | 文档 | 一句话定位 |
+|---|------|-----------|
+| 25 | [agents.md](agents.md) | Agent 装配（SDK + config 双入口[create_deerflow_agent features 驱动 / make_lead_agent config 驱动] + RuntimeFeatures 声明式 flag + @Next/@Prev 锚点定位 + thread_state 类型化 reducer[fail-closed merge_sandbox 红线 #16 / merge_promoted catalog_hash scope] + tracing 图根注入红线 #17 + 工具策略过滤 + 延迟装配 fail-closed + bootstrap/custom/默认三分支 + 条件段 prompt 保 prefix-cache） |
 
-| 阶段 | 文档（待写） | 对应模块 |
-|------|------------|----------|
-| Phase 7 | `agents.md` | M17 |
-| Phase 8 | `runs.md` / `runtime_store.md` / `architecture.md` | M18 / M19 / 集成 |
+## Phase 8 — 运行管理 + 集成装配
+
+| # | 文档 | 一句话定位 |
+|---|------|-----------|
+| 26 | [runs.md](runs.md) | 运行管理（RunManager 状态机 + run_agent 后台执行 + RunRecord/RunStatus 生命周期 + 并发模型[asyncio 锁+线程索引/create_or_reject 原子消除 TOCTOU/busy 重试红线 #2/orphan 恢复红线 #7/shutdown drain 红线 #6/幂等 cancel] + worker[runtime/journal 注入/rollback 快照红线 #5/abort interrupt+rollback/LLM 兜底扫 chunk] + RunContext+RunStore） |
+| 27 | [runtime_store.md](runtime_store.md) | LangGraph Store 工厂（与 checkpointer 平行的跨线程记忆；Store vs checkpointer 对比 + 三入口[make_store 异步/get_store 同步单例/store_context 同步一次性] + 后端镜像 checkpointer[memory/sqlite/postgres + soft-load] + worker 怎么用 + None→InMemoryStore 红线 #25） |
+| 28 | [architecture.md](architecture.md) | 集成装配总览（runtime_lifespan 把所有单件串成 RuntimeBundle + 装配/drain 顺序[红线 #6 先 drain 再关 checkpointer] + 一次请求完整路径 + 后端选择矩阵 + Part D 集成清单对照 + 全模块关系。**Phase 0–8 文档完结篇**） |
+
+---
+
+**🎉 主线全部完成**：Phase 0–8（M-build + M0–M19 + M10b/M20–M23）全部 ✅，对齐 deer-flow v1.2
+「全面对标、不裁剪核心功能」。从 [build.md](build.md)（怎么跑起来）一路读到
+[architecture.md](architecture.md)（怎么拼成系统）。仅剩 Guardrail / DeerFlowClient 两个真正可选模块
+（依赖独立外部包，按需）。
 
 ---
 
