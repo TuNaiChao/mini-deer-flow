@@ -8,6 +8,16 @@
 「run 之外的那些**跨 run 数据**（thread 列表、记忆）存在哪、怎么建」。worker 的
 `RunContext.store` 就是这里建的 Store。
 
+> **M19 全维重审（2026-06-28）**：逐文件 diff 最新上游（`runtime/store/{__init__,provider,
+> async_provider,_sqlite_utils}.py`），剥 docstring 后**逻辑完全一致**——三入口（`make_store` /
+> `get_store` / `store_context`）、双检锁单例、soft-load（红线 #24）、None→InMemoryStore（红线 #25）、
+> 共用 `_sqlite_utils` 全部对齐。差异仅为**风格层**（非行为）：
+> ① mini 用绝对导入（`from deerflow.runtime.store.xxx`），上游用相对导入（`from .xxx`）——
+> 等价，不影响 `__main__` 直接跑（mini 的包路径固定）；
+> ② mini 的 provider 直接读 `get_app_config().checkpointer`，上游多一层 `ensure_config_loaded()`
+> + `get_checkpointer_config()` 包装——mini 在 lifespan 进时配置已加载，无需二次 ensure。
+> 无需补丁。
+
 ---
 
 ## 0. 这个模块解决什么问题

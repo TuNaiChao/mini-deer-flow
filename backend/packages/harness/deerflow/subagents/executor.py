@@ -25,6 +25,7 @@ skills——这些用**延迟导入 + 缺包降级**处理：模块当前缺失�
 import asyncio
 import atexit
 import logging
+import os
 import threading
 import uuid
 from collections.abc import Callable, Coroutine
@@ -47,6 +48,7 @@ from deerflow.config.app_config import AppConfig
 from deerflow.models import create_chat_model
 from deerflow.subagents.config import SubagentConfig, resolve_subagent_model_name
 from deerflow.subagents.token_collector import SubagentTokenCollector
+from deerflow.tracing import build_tracing_callbacks, inject_langfuse_metadata
 
 # 注：tool_search 的 ``DeferredToolSetup`` 仅作类型注解出现在 deer 源里；mini 的
 # ``_build_initial_state`` 返回 ``tuple[..., Any]``，运行时不依赖该类型，故不强 import
@@ -332,6 +334,7 @@ class SubagentExecutor:
         thread_data: dict | None = None,
         thread_id: str | None = None,
         trace_id: str | None = None,
+        user_id: str | None = None,
     ):
         """初始化执行器。
 
@@ -360,6 +363,10 @@ class SubagentExecutor:
         self.thread_id = thread_id
         # 顶层调用未提供时生成 trace_id
         self.trace_id = trace_id or str(uuid.uuid4())[:8]
+        # 父 run 的 user_id（task_tool 经 ``resolve_runtime_user_id`` 捕获）——用于 Langfuse
+        # 子代理 span 归属（#3611，``langfuse_user_id``）。子代理沙箱/记忆另经 contextvar
+        # （``copy_context`` 传播到隔离循环）解析 user_id，与此处互不依赖。
+        self.user_id = user_id
 
         self._base_tools = _filter_tools(
             tools,
@@ -569,6 +576,12 @@ class SubagentExecutor:
         if ai_messages is None:
             ai_messages = []
             result.ai_messages = ai_messages
+        # 流式 AI 消息去重用 O(1) 集合（#3687）。
+        # ``stream_mode="values"`` 每个 super-step 都把完整 state 重发一次，所以同一条
+        # 尾部 AI 消息会在每个 chunk 被重新检查；用 id 作键的集合把这次检查保持 O(1)，
+        # 而不是每次扫描只增的 ``ai_messages`` 列表（每 chunk O(n) → 整轮 O(n^2)，
+        # 深研究子代理能跑到 max_turns=150）。
+        seen_message_ids: set[str] = {mid for msg in ai_messages if (mid := msg.get("id"))}
 
         collector: SubagentTokenCollector | None = None
         try:
@@ -585,6 +598,36 @@ class SubagentExecutor:
                 "callbacks": [collector],
                 "tags": [collector_caller],
             }
+
+            # 在图根挂 tracing callbacks（#17）：让一次子代理 run 产生一条 trace，所有
+            # node / LLM / tool 调用作为子 span。镜像 lead agent 模式——图级 tracing 配合
+            # 模型层 ``attach_tracing=False`` 避免重复计数。
+            tracing_callbacks = build_tracing_callbacks()
+            if tracing_callbacks:
+                existing_callbacks = list(run_config.get("callbacks") or [])
+                run_config["callbacks"] = [*existing_callbacks, *tracing_callbacks]
+
+            # 归一化子代理名用于 tracing，对齐 lead-agent 命名形状（小写、仅连字符）。内联
+            # 实现——无共享 helper（runtime/runs/naming.py 只管 lead-agent run）。
+            if self.config.name:
+                normalized_name = self.config.name.strip().lower().replace("_", "-")
+                assistant_id = f"subagent:{normalized_name}"
+            else:
+                assistant_id = "subagent"
+
+            # 注入 Langfuse trace 属性元数据（#3611）：让子代理 trace 关联父 thread、带正确
+            # 的 session/user_id（父 thread_id→``langfuse_session_id``、task_tool 捕获的
+            # user_id→``langfuse_user_id``、``subagent:<name>``→``langfuse_trace_name``）。
+            # 调用方已有键经 ``setdefault`` 优先保留（如前端设的 session_id 不被覆盖）。
+            inject_langfuse_metadata(
+                run_config,
+                thread_id=self.thread_id,
+                user_id=self.user_id,
+                assistant_id=assistant_id,
+                model_name=self.model_name,
+                environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
+            )
+
             context: dict[str, Any] = {}
             if self.thread_id:
                 run_config["configurable"] = {"thread_id": self.thread_id}
@@ -631,16 +674,18 @@ class SubagentExecutor:
                         # 转 dict 供序列化
                         message_dict = last_message.model_dump()
                         # 仅在不在列表里时才加（去重）
-                        # 有 id 比 id，否则比整 dict
+                        # 有 id 用 O(1) 集合查（#3687），否则比整 dict（极少无 id 路径）
                         message_id = message_dict.get("id")
                         is_duplicate = False
                         if message_id:
-                            is_duplicate = any(msg.get("id") == message_id for msg in ai_messages)
+                            is_duplicate = message_id in seen_message_ids
                         else:
                             is_duplicate = message_dict in ai_messages
 
                         if not is_duplicate:
                             ai_messages.append(message_dict)
+                            if message_id:
+                                seen_message_ids.add(message_id)
                             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} captured AI message #{len(ai_messages)}")
 
             logger.info(f"[trace={self.trace_id}] Subagent {self.config.name} completed async execution")

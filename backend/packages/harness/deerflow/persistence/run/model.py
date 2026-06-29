@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Index, String, Text
+from sqlalchemy import JSON, DateTime, Index, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from deerflow.persistence.base import Base
@@ -41,6 +41,11 @@ class RunRow(Base):
     lead_agent_tokens: Mapped[int] = mapped_column(default=0)
     subagent_tokens: Mapped[int] = mapped_column(default=0)
     middleware_tokens: Mapped[int] = mapped_column(default=0)
+    # 按模型归桶的 token 用量（#3658）：一个 run 可能路由到多个模型（主模型+兜底 /
+    # 子代理换模型），真计费模型由 provider 返回的 response_metadata.model_name 决定，
+    # 而非 config 里写的 model_name。结构 {model_name: {input/output/total_tokens}}。
+    # server_default 用 text("'{}'") 让旧库 ALTER 加列时直接给空 JSON，无需回填。
+    token_usage_by_model: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
 
     # 后续关联（follow-up run 指向它继续的 run）
     follow_up_to_run_id: Mapped[str | None] = mapped_column(String(64))

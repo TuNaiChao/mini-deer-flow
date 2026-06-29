@@ -84,6 +84,14 @@ IGNORE_PATTERNS = [
 DEFAULT_MAX_FILE_SIZE_BYTES = 1_000_000
 DEFAULT_LINE_SUMMARY_LENGTH = 200
 
+# 把忽略模式预拆成两类，避免 ``should_ignore_name`` 每次都对每个名字跑一遍 O(n) 的
+# fnmatch 循环（os.walk 每个目录 / 文件都调它）：无通配符的精确名进 frozenset（O(1)
+# 查），带通配符的 glob 模式合并编译成一条正则（一次 match）。两者都 os.path.normcase
+# 归一，与原 fnmatch（大小写不敏感、平台相关）语义一致。
+_EXACT_IGNORE_NAMES = frozenset(os.path.normcase(p) for p in IGNORE_PATTERNS if not any(c in p for c in "*?["))
+_GLOB_IGNORE_PATTERNS = [p for p in IGNORE_PATTERNS if any(c in p for c in "*?[")]
+_GLOB_IGNORE_RE = re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in _GLOB_IGNORE_PATTERNS)) if _GLOB_IGNORE_PATTERNS else None
+
 
 @dataclass(frozen=True)
 class GrepMatch:
@@ -95,11 +103,15 @@ class GrepMatch:
 
 
 def should_ignore_name(name: str) -> bool:
-    """名字是否命中任一忽略模式（fnmatch）。"""
-    for pattern in IGNORE_PATTERNS:
-        if fnmatch.fnmatch(name, pattern):
-            return True
-    return False
+    """名字是否命中任一忽略模式。
+
+    精确名走 frozenset（O(1)），glob 模式走一条预编译正则（一次 match）——比原来对每个
+    名字遍历所有模式跑 fnmatch 快，且 os.walk 每个目录/文件都调它，是搜索热路径。
+    """
+    normalized = os.path.normcase(name)
+    if normalized in _EXACT_IGNORE_NAMES:
+        return True
+    return _GLOB_IGNORE_RE is not None and _GLOB_IGNORE_RE.match(normalized) is not None
 
 
 def should_ignore_path(path: str) -> bool:

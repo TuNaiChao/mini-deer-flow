@@ -7,6 +7,13 @@
 读完 [models.md](models.md)（懂了 `create_chat_model` 与 `attach_tracing`）再看本篇最省事——
 tracing 的核心就是「回调挂在哪一层」，而 models 的 `attach_tracing` 开关正是这个分层的旋钮。
 
+> **M12 全维重审（2026-06-28）**：逐文件 diff 最新上游，tracing 模块本身（factory/metadata）
+> 剥 docstring 后**零逻辑漂移**。补 **#17 + #3611 的子代理注入点**——上游在 `subagents/executor.py`
+> 的 `_aexecute` 图根也挂 tracing callbacks 并注入 Langfuse 元数据（让子代理 trace 归属父 thread），
+> mini 此前缺这一处。本次补齐：① 子代理图根挂 `build_tracing_callbacks`（#17）；② `inject_langfuse_metadata`
+> 注入父 `thread_id`→session、`task_tool` 捕获的 user_id→user、`subagent:<归一化名>`→trace_name（#3611）。
+> + 8 项 hermetic 测试（`test_subagents.py::TestSubagentTracingWiring`）。详见 §「三个注入点」。
+
 ---
 
 ## 为什么需要链路追踪（痛点）
@@ -55,8 +62,20 @@ mini 两个都支持，靠环境变量开关（见下）。**两个都不配 = �
 
 ### ③ 图根注入（graph-root injection）
 
-回调必须在**图调用的根**注入——也就是 `lead_agent` / client 在调 `agent.astream(...)` 前，
-把 callbacks append 进 `config["callbacks"]`。这样整棵 span 树挂在**一个根 trace** 下。
+回调必须在**图调用的根**注入——也就是在调 `agent.astream(...)` / `ainvoke(...)` 前，把 callbacks
+append 进 `config["callbacks"]`。这样整棵 span 树挂在**一个根 trace** 下。
+
+mini 有**三个图根注入点**（都调 `build_tracing_callbacks()` + `inject_langfuse_metadata()`）：
+
+| 注入点 | 位置 | 作用 |
+|--------|------|------|
+| **lead agent** | [lead_agent/agent.py](../backend/packages/harness/deerflow/agents/lead_agent/agent.py) `_make_lead_agent` | 主 run 一条 trace（#17） |
+| **子代理** | [subagents/executor.py](../backend/packages/harness/deerflow/subagents/executor.py) `_aexecute` | 每个 task 子代理一条子 trace，归属父 thread（#17 + #3611） |
+| **独立调用方** | [models/factory.py](../backend/packages/harness/deerflow/models/factory.py) `attach_tracing=True` | 图外的 LLM 调用（如 MemoryUpdater），模型级兜底 |
+
+> 上游还有第四个注入点：嵌入式 `client.py`（DeerFlowClient.stream）+ gateway `runtime/runs/worker.py`。
+> mini 不 port `client.py`（§2.1 设计上不做嵌入式客户端）和 gateway worker（M18 范畴）——mini 走
+> `langgraph dev` / 基于 `runtime_lifespan` bundle 自搭，故这两条路径不在 harness 层。
 
 为什么不在每个 LLM 调用处挂？——那样每次 `create_chat_model` 各挂各的回调，会产生**一堆碎片
 trace**（每个 LLM 调用一条），而不是一棵完整树，面板上根本串不起来。
@@ -92,10 +111,34 @@ Langfuse v4 的 callback handler 从 `RunnableConfig.metadata` 里取一组**保
 | tags | `langfuse_tags` | `env:<DEER_FLOW_ENV>` + `model:<model_name>` |
 
 `build_langfuse_trace_metadata()` 构造这个 dict，`inject_langfuse_metadata()` 把它 merge 进
-`config["metadata"]`。两条注入路径（gateway worker / 嵌入式 client）共用，防漂移。
+`config["metadata"]`。所有图根注入点（lead agent / 子代理 / 独立调用方）共用这两个函数，防漂移。
 
 **Langfuse 不在启用 provider 时返回 `{}`**——调用方可以无条件 merge 结果而不影响 LangSmith
 或其它 tracer。这是「可选 provider 不污染必选路径」的不变量。
+
+### #3611：子代理 trace 归属父 thread
+
+子代理经 `task` 工具触发后，在自己的隔离事件循环里跑一棵**独立子图**。若不注入 Langfuse 元数据，
+子代理的 trace 会**飘成一个独立 session**——和父对话断开，面板上看不出「这次子代理调用是哪个
+对话发起的」。#3611 的修复：子代理 executor 在 `_aexecute` 图根也调 `inject_langfuse_metadata`，
+把**父 run 的身份**映射进子代理 trace：
+
+| 子代理 metadata 字段 | 来源 | 作用 |
+|---------------------|------|------|
+| `langfuse_session_id` | 父 `thread_id`（executor 的 `self.thread_id`） | 子代理 trace 归到父对话的 Session 卡片 |
+| `langfuse_user_id` | `task_tool` 经 `resolve_runtime_user_id` 捕获的 `user_id` | 子代理 trace 落在正确的 Langfuse Users 页 |
+| `langfuse_trace_name` | `subagent:<归一化名>` | 区分「这是哪个子代理的 trace」 |
+
+**子代理名归一化**：对齐 lead-agent 命名形状——`self.config.name.strip().lower().replace("_", "-")`。
+例如 `Deep_Research` → `subagent:deep-research`。无共享 helper（`runtime/runs/naming.py` 只管 lead
+run），故内联在 executor。
+
+**user_id 捕获跨线程**：子代理跑在隔离 daemon 线程的持久事件循环上。`task_tool` 在调用方线程
+（有 runtime 上下文）经 `resolve_runtime_user_id(runtime)` 解析 user_id，**显式传入** executor
+（存 `self.user_id`），不依赖 contextvar 跨线程传播（同 [memory.md](memory.md) #20 的「入队捕获」
+思路）。子代理沙箱/记忆另经 `copy_context()` 传播的 contextvar 解析 user_id，与此处互不依赖。
+
+> `setdefault` 同样适用：调用方（如前端）已设的 `langfuse_session_id` 不被子代理覆盖。
 
 ### `setdefault`：调用方优先
 
@@ -200,29 +243,49 @@ pip install langfuse   # 提供 langfuse + langfuse.langchain.CallbackHandler
 > `langfuse` 是 **soft-load**：缺包时 `_create_langfuse_handler` 的 `from langfuse import ...`
 > 抛 ImportError，被包成 RuntimeError。不影响 LangSmith 路径。
 
-### 注入点（M17 lead_agent / M18 worker 落地后）
+### 注入点（三处图根，都已落地）
+
+**① lead agent**（[lead_agent/agent.py](../backend/packages/harness/deerflow/agents/lead_agent/agent.py) `_make_lead_agent`）：
 
 ```python
-# 图根注入（lead_agent 工厂或运行 worker）
-config = {...}
-callbacks = build_tracing_callbacks()
-if callbacks:
-    config["callbacks"] = [*config.get("callbacks", []), *callbacks]
-inject_langfuse_metadata(config, thread_id=thread_id, user_id=user_id,
-                         assistant_id=agent_name, model_name=model_name)
-result = await agent.ainvoke(state, config=config)
+# 图根注入——一次 run 一条 trace，所有节点/LLM/工具调用作为子 span
+tracing_callbacks = build_tracing_callbacks()
+if tracing_callbacks:
+    config["callbacks"] = [*config.get("callbacks", []), *tracing_callbacks]
+# Langfuse 元数据经 worker/client 在调图前 merge 进 config["metadata"]（见 §关系图）
 ```
+
+**② 子代理**（[subagents/executor.py](../backend/packages/harness/deerflow/subagents/executor.py) `_aexecute`，#3611）：
+
+```python
+run_config: RunnableConfig = {"recursion_limit": ..., "callbacks": [collector], "tags": [...]}
+# #17：图根追加 tracing callbacks（在 collector 之后）
+tracing_callbacks = build_tracing_callbacks()
+if tracing_callbacks:
+    run_config["callbacks"] = [*(run_config.get("callbacks") or []), *tracing_callbacks]
+# 子代理名归一化（对齐 lead-agent 命名形状）
+assistant_id = f"subagent:{self.config.name.strip().lower().replace('_', '-')}" if self.config.name else "subagent"
+# #3611：注入 Langfuse 元数据（父 thread_id / 捕获 user_id / subagent:<name>）
+inject_langfuse_metadata(run_config, thread_id=self.thread_id, user_id=self.user_id,
+                         assistant_id=assistant_id, model_name=self.model_name,
+                         environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"))
+```
+
+**③ 独立调用方**（图外的 LLM 调用，如 MemoryUpdater）：`create_chat_model(attach_tracing=True)`
+经 `_maybe_build_tracing_callbacks` 懒导入 tracing，在模型级挂回调——这些调用没经过图根，只能模型级兜底。
 
 ### 跑测试
 
 ```bash
-cd backend && make test    # 含 test/test_tracing.py（26 个 hermetic 测试）
+cd backend && make test    # 含 test/test_tracing.py（hermetic 单元测试）+ test_subagents.py::TestSubagentTracingWiring（#17/#3611 注入点）
 ```
 
 测试约定：env var 经 `monkeypatch.setenv/delenv` 控制；langfuse SDK（非依赖）用
 `sys.modules` 注入 fake；langsmith tracer 经 monkeypatch 替身；models `attach_tracing` 联动用
 `_FakeModelClass` + `resolve_class`/app_config 替身 + `_maybe_build_tracing_callbacks` spy，跑真
-`create_chat_model` 到「挂回调」那步而不碰真模型 provider。
+`create_chat_model` 到「挂回调」那步而不碰真模型 provider。子代理注入点测试（`TestSubagentTracingWiring`）
+把 `_build_initial_state`/`_create_agent` 打桩短路，在 `agent.astream` 处捕获 `run_config`，断言
+callbacks 追加 + langfuse 元数据字段映射——不跑真 agent / 真 Langfuse 后端。
 
 ---
 
@@ -245,10 +308,15 @@ models/factory._maybe_build_tracing_callbacks() 懒导入 ← tracing（落地�
 ```
 
 - **上游**：`config`（provider 开关 + 凭证，env 驱动）、`runtime/user_context`
-  （`DEFAULT_USER_ID` 给 langfuse_user_id 兜底）。
-- **下游消费者**：`models.create_chat_model(attach_tracing=True)`（独立调用方，懒导入已就位）；
-  M17 lead_agent / M18 worker / 嵌入式 client（图根注入回调 + metadata——Phase 7/8 落地）。
+  （`DEFAULT_USER_ID` 给 langfuse_user_id 兜底；`resolve_runtime_user_id` 给子代理捕获 user_id）。
+- **下游消费者**（三个图根注入点，都已落地）：
+  - **lead agent**（`make_lead_agent` → `_make_lead_agent`）——主 run trace；
+  - **子代理**（`executor._aexecute`，#3611）——子代理 trace 归属父 thread；
+  - **独立调用方**（`models.create_chat_model(attach_tracing=True)`，懒导入已就位）——图外 LLM 兜底。
+- **不 port**：嵌入式 `client.py`（DeerFlowClient）+ gateway `runtime/runs/worker.py`——属 Gateway 层
+  （§2.1 / §2.3），mini 走 `langgraph dev`。harness 层的 worker 注入在 M18 范畴。
 - **红线 #17**：图内 `create_chat_model` 一律 `attach_tracing=False`，图根统一注入，防重复 span。
+- **红线 #3611**：子代理 trace 必须注入父 `thread_id`/`user_id`，否则飘成独立 session、与父对话断开。
 
 ---
 
@@ -261,7 +329,8 @@ A：那样会产出一堆碎片 trace（每个 LLM 调用一条），面板上�
 **Q：我设了 `LANGFUSE_TRACING=true` 但 Langfuse 面板看不到 trace？**
 A：常见原因：① 没装 `langfuse` 包（`_create_langfuse_handler` ImportError → RuntimeError）；
 ② 缺 `LANGFUSE_SECRET_KEY`/`LANGFUSE_PUBLIC_KEY`（validate ValueError）；③ 回调没在图根注入
-（Phase 7/8 的 lead_agent/worker 还没接）。本模块只管**构造回调**，**注入**在 M17/M18。
+（检查 `make_lead_agent` 是否在调图前 append 了 `build_tracing_callbacks()`）。本模块负责**构造回调**，
+**注入**在 lead_agent（已落地）/ 子代理 executor（#3611 已落地）。
 
 **Q：`build_tracing_callbacks` 抛 RuntimeError 但 `_maybe_build_tracing_callbacks` 返回 `[]`，矛盾吗？**
 A：不矛盾，两层语义不同。`build_tracing_callbacks` 是**显式构造**，坏了得知道（响亮报错）；
@@ -276,6 +345,12 @@ A：把同一 `thread_id` 的多次 run 归到一个 Langfuse **Session**——�
 **Q：前端设的 `langfuse_session_id` 会被后端覆盖吗？**
 A：不会。`inject_langfuse_metadata` 用 `setdefault`——调用方已有的 key 优先。这让前端能把多个
 run 归到一个自定义会话。
+
+**Q：子代理（task 工具触发的）的 trace 飘成了独立 session，和父对话断开？**
+A：这是 #3611 的征兆——子代理 executor 没注入父 `thread_id`/`user_id`。已修复：`_aexecute` 在图根
+调 `inject_langfuse_metadata`，把父 `thread_id`→`langfuse_session_id`、捕获的 `user_id`→
+`langfuse_user_id`、`subagent:<归一化名>`→`langfuse_trace_name`。现在子代理 trace 归到父对话的
+Session 卡片下，带 `subagent:deep-research` 这样的 trace 名。
 
 **Q：不配任何 tracing 会有开销吗？**
 A：零。`get_enabled_tracing_providers()` 返回 `[]` → `build_tracing_callbacks()` 直接返回 `[]`，

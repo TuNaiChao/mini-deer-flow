@@ -8,16 +8,20 @@
 
 可靠性要点（红线）：
 - **#2 SQLite WAL + busy 重试**：每条新连接开 ``journal_mode=WAL`` /
-  ``synchronous=NORMAL`` / ``foreign_keys=ON``。WAL 让并发读 + 单写不阻塞，
-  ``synchronous=NORMAL`` 只在 WAL checkpoint 边界 fsync（安全且快的搭配）。
-  ``busy_timeout`` 不在这里设——Python sqlite3 驱动默认 5 秒 busy 超时，
-  aiosqlite / SQLAlchemy 的 aiosqlite 方言继承该默认，重复设置是 no-op。
+  ``synchronous=NORMAL`` / ``foreign_keys=ON`` / ``busy_timeout=30000``。WAL 让
+  并发读 + 单写不阻塞，``synchronous=NORMAL`` 只在 WAL checkpoint 边界 fsync
+  （安全且快的搭配）。``busy_timeout=30000`` 把锁竞争等待窗口提到 30 秒
+  （Python sqlite3 驱动默认只有 5 秒，并发启动 / 多 worker 同时写时太短会误报
+  ``database is locked``）。
 - **#24 缺包可操作提示**：postgres 缺 asyncpg 时给出 install 命令。
+- **#28 blocking-IO 卸载**：``os.makedirs`` 是同步磁盘 IO，在 async ``init_engine``
+  里用 ``asyncio.to_thread`` 卸载。
 - **create_all 自动建表**（开发便利；生产用 Alembic，本 Phase 未引入）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -96,14 +100,17 @@ async def init_engine(
 
         from sqlalchemy import event
 
-        os.makedirs(sqlite_dir or ".", exist_ok=True)
+        # ``os.makedirs`` 是同步磁盘 IO——init_engine 跑在 lifespan 的 async 上下文里，
+        # 必须用 ``asyncio.to_thread`` 卸载，否则违反 blocking-IO 红线 #28。
+        await asyncio.to_thread(os.makedirs, sqlite_dir or ".", exist_ok=True)
         _engine = create_async_engine(url, echo=echo, json_serializer=_json_serializer)
 
         # 每条新连接开 WAL。SQLite PRAGMA 是连接级的，所以用监听器而非启动时跑一次。
         # WAL 给出并发读 + 写者不阻塞，是任何生产 SQLite 部署的标准建议。配套的
         # ``synchronous=NORMAL`` 是安全且快的搭配——只在 WAL checkpoint 边界 fsync，
-        # 而非每次提交。注意这里不设 ``busy_timeout``——Python sqlite3 驱动默认 5 秒
-        # busy 超时，aiosqlite / SQLAlchemy 的 aiosqlite 方言继承该默认，重复设置是 no-op。
+        # 而非每次提交。``busy_timeout=30000`` 把锁竞争下的「等还是立刻报 busy」窗口
+        # 提到 30 秒——Python sqlite3 驱动默认只有 5 秒，并发启动 / 多 worker 同时写时
+        # 太短会误报 ``database is locked``。
         @event.listens_for(_engine.sync_engine, "connect")
         def _enable_sqlite_wal(dbapi_conn, _record):  # noqa: ARG001 — SQLAlchemy 契约
             cursor = dbapi_conn.cursor()
@@ -111,6 +118,7 @@ async def init_engine(
                 cursor.execute("PRAGMA journal_mode=WAL;")
                 cursor.execute("PRAGMA synchronous=NORMAL;")
                 cursor.execute("PRAGMA foreign_keys=ON;")
+                cursor.execute("PRAGMA busy_timeout=30000;")
             finally:
                 cursor.close()
     elif backend == "postgres":

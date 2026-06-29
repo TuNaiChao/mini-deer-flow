@@ -19,6 +19,7 @@ from langchain_core.callbacks import BaseCallbackManager
 from langgraph.config import get_stream_writer
 
 from deerflow.config import get_app_config
+from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.sandbox.security import LOCAL_BASH_SUBAGENT_DISABLED_MESSAGE, is_host_bash_allowed
 from deerflow.subagents import SubagentExecutor, get_available_subagent_names, get_subagent_config
 from deerflow.subagents.config import resolve_subagent_model_name
@@ -255,6 +256,10 @@ async def task_tool(
         parent_model = metadata.get("model_name")
         trace_id = metadata.get("trace_id") or str(uuid.uuid4())[:8]
 
+    # 子代理 Langfuse span 归属用的 user_id（#3611）：标准解析序（runtime.context["user_id"]
+    # 优先，回退 contextvar）。此处捕获确保跨隔离 daemon 线程不丢——同 memory queue #20 思路。
+    user_id = resolve_runtime_user_id(runtime)
+
     parent_available_skills = metadata.get("available_skills")
     if parent_available_skills is not None:
         overrides["skills"] = _merge_skill_allowlists(list(parent_available_skills), config.skills)
@@ -290,6 +295,7 @@ async def task_tool(
         "thread_data": thread_data,
         "thread_id": thread_id,
         "trace_id": trace_id,
+        "user_id": user_id,
     }
     if resolved_app_config is not None:
         executor_kwargs["app_config"] = resolved_app_config

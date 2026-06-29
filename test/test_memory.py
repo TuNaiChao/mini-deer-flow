@@ -304,6 +304,17 @@ class TestMessageProcessing:
         assert "uploaded_files" not in getattr(filtered[0], "content", "")
         assert "please review" in filtered[0].content
 
+    def test_filter_drops_hide_from_ui_messages(self):
+        """#3697：``hide_from_ui`` 标记的 human 消息（中间件注入的隐藏消息）不进记忆 LLM。"""
+        from langchain_core.messages import HumanMessage
+
+        hidden = HumanMessage(content="todo reminder", additional_kwargs={"hide_from_ui": True})
+        msgs = [hidden, _human("real question"), _ai("answer")]
+        filtered = filter_messages_for_memory(msgs)
+        contents = [getattr(m, "content", "") for m in filtered]
+        assert "todo reminder" not in contents  # hide_from_ui 那条被丢
+        assert len(filtered) == 2  # 只留 real question + answer
+
     def test_detect_correction_english(self):
         assert detect_correction([_human("that's wrong, try again")]) is True
         assert detect_correction([_human("you misunderstood me")]) is True
@@ -549,6 +560,27 @@ class TestApplyUpdates:
         }
         result = MemoryUpdater()._apply_updates(mem, update)
         assert len(result["facts"]) == 1  # 去重，不重复加
+
+    def test_whitespace_only_fact_skipped(self, monkeypatch):
+        """#3719：空白/纯空白 content 的 fact 跳过（不写空 fact 进记忆）。
+
+        旧版 ``if fact_key is not None and fact_key in existing`` 合并条件在
+        fact_key is None（空白 content）时为 False、不跳过，空 fact 仍被 append。"""
+        _patch_mem_config(monkeypatch, _mem_config_simple(fact_confidence_threshold=0.0))
+        mem = create_empty_memory()
+        update = {
+            "user": {},
+            "history": {},
+            "newFacts": [
+                {"content": "   ", "category": "context", "confidence": 0.9},  # 纯空白
+                {"content": "", "category": "context", "confidence": 0.9},  # 空
+                {"content": "real fact", "category": "context", "confidence": 0.9},
+            ],
+            "factsToRemove": [],
+        }
+        result = MemoryUpdater()._apply_updates(mem, update)
+        assert len(result["facts"]) == 1  # 只有 real fact 进
+        assert result["facts"][0]["content"] == "real fact"
 
     def test_fact_below_confidence_threshold_dropped(self, monkeypatch):
         _patch_mem_config(monkeypatch, _mem_config_simple(fact_confidence_threshold=0.8))

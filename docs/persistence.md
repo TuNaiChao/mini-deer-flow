@@ -4,6 +4,20 @@
 > 配套测试：[test/test_persistence.py](../test/test_persistence.py)
 > 本文面向「刚接触数据库 / ORM 的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐文件 diff `persistence/{engine,base,json_compat}.py` +
+> `run/{model,sql}.py` + `thread_meta/*` vs 最新上游（剥 docstring 后判逻辑差）。补 **4 项对齐**：
+> ① **#3658 SQL 层**——`RunRow` 加 `token_usage_by_model` JSON 列（一个 run 可能路由多个模型，
+> 真计费模型由 provider 返回决定）+ `RunRepository.{update_run_completion,update_run_progress}`
+> 签名加该参数 + `aggregate_tokens_by_thread` 由 SQL `GROUP BY model_name` 改 Python 侧按
+> `token_usage_by_model` 逐模型累加（老行回退 `model_name`），见 §4.9；② **engine** 加
+> `PRAGMA busy_timeout=30000`（见 §3.5）+ `os.makedirs` 用 `asyncio.to_thread` 卸载（红线 #28，
+> `init_engine` 跑在 async lifespan 里）；③ **base** 加 `@cache` 的 `_column_keys` 让 `to_dict()`
+> / `__repr__()` 不必每次都 SQLAlchemy 内省（list 端点成百上千行时的热路径优化）；④ `run/sql.py`
+> 删不再用的 `func` import。**有意不 port**：上游 `bootstrap.py` + alembic 迁移——mini 走
+> `create_all`（教学简化，无 alembic），是 mini 无 Gateway 层的已知选择。`thread_meta/*` 与上游
+> AST 级零漂移；`persistence/models/__init__.py` 少的 ChannelConnection/Feedback/User 是 Gateway
+> 专属不 port。
+
 ---
 
 ## 1. 一句话定位
@@ -73,6 +87,8 @@ SQLite 默认用 **rollback journal**（回滚日志）模式：写之前先把�
 **WAL 模式**：写时不改原文件，而是把改动**追加**到一个 `-wal` 伴随文件；读时把 wal 里的最新改动叠加到原文件读出。于是：**多个读者 + 一个写者可以同时进行，互不阻塞**。这是任何生产 SQLite 部署的标准建议（红线 **#2**）。
 
 配套的 `synchronous=NORMAL`：不在每次提交都 fsync（强制刷盘），而是在 WAL checkpoint（合并点）边界才 fsync——**安全（断电不丢已提交事务）且快**。
+
+还有一条 `busy_timeout=30000`（30 秒）：当两个连接同时想写、SQLite 文件级写锁被占着时，后到的连接**等多久**再放弃并报 `database is locked`。Python 的 sqlite3 驱动默认只等 5 秒——并发启动 / 多 worker 同时写时太短，容易误报 locked。提到 30 秒给锁竞争留足窗口。
 
 ---
 
@@ -152,6 +168,25 @@ SQLite 声明了 `DateTime(timezone=True)`，但**读回来时 tzinfo 会丢失*
 `RunRepository` 继承 `RunStore`（ABC）。但 `RunStore` 属于 runs 领域，而 runs 的**运行管理层**（RunManager / worker）在 Phase 8，又依赖持久化。如果把 ABC 留到 Phase 8，会形成「持久化 → 运行管理 → 持久化」的**循环依赖**。
 
 解法：把纯数据的 `RunStore` ABC + 状态枚举提前到 Phase 1（本模块），运行管理留 Phase 8。于是 `RunRepository(RunStore)` 可以先于 `RunManager` 存在，循环被打破。
+
+### 4.9 #3658 按模型归桶 token（SQL 层）
+
+`RunRow` 有一组平铺的 token 列（`total_tokens` / `lead_agent_tokens` / `subagent_tokens` / `middleware_tokens` …）。但**一个 run 可能路由到多个模型**——主模型 + 兜底模型、子代理用了别的模型。平铺列只能记「这个 run 一共花了多少 token」，没法回答「`gpt-4o` 花了多少、`gpt-4o-mini` 花了多少」这种按真计费模型的账。
+
+`#3658` 的解法：加一列 `token_usage_by_model`（JSON，结构 `{model_name: {input_tokens, output_tokens, total_tokens}}`），由 `RunJournal` 在内存里按 `response_metadata.model_name` 分桶累加，run 完成时随其它 token 列一起写入（`update_run_completion` / `update_run_progress` 的签名都加了该参数）。
+
+> 为什么记 `response_metadata.model_name` 而不是 config 里写的 model？因为**真计费模型由 provider 返回决定**，不是配置里写的。一个 agent 可能配了 `gpt-4o`，但请求被路由到 fallback 或别名，provider 返回的 `model_name` 才是真正计费的那个。
+
+`aggregate_tokens_by_thread` 因此也变了：旧版用一条 SQL `GROUP BY model_name`（假设一行 run 只对应一个模型，错！）；新版拉出每行的各 token 列 + `token_usage_by_model`，在 Python 侧按真计费模型逐模型累加——有分桶数据的行按桶累加（一个 run 可贡献给多个模型桶），**老行**（#3658 之前写入、无该列值）回退到行的 `model_name` 整 run 归一桶。mini 无 alembic，所以列上加 `server_default=text("'{}'")`——旧库 `create_all` 重建或手动 ALTER 加列时直接给空 JSON，无需回填迁移。
+
+> 内存侧的对应实现（`MemoryRunStore`）在 M18 已 port（见 [runs.md](runs.md) §6.1 端到端数据流）；本 Phase 补齐的是**SQL 侧**——之前 M18 误判「mini 无 ORM」而漏 port SQL 层，本轮重审发现 `persistence/run/{model,sql}.py` 其实都在，故补齐。
+
+### 4.10 hot path 微优化：to_thread 卸载 + @cache 列键
+
+两条对齐上游的小优化，都不改语义、只让热路径更稳更快：
+
+- **`os.makedirs` 用 `asyncio.to_thread` 卸载**（红线 #28）：`init_engine` 是 async 函数，跑在 lifespan 的事件循环里；而 `os.makedirs`（建 SQLite 目录）是同步磁盘 IO。直接调会卡住事件循环——这正是 mini 自己 blocking-IO gate 要拦的。卸到线程池后，事件循环期间不被这一个系统调用阻塞。
+- **`@cache _column_keys`**：`Base.to_dict()` / `__repr__()` 都要遍历「这个 ORM 类有哪些列」。SQLAlchemy 的 `inspect(cls).mapper.column_attrs` 每次都走一次 mapper 内省；而列集合在类定义后就不变。所以按类缓存一份列键元组（`functools.cache`），把每次内省省掉——list 端点一次序列化成百上千行时是有意义的热路径优化。
 
 ---
 

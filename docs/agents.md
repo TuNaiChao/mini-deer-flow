@@ -10,6 +10,17 @@
 `build_middlewares`（M16 落地，见 [middlewares.md](middlewares.md)）；本篇讲它的两个调用方
 （factory + lead_agent）以及它们还做了什么（模型解析 / 工具过滤 / 提示词拼接 / tracing 注入）。
 
+> **M17 全维重审（2026-06-28）**：逐文件 diff 最新上游（`__init__` / `factory` / `features` /
+> `thread_state` / `lead_agent/{agent,prompt}` / `lead_agent/__init__`）。差异**几乎全是中英 docstring
+> 翻译 + 类型注解引号（`from __future__ import annotations`）+ mini 把 `build_middlewares` 从
+> `lead_agent/agent.py` 拆到 `agents/middlewares/__init__.py` 的结构选择**，剥 docstring 后逻辑零漂移。
+> 补 **1 项半挂对齐**：SDK 路径 `create_deerflow_agent` 缺 TokenBudget——M16 给 lead 链（步骤 #23）
+> 加了 `TokenBudgetMiddleware`，但 SDK 的 `RuntimeFeatures` 漏了 `token_budget` 字段、`factory.py`
+> 漏了步骤 [13]。本次补齐：`features.py` 加 `token_budget` flag + `factory.py` 加步骤 [13]（Clarification
+> 顺延 [14]）。+ 3 项 hermetic 测试（`test_agent_with_middlewares.py`：token_budget=True 进链且在
+> Clarification 前 / 默认 False 不误装 / 自定义实例直用）。deferred：**#3592 guaranteed memory injection**
+>（跨 prompt.py+memory_config+lead_agent/prompt 3 模块的新增特性，非 bug，归后续专项）。
+
 ---
 
 ## 0. 这个模块解决什么问题
@@ -48,6 +59,7 @@ class RuntimeFeatures:
     auto_title: bool | AgentMiddleware = False   # 自动标题
     guardrail: Literal[False] | AgentMiddleware = False     # 护栏（无内置默认）
     loop_detection: bool | AgentMiddleware = True  # 循环检测
+    token_budget: bool | AgentMiddleware = False   # 单 run token 预算（M17 重审补）
 ```
 
 每个 feature 接受三类值：`True`（用内置默认中间件）/ `False`（关）/ 一个 `AgentMiddleware`
@@ -117,7 +129,7 @@ agent = create_deerflow_agent(
 )
 ```
 
-`_assemble_from_features` 按**固定 14 步顺序**装链（与 lead_agent 对齐的精简版）：
+`_assemble_from_features` 按**固定 15 步顺序**装链（与 lead_agent 对齐的精简版）：
 
 ```
 0-2.  Sandbox 基础设施（ThreadData → Uploads → Sandbox）
@@ -131,7 +143,8 @@ agent = create_deerflow_agent(
 10.   ViewImageMiddleware（vision feature）
 11.   SubagentLimitMiddleware（subagent feature）
 12.   LoopDetectionMiddleware（loop_detection feature）
-13.   ClarificationMiddleware（恒定末位）
+13.   TokenBudgetMiddleware（token_budget feature，M17 重审补）
+14.   ClarificationMiddleware（恒定末位）
 ```
 
 每个 feature 值按 `False`（跳过）/ `True`（内置默认）/ 实例（自定义）三态处理。feature 注入
@@ -184,6 +197,11 @@ tracing 回调挂在**图调用根**，让一次 run 产生**一条** trace（�
 **配套不变量**：图里**每个** `create_chat_model(...)` 调用必须传 `attach_tracing=False`
 （否则模型级又挂一份回调 → 重复 span + propagate 失效）。agent.py 模块 docstring 专门记录了
 这四个调用点（bootstrap agent / 默认 agent / summarization 中间件 / TitleMiddleware）。
+
+> **子代理也镜像这套**（#3611，见 [tracing.md](tracing.md)）：`subagents/executor.py::_aexecute`
+> 在子代理图根同样挂 `build_tracing_callbacks()` + 注入 `inject_langfuse_metadata`（父 `thread_id`
+> → session、捕获 `user_id` → user、`subagent:<归一化名>` → trace_name），让子代理 trace 归属
+> 父对话而非飘成独立 session。
 
 ### 4.3 工具策略过滤 + 延迟装配
 

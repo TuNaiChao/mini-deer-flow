@@ -164,7 +164,8 @@ def _assemble_from_features(
       10.  ViewImageMiddleware（vision feature）
       11.  SubagentLimitMiddleware（subagent feature）
       12.  LoopDetectionMiddleware（loop_detection feature）
-      13.  ClarificationMiddleware（恒定末位）
+      13.  TokenBudgetMiddleware（token_budget feature）
+      14.  ClarificationMiddleware（恒定末位）
 
     两阶段排序：
       1. 内置链——固定顺序 append；
@@ -271,7 +272,17 @@ def _assemble_from_features(
 
             chain.append(LoopDetectionMiddleware.from_config(LoopDetectionConfig()))
 
-    # --- [13] Clarification（内置链恒定末位）---
+    # --- [13] TokenBudget ---
+    if feat.token_budget is not False:
+        if isinstance(feat.token_budget, AgentMiddleware):
+            chain.append(feat.token_budget)
+        else:
+            from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
+            from deerflow.config.token_budget_config import TokenBudgetConfig
+
+            chain.append(TokenBudgetMiddleware.from_config(TokenBudgetConfig()))
+
+    # --- [14] Clarification（内置链恒定末位）---
     chain.append(ClarificationMiddleware())
     extra_tools.append(ask_clarification_tool)
 

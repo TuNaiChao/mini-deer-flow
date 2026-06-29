@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import threading
+import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +43,7 @@ from deerflow.skills import (
 )
 from deerflow.skills.installer import (
     SkillAlreadyExistsError,
+    is_symlink_member,
     is_unsafe_zip_member,
     resolve_skill_dir_from_archive,
     safe_extract_skill_archive,
@@ -409,6 +412,122 @@ class TestStorage:
 
 
 # ===========================================================================
+# 5b. storage singleton lifecycle（#3778）
+# ===========================================================================
+
+
+class TestSkillStorageSingleton:
+    """#3778：单例在 ``_skill_storage_lock`` 内双检构建——冷启动并发只构出一个实例。
+
+    这些用例把 ``get_app_config`` 与 ``resolve_class`` 换成桩，绕开磁盘 config.yaml 与
+    真实反射；桩构造器刻意 sleep 撑开竞态窗口，让「无锁会构出多份」的事实可被观测。
+    """
+
+    def _patch_singleton_deps(self, monkeypatch, *, construct_sleep: float):
+        import deerflow.config as cfg_mod
+        import deerflow.reflection as refl_mod
+        import deerflow.skills.storage as storage_mod
+
+        # 记录每次构造的**线程 id**（而非全局计数）。全量套件下，前序测试（如 run_manager
+        # 的 worker）可能遗留后台线程，经 lead_agent/prompt.py 的 ``get_or_new_skill_storage(
+        # app_config=...)`` **bypass 单例路径**（每次新构、不经锁）在本测试窗口内构造
+        # _CountingStorage——那与本测试的「单例冷启动」无关。按 tid 过滤才能只数本测试
+        # 自己的线程，排除这类跨文件污染。
+        constructor_tids: list[int] = []
+        built: list[object] = []
+
+        # 显式冷启动：patch 完依赖后再 reset，保证测试线程看到的一定是 None 冷启动。
+        storage_mod.reset_skill_storage()
+
+        class _CountingStorage:
+            """桩 storage：不继承 SkillStorage（``resolve_class`` 已被 patch 跳过 issubclass 校验），
+            记构造线程 + 模拟慢构造。提供 ``load_skills`` 等 stub，以免误拿到该单例时 AttributeError。"""
+
+            def __init__(self_inner, *args, **kwargs):
+                if construct_sleep:
+                    time.sleep(construct_sleep)
+                constructor_tids.append(threading.get_ident())
+                built.append(self_inner)
+
+            def load_skills(self_inner, *, enabled_only: bool = False):
+                return []
+
+        fake_app_config = SimpleNamespace(
+            skills=SimpleNamespace(
+                use="fake",
+                container_path="/mnt/skills",
+                get_skills_path=lambda: Path("/tmp/skills"),
+            )
+        )
+        monkeypatch.setattr(cfg_mod, "get_app_config", lambda: fake_app_config)
+        monkeypatch.setattr(refl_mod, "resolve_class", lambda path, base: _CountingStorage)
+        return constructor_tids, built
+
+    def test_concurrent_cold_start_builds_exactly_one(self, monkeypatch):
+        """8 个线程同时冷启动 → 这 8 个线程**之间**至多构出 1 个实例，且都拿到同一对象。
+
+        不断言「全局恰好 1 次构造」——全量套件下前序测试遗留的后台线程可能经 bypass 路径
+        （``app_config=`` / ``skills_path=``）无关地构造。真正要验证的不变量是：**单例路径上
+        的并发调用方被锁串行**——8 个测试线程彼此之间不会各构一份（``<= 1``），且全部拿到
+        同一实例。
+        """
+        import deerflow.skills.storage as storage_mod
+
+        constructor_tids, _built = self._patch_singleton_deps(monkeypatch, construct_sleep=0.05)
+        results: list[object] = []
+        results_lock = threading.Lock()
+        barrier = threading.Barrier(8)
+        test_tids: set[int] = set()
+
+        def _caller():
+            test_tids.add(threading.get_ident())
+            barrier.wait()  # 8 个线程尽量同时进 get_or_new_skill_storage
+            instance = storage_mod.get_or_new_skill_storage()
+            with results_lock:
+                results.append(instance)
+
+        threads = [threading.Thread(target=_caller) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 只数 8 个测试线程的构造（排除外来 bypass 构造）。
+        own_constructions = sum(1 for tid in constructor_tids if tid in test_tids)
+        assert own_constructions <= 1, f"8 个并发测试线程之间应至多构出 1 个实例（锁串行），实际 {own_constructions}"
+        assert len(results) == 8
+        # 全部拿到同一个实例
+        first = results[0]
+        assert all(r is first for r in results)
+
+    def test_second_call_reuses_singleton_without_rebuild(self, monkeypatch):
+        """单线程二次调用：本线程不重新构造，返回同一实例。"""
+        import deerflow.skills.storage as storage_mod
+
+        constructor_tids, _built = self._patch_singleton_deps(monkeypatch, construct_sleep=0.0)
+        main_tid = threading.get_ident()
+        first = storage_mod.get_or_new_skill_storage()
+        second = storage_mod.get_or_new_skill_storage()
+        own_constructions = sum(1 for tid in constructor_tids if tid == main_tid)
+        assert own_constructions == 1, f"本线程二次调用应只构 1 次，实际 {own_constructions}"
+        assert second is first
+
+    def test_reset_clears_singleton_allowing_rebuild(self, monkeypatch):
+        """reset_skill_storage() 持锁清空 → 本线程下次调用会重新构造（own_constructions 升到 2）。"""
+        import deerflow.skills.storage as storage_mod
+
+        constructor_tids, _built = self._patch_singleton_deps(monkeypatch, construct_sleep=0.0)
+        main_tid = threading.get_ident()
+        storage_mod.get_or_new_skill_storage()
+        storage_mod.reset_skill_storage()
+        # 清空后全局确为 None
+        assert storage_mod._default_skill_storage is None
+        storage_mod.get_or_new_skill_storage()
+        own_constructions = sum(1 for tid in constructor_tids if tid == main_tid)
+        assert own_constructions == 2, f"reset 后本线程应再构 1 次（共 2 次），实际 {own_constructions}"
+
+
+# ===========================================================================
 # 6. permissions
 # ===========================================================================
 
@@ -490,6 +609,39 @@ class TestInstaller:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             with pytest.raises(ValueError, match="too large"):
                 safe_extract_skill_archive(zf, dest, max_total_size=100)
+
+    def test_is_symlink_member_detected(self):
+        """#23：external_attr 高 16 位带 S_IFLNK → 判为 symlink 成员。"""
+        import stat
+
+        link_info = zipfile.ZipInfo("evil-link")
+        link_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        assert is_symlink_member(link_info) is True
+
+        file_info = zipfile.ZipInfo("plain.txt")
+        file_info.external_attr = (stat.S_IFREG | 0o644) << 16
+        assert is_symlink_member(file_info) is False
+
+    def test_safe_extract_skips_symlink_member(self, tmp_path):
+        """#23：归档里的 symlink 成员被静默跳过——不解压、不抛错（防 symlink 越权）。"""
+        import stat
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            link_info = zipfile.ZipInfo("evil-link")
+            # 高 16 位 = Unix mode；S_IFLNK 标记这是个符号链接，内容是目标路径
+            link_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            zf.writestr(link_info, "/etc/passwd")
+            # 同时放一个正常文件，证明只跳 symlink、不影响其余成员
+            zf.writestr("real/SKILL.md", "---\nname: x\ndescription: y\n---\n")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+            safe_extract_skill_archive(zf, dest)
+        # symlink 没被解压成任何东西
+        assert not (dest / "evil-link").exists()
+        # 正常文件照常解压
+        assert (dest / "real" / "SKILL.md").exists()
 
     def test_resolve_skill_dir_single_nested(self, tmp_path):
         nested = tmp_path / "skill"

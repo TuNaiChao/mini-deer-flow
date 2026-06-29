@@ -95,6 +95,30 @@ models:
   #   supports_thinking: false
   #   supports_vision: true
 
+  # --- 路径 D：vLLM 0.19.0 推理模型（OpenAI 兼容，保留 reasoning 字段）---
+  # 当你在 vLLM 上跑「会先想一想的模型」（reasoning model，如 Qwen3 开了思考模式）
+  # 时，vLLM 会在返回里多塞一个非标准字段 reasoning。LangChain 默认的 ChatOpenAI
+  # 会把它丢掉，导致「想完→调工具→继续想」这种交替流程在多轮里出问题。
+  # 用 deerflow 自带的 VllmChatModel（继承 ChatOpenAI，重写三个钩子保住 reasoning）
+  # 即可解决。Qwen 系推理模型开关思考用 extra_body.chat_template_kwargs.enable_thinking
+  # （deerflow 也会把旧键名 thinking 自动翻译成 enable_thinking）。
+  # 注意：部分推理模型还需在服务端用 `vllm serve ... --reasoning-parser <parser>` 启动。
+  # - name: qwen3-32b-vllm
+  #   display_name: Qwen3 32B (vLLM)
+  #   use: deerflow.models.vllm_provider:VllmChatModel
+  #   model: Qwen/Qwen3-32B
+  #   api_key: $VLLM_API_KEY
+  #   base_url: http://localhost:8000/v1
+  #   request_timeout: 600.0
+  #   max_retries: 2
+  #   max_tokens: 8192
+  #   supports_thinking: true
+  #   supports_vision: false
+  #   when_thinking_enabled:
+  #     extra_body:
+  #       chat_template_kwargs:
+  #         enable_thinking: true
+
   # --- OpenAI 兼容接口（可选）---
   # - name: gpt-4o
   #   display_name: GPT-4o
@@ -142,6 +166,21 @@ loop_detection:
   enabled: true
   warn_threshold: 3
   hard_limit: 5
+
+# ============================================================
+# Token 预算（单 run token 用量上限，默认关）
+# ============================================================
+# 到 warn_threshold 软提醒模型收尾；到 hard_stop_threshold 剥 tool_calls 强制收尾。
+# 三上限取最先突破的：max_tokens（input+output 总和）、max_input_tokens、max_output_tokens（后两个可选）。
+# 注：InputSanitizationMiddleware（#1 提示词注入防御）与 SystemMessageCoalescingMiddleware
+# （#20 合并 SystemMessage）无开关、始终生效，不在此配置。
+token_budget:
+  enabled: false
+  max_tokens: 200000
+  # max_input_tokens: 100000    # 可选：只限 input
+  # max_output_tokens: 50000    # 可选：只限 output
+  warn_threshold: 0.8           # 用到上限的 80% 时软提醒
+  hard_stop_threshold: 1.0      # 用满时硬停（不得低于 warn_threshold）
 
 # ============================================================
 # 数据库配置

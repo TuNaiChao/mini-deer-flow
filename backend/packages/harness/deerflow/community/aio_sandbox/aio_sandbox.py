@@ -154,10 +154,18 @@ class AioSandbox(Sandbox):
                 output = result.data.output if result.data else ""
 
                 if output and _ERROR_OBSERVATION_SIGNATURE in output:
-                    logger.warning("ErrorObservation detected in sandbox output, retrying with a fresh session")
+                    logger.warning("ErrorObservation detected in sandbox output, retrying on a fresh session")
                     fresh_id = str(uuid.uuid4())
-                    result = self._client.shell.exec_command(command=command, id=fresh_id, no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT)  # type: ignore[union-attr]
-                    output = result.data.output if result.data else ""
+                    # 显式建/拆恢复 session，免得每次错误恢复都泄漏一个 session。
+                    self._client.shell.create_session(id=fresh_id)  # type: ignore[union-attr]
+                    try:
+                        result = self._client.shell.exec_command(command=command, id=fresh_id, no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT)  # type: ignore[union-attr]
+                        output = result.data.output if result.data else ""
+                    finally:
+                        try:
+                            self._client.shell.cleanup_session(fresh_id)  # type: ignore[union-attr]
+                        except Exception as cleanup_error:
+                            logger.warning("Failed to release recovery session %s: %s", fresh_id, cleanup_error)
 
                 return output if output else "(no output)"
             except Exception as e:

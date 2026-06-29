@@ -4,6 +4,14 @@
 > 配套测试：[test/test_checkpointer.py](../test/test_checkpointer.py)
 > 本文面向「刚接触 LangGraph 状态管理的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐文件 diff `checkpointer/{__init__,provider,async_provider}.py`
+> vs 最新上游。**勘误 §3.1-A**：上游漂移清单曾记「mini 缺 `async_provider.py`」——**过时**，mini 早已有
+> 该文件且与上游 AST 级零漂移（异步 checkpointer provider 完整）。`provider.py` 的差异是
+> M19 已认定并记录的**有意结构选择**：mini `get_app_config().checkpointer` 直读（lifespan 进时
+> 配置已加载），上游用 `ensure_config_loaded()` + `get_checkpointer_config()` 包装（Gateway 上下文
+> 里不保证配置已加载）——语义等价，mini 无 Gateway 故走直读。其余差异为 install hint 文案
+> （中英）+ `__init__.py` 相对/绝对 import 顺序，均 cosmetic。无需补丁。
+
 ---
 
 ## 1. 一句话定位

@@ -816,6 +816,18 @@ def test_classify_warn_medium_risk():
     assert _classify_command("sudo ls") == "warn"
 
 
+def test_unparseable_heredoc_classified_as_pass():
+    """#3786：合法 heredoc 是有效 bash 但 shlex 解析不了——不直接 block，落中危检查后放行。"""
+    cmd = "python3 << 'EOF'\necho it's fine\nEOF"
+    assert _classify_command(cmd) == "pass"
+
+
+def test_unparseable_heredoc_with_high_risk_pattern_still_blocks():
+    """#3786：heredoc 体内含高危模式仍要 block（高危在 shlex 解析前已对原文检查）。"""
+    cmd = "python3 << 'EOF'\necho it's fine\ncat /etc/shadow\nEOF"
+    assert _classify_command(cmd) == "block"
+
+
 def test_classify_compound_takes_worst():
     # 安全 + 中危 → warn。
     assert _classify_command("echo hi && pip install x") == "warn"

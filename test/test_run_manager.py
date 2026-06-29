@@ -661,3 +661,136 @@ async def test_create_or_reject_does_not_interrupt_old_run_when_new_run_store_wr
     assert old.abort_event.is_set() is False
     # 内存里只剩老 run（新 run 被 finally 清掉）
     assert list(rm._runs) == [old.run_id]
+
+
+# ===========================================================================
+# MemoryRunStore：thread_id 二级索引（#3562）+ 按模型归桶聚合（#3658）
+# ===========================================================================
+
+
+class TestMemoryRunStoreIndex:
+    """``MemoryRunStore`` 的 ``_runs_by_thread`` 二级索引 + 按模型聚合。
+
+    #3562：``list_by_thread`` / ``aggregate_tokens_by_thread`` 用索引做 O(该 thread 的 run 数)
+    查找，而非扫全部 run；put/delete 同步维护索引。#3658：``aggregate_tokens_by_thread``
+    按 ``token_usage_by_model`` 归桶，旧行（无此字段）回退到单一 ``model_name``。
+    """
+
+    async def _put_run(self, store, run_id, thread_id, *, status="success", model_name="gpt-4o", **extra):
+        await store.put(run_id, thread_id=thread_id, model_name=model_name, status=status, **extra)
+        # put 不支持设完成字段，单独调 update_run_completion 补 token 字段
+        if extra or status != "pending":
+            await store.update_run_completion(
+                run_id,
+                status=status,
+                model_name=model_name,
+                **{k: v for k, v in extra.items() if k != "metadata"},
+            )
+
+    async def test_put_indexes_by_thread(self):
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="success")
+        await store.put("r2", thread_id="t1", status="success")
+        await store.put("r3", thread_id="t2", status="success")
+        # t1 桶有两个 run
+        assert set(store._runs_by_thread["t1"]) == {"r1", "r2"}
+        assert set(store._runs_by_thread["t2"]) == {"r3"}
+
+    async def test_delete_unindexes(self):
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="success")
+        await store.delete("r1")
+        # 桶空了就摘键
+        assert "t1" not in store._runs_by_thread
+
+    async def test_list_by_thread_uses_index_not_full_scan(self):
+        """list_by_thread 经索引返回该 thread 的 run，不混入别的 thread。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="success")
+        await store.put("r2", thread_id="t2", status="success")
+        await store.put("r3", thread_id="t1", status="success")
+        results = await store.list_by_thread("t1")
+        assert {r["run_id"] for r in results} == {"r1", "r3"}
+
+    async def test_list_by_thread_unknown_thread_returns_empty(self):
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="success")
+        # 索引里没 t2 → 直接返空，不扫 _runs
+        assert await store.list_by_thread("t2") == []
+
+    async def test_list_by_thread_drops_stale_index_entry(self):
+        """纵深防御：索引里有 id 但 _runs 已没有（不应发生，但索引查时 ``_runs.get`` 兜底跳过）。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="success")
+        # 手动制造陈旧索引条目
+        store._runs_by_thread["t1"]["ghost"] = None
+        results = await store.list_by_thread("t1")
+        assert {r["run_id"] for r in results} == {"r1"}  # ghost 被跳过
+
+    async def test_aggregate_buckets_by_token_usage_by_model(self):
+        """#3658：有 token_usage_by_model 的 run → 按模型归桶（一次 run 多模型分开计）。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", model_name="gpt-4o", status="success")
+        await store.update_run_completion(
+            "r1",
+            status="success",
+            total_tokens=100,
+            token_usage_by_model={
+                "gpt-4o": {"input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
+                "claude-3": {"input_tokens": 30, "output_tokens": 20, "total_tokens": 50},
+            },
+        )
+        agg = await store.aggregate_tokens_by_thread("t1")
+        by_model = agg["by_model"]
+        assert by_model["gpt-4o"]["tokens"] == 50
+        assert by_model["gpt-4o"]["runs"] == 1
+        assert by_model["claude-3"]["tokens"] == 50
+        assert by_model["claude-3"]["runs"] == 1
+
+    async def test_aggregate_legacy_run_falls_back_to_model_name(self):
+        """#3658：无 token_usage_by_model 的旧行 → 整 run 归到单一 model_name（不丢老数据）。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", model_name="legacy-model", status="success")
+        await store.update_run_completion("r1", status="success", total_tokens=80)
+        agg = await store.aggregate_tokens_by_thread("t1")
+        by_model = agg["by_model"]
+        assert by_model["legacy-model"]["tokens"] == 80
+        assert by_model["legacy-model"]["runs"] == 1
+
+    async def test_aggregate_mixed_new_and_legacy_runs(self):
+        """新行（按模型归桶）+ 旧行（回退 model_name）混合，两者都进 by_model。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", model_name="gpt-4o", status="success")
+        await store.update_run_completion(
+            "r1",
+            status="success",
+            total_tokens=50,
+            token_usage_by_model={"gpt-4o": {"input_tokens": 30, "output_tokens": 20, "total_tokens": 50}},
+        )
+        await store.put("r2", thread_id="t1", model_name="legacy-model", status="success")
+        await store.update_run_completion("r2", status="success", total_tokens=70)
+        agg = await store.aggregate_tokens_by_thread("t1")
+        by_model = agg["by_model"]
+        assert by_model["gpt-4o"]["tokens"] == 50
+        assert by_model["legacy-model"]["tokens"] == 70
+
+    async def test_aggregate_skips_non_terminal_status(self):
+        """include_active=False（默认）→ running 不算；success/error 才进聚合。"""
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", model_name="gpt-4o", status="success")
+        await store.update_run_completion("r1", status="success", total_tokens=50)
+        await store.put("r2", thread_id="t1", model_name="gpt-4o", status="running")
+        await store.update_run_completion("r2", status="running", total_tokens=999)
+        agg = await store.aggregate_tokens_by_thread("t1")
+        assert agg["total_tokens"] == 50  # running 的 999 没算
+        # include_active=True → running 也算
+        agg_active = await store.aggregate_tokens_by_thread("t1", include_active=True)
+        assert agg_active["total_tokens"] == 50 + 999
+
+    async def test_update_run_completion_persists_token_usage_by_model(self):
+        store = MemoryRunStore()
+        await store.put("r1", thread_id="t1", status="running")
+        usage = {"gpt-4o": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}
+        await store.update_run_completion("r1", status="success", token_usage_by_model=usage)
+        row = await store.get("r1")
+        assert row["token_usage_by_model"] == usage

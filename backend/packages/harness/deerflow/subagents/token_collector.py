@@ -48,6 +48,12 @@ class SubagentTokenCollector(BaseCallbackHandler):
                     total_tk = input_tk + output_tk
                 if total_tk <= 0:
                     continue
+                # #3658：从 response_metadata 取模型名，随记录回灌父 RunJournal，
+                # 让子代理的 token 也按模型归桶（不只是按 caller 归桶）。
+                response_metadata = getattr(gen.message, "response_metadata", None) or {}
+                model_name: str | None = None
+                if isinstance(response_metadata, dict):
+                    model_name = response_metadata.get("model_name") or response_metadata.get("model")
                 self._counted_run_ids.add(rid)
                 self._records.append(
                     {
@@ -56,10 +62,11 @@ class SubagentTokenCollector(BaseCallbackHandler):
                         "input_tokens": input_tk,
                         "output_tokens": output_tk,
                         "total_tokens": total_tk,
+                        "model_name": model_name,
                     }
                 )
                 return
 
-    def snapshot_records(self) -> list[dict[str, int | str]]:
+    def snapshot_records(self) -> list[dict[str, int | str | None]]:
         """返回累计用量记录的副本。"""
         return list(self._records)

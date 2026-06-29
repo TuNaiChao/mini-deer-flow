@@ -5,7 +5,7 @@ hermetic：``build_middlewares(app_config=...)`` 接显式配置不读全局 con
 
 覆盖红线：
   - #14 Clarification 永远末位；
-  - #2 ThreadData 先于 #4 Sandbox，#3 Uploads 先于 #4 Sandbox；
+  - #3 Uploads 先于 #4 ThreadData，#4 ThreadData 先于 #5 Sandbox（对齐上游顺序）；
   - #15 所有 ``wrap_tool_call`` / ``wrap_model_call`` 透传 ``GraphBubbleUp``；
   - 23 步顺序不变量 + 各 config 开关 gating。
 """
@@ -97,9 +97,10 @@ def test_default_chain_has_core_middlewares_and_clarification_last():
     mws = build_middlewares(app_config=AppConfig())
     names = _names(mws)
     for must in [
+        "InputSanitizationMiddleware",
         "ToolOutputBudgetMiddleware",
-        "ThreadDataMiddleware",
         "UploadsMiddleware",
+        "ThreadDataMiddleware",
         "SandboxMiddleware",
         "DanglingToolCallMiddleware",
         "LLMErrorHandlingMiddleware",
@@ -110,22 +111,25 @@ def test_default_chain_has_core_middlewares_and_clarification_last():
         "TokenUsageMiddleware",
         "TitleMiddleware",
         "MemoryMiddleware",
+        "SystemMessageCoalescingMiddleware",
         "LoopDetectionMiddleware",
         "SafetyFinishReasonMiddleware",
         "ClarificationMiddleware",
     ]:
         assert must in names, f"missing {must}"
     assert isinstance(mws[-1], ClarificationMiddleware)
+    # InputSanitization 必须是第 0 个（最外层 wrap_model_call）。
+    assert names[0] == "InputSanitizationMiddleware"
 
 
-def test_thread_data_precedes_sandbox_and_uploads():
-    """红线：ThreadData(#2) → Uploads(#3) → Sandbox(#4)。"""
+def test_uploads_precedes_thread_data_and_sandbox():
+    """红线：Uploads(#3) → ThreadData(#4) → Sandbox(#5)（对齐上游顺序）。"""
     mws = build_middlewares(app_config=AppConfig())
-    assert _idx(mws, ThreadDataMiddleware) < _idx(mws, UploadsMiddleware)
+    assert _idx(mws, UploadsMiddleware) < _idx(mws, ThreadDataMiddleware)
     # SandboxMiddleware 来自 sandbox.middleware；用类名定位（避免硬 import 产生耦合）。
     sandbox_i = next(i for i, m in enumerate(mws) if type(m).__name__ == "SandboxMiddleware")
-    assert _idx(mws, UploadsMiddleware) < sandbox_i
     assert _idx(mws, ThreadDataMiddleware) < sandbox_i
+    assert _idx(mws, UploadsMiddleware) < sandbox_i
 
 
 def test_custom_middlewares_before_clarification():
@@ -147,6 +151,63 @@ def test_safety_registered_after_custom():
 
     mws = build_middlewares(app_config=AppConfig(), custom_middlewares=[MyMiddleware()])
     assert _idx(mws, MyMiddleware) < _idx(mws, SafetyFinishReasonMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-27 六维重审新增：3 个补齐的中间件（InputSanitization / SystemMessageCoalescing / TokenBudget）
+# ---------------------------------------------------------------------------
+
+
+def test_input_sanitization_is_first_in_lead_and_subagent_base():
+    """InputSanitization(#1) 在 lead 与 subagent 共享前置段都是第 0 个（最外层 wrap_model_call）。"""
+    from deerflow.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
+    from deerflow.agents.middlewares.tool_error_handling_middleware import (
+        build_lead_runtime_middlewares,
+        build_subagent_runtime_middlewares,
+    )
+
+    lead = build_lead_runtime_middlewares(app_config=AppConfig())
+    sub = build_subagent_runtime_middlewares(app_config=AppConfig())
+    assert isinstance(lead[0], InputSanitizationMiddleware)
+    assert isinstance(sub[0], InputSanitizationMiddleware)
+
+
+def test_system_message_coalescing_always_present_before_subagent():
+    """SystemMessageCoalescing(#20) 始终挂（无开关），且在 SubagentLimit(#21) 之前。"""
+    from deerflow.agents.middlewares.system_message_coalescing_middleware import SystemMessageCoalescingMiddleware
+
+    mws = build_middlewares(app_config=AppConfig())
+    assert any(isinstance(m, SystemMessageCoalescingMiddleware) for m in mws)
+    # 默认不开 subagent 时也挂 SystemMessageCoalescing（始终生效）
+    # 开 subagent 后：SystemMessageCoalescing 必须在 SubagentLimit 之前
+    mws2 = build_middlewares(config={"configurable": {"subagent_enabled": True}}, app_config=AppConfig())
+    assert _idx(mws2, SystemMessageCoalescingMiddleware) < _idx(mws2, SubagentLimitMiddleware)
+
+
+def test_system_message_coalescing_before_loop_detection():
+    """SystemMessageCoalescing(#20) 在 LoopDetection(#22) 之前——合并要在循环检测看消息前完成。"""
+    from deerflow.agents.middlewares.system_message_coalescing_middleware import SystemMessageCoalescingMiddleware
+
+    mws = build_middlewares(app_config=AppConfig())
+    assert _idx(mws, SystemMessageCoalescingMiddleware) < _idx(mws, LoopDetectionMiddleware)
+
+
+def test_token_budget_disabled_omits():
+    """TokenBudget 默认 enabled=False → 不挂。"""
+    from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
+
+    mws = build_middlewares(app_config=AppConfig())
+    assert not any(isinstance(m, TokenBudgetMiddleware) for m in mws)
+
+
+def test_token_budget_enabled_after_loop_before_clarification():
+    """TokenBudget(#23) 启用时挂在 LoopDetection(#22) 之后、Clarification(#26) 之前。"""
+    from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
+
+    cfg = AppConfig(token_budget={"enabled": True})
+    mws = build_middlewares(app_config=cfg)
+    assert _idx(mws, LoopDetectionMiddleware) < _idx(mws, TokenBudgetMiddleware)
+    assert _idx(mws, TokenBudgetMiddleware) < len(mws) - 1  # 不是末位（Clarification 才是）
 
 
 # ---------------------------------------------------------------------------

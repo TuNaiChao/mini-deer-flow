@@ -71,6 +71,87 @@ def test_app_config_get_model_config_contract():
     assert AppConfig().get_model_config(None) is None
 
 
+# ---------------------------------------------------------------------------
+# #3688：name -> config O(1) 索引
+# ---------------------------------------------------------------------------
+
+
+class TestNameIndexes:
+    """#3688：``_build_name_indexes`` 把 models/tools 预建 dict，让 getter O(1)。
+
+    锁住三点：① 索引在构造后已建（getter 走 dict 非 ``next`` 扫）；② 重名保留首条
+    （与旧 ``next(...)`` / 上游 ``setdefault`` 语义一致）；③ reload（新构 AppConfig）
+    刷新索引——旧实例的索引不污染新实例。
+    """
+
+    def test_model_index_built_after_construction(self):
+        """构造后 ``_models_by_name`` 已建，getter 命中。"""
+        cfg = AppConfig(
+            models=[
+                ModelConfig(name="a", use="x:A", model="ma"),
+                ModelConfig(name="b", use="x:B", model="mb"),
+            ]
+        )
+        assert set(cfg._models_by_name.keys()) == {"a", "b"}
+        # getter 返回的正是索引里那条（身份相等，证明走 dict 非重建）
+        assert cfg.get_model_config("b") is cfg._models_by_name["b"]
+
+    def test_tool_index_built_after_construction(self):
+        """构造后 ``_tools_by_name`` 已建；非 dict / 无 name 条目被跳过（对齐旧过滤）。"""
+        cfg = AppConfig(
+            tools=[
+                {"name": "web_search", "api_key": "k"},
+                {"name": "web_fetch"},
+                {"not_name": "oops"},  # 无 name 键 → 不索引
+            ],
+        )
+        assert set(cfg._tools_by_name.keys()) == {"web_search", "web_fetch"}
+        assert cfg.get_tool_config("web_search") == {"name": "web_search", "api_key": "k"}
+        assert cfg.get_tool_config("web_fetch") == {"name": "web_fetch"}
+        assert cfg.get_tool_config("missing") is None
+
+    def test_duplicate_model_name_keeps_first(self):
+        """重名模型保留首个（setdefault 语义，对齐上游 + 旧 next 首匹配）。"""
+        first = ModelConfig(name="dup", use="x:First", model="m1")
+        second = ModelConfig(name="dup", use="x:Second", model="m2")
+        cfg = AppConfig(models=[first, second])
+        assert cfg.get_model_config("dup") is first
+        assert cfg._models_by_name["dup"] is first
+
+    def test_duplicate_tool_name_keeps_first(self):
+        """重名工具保留首个 dict。"""
+        cfg = AppConfig(
+            tools=[
+                {"name": "t", "v": 1},
+                {"name": "t", "v": 2},
+            ],
+        )
+        assert cfg.get_tool_config("t") == {"name": "t", "v": 1}
+
+    def test_empty_config_has_empty_indexes(self):
+        """空配置 → 空索引（不报错）。"""
+        cfg = AppConfig()
+        assert cfg._models_by_name == {}
+        assert cfg._tools_by_name == {}
+
+    def test_index_not_serialized(self):
+        """PrivateAttr 不进 model_dump（私有，不序列化）。"""
+        cfg = AppConfig(models=[ModelConfig(name="a", use="x:A", model="ma")])
+        dumped = cfg.model_dump()
+        assert "_models_by_name" not in dumped
+        assert "_tools_by_name" not in dumped
+
+    def test_fresh_config_does_not_inherit_stale_index(self):
+        """新构 AppConfig 自带新索引——旧实例不污染（reload 场景）。"""
+        old = AppConfig(models=[ModelConfig(name="old", use="x:O", model="mo")])
+        assert old.get_model_config("old") is not None
+        new = AppConfig(models=[ModelConfig(name="new", use="x:N", model="mn")])
+        # 新实例看不到旧 name，旧实例看不到新 name
+        assert new.get_model_config("old") is None
+        assert old.get_model_config("new") is None
+        assert new.get_model_config("new").name == "new"
+
+
 def test_app_config_coerces_null_list_sections():
     """yaml 里全注释的列表节解析成 None，validator 归一为 []（红线 #25 配套）。"""
     cfg = AppConfig(models=None, tools=None, tool_groups=None)

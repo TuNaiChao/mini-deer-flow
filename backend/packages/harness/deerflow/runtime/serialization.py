@@ -41,6 +41,16 @@ def serialize_lc_object(obj: Any) -> Any:
             return obj.dict()
         except Exception:
             pass
+    # LangGraph 的 Interrupt 是 __slots__ 类——没有 model_dump/dict/__dict__，
+    # 否则会落到下面的 str() 兜底，产出一个畸形 payload。这里把它规范化成
+    # {value, id}（对齐 LangGraph Platform API）。
+    try:
+        from langgraph.types import Interrupt
+    except ImportError:
+        pass
+    else:
+        if isinstance(obj, Interrupt):
+            return serialize_lc_object({"value": obj.value, "id": getattr(obj, "id", None)})
     # 最后兜底
     try:
         return str(obj)
@@ -51,12 +61,13 @@ def serialize_lc_object(obj: Any) -> Any:
 def serialize_channel_values(channel_values: dict[str, Any]) -> dict[str, Any]:
     """序列化 channel values，剥掉 LangGraph 的内部键。
 
-    ``__pregel_*`` 与 ``__interrupt__`` 这类内部键被移除，以对齐 LangGraph Platform
-    API 的返回。
+    只移除 ``__pregel_*`` 键——``__interrupt__`` **故意保留**，让 LangGraph SDK
+    能从 values chunk 里识别中断事件（见 issue #3595）；其值（Interrupt 对象列表）
+    由 :func:`serialize_lc_object` 里的 Interrupt 分支规范化成 ``{value, id}``。
     """
     result: dict[str, Any] = {}
     for key, value in channel_values.items():
-        if key.startswith("__pregel_") or key == "__interrupt__":
+        if key.startswith("__pregel_"):
             continue
         result[key] = serialize_lc_object(value)
     return result
@@ -126,5 +137,7 @@ def serialize(obj: Any, *, mode: str = "") -> Any:
     if mode == "messages":
         return serialize_messages_tuple(obj)
     if mode == "values":
-        return serialize_channel_values(obj) if isinstance(obj, dict) else serialize_lc_object(obj)
+        # ``values`` 快照把完整 state 流给前端，所以必须像 REST 端点一样剥掉
+        # hide_from_ui 消息里的 base64 图片 payload。
+        return serialize_channel_values_for_api(obj) if isinstance(obj, dict) else serialize_lc_object(obj)
     return serialize_lc_object(obj)

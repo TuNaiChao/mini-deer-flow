@@ -6,6 +6,17 @@
 
 读完 [sandbox.md](sandbox.md)（懂了虚拟路径 + LocalSandbox 为何不是安全边界）再看本篇最省事。
 
+> **Phase 2 全维重审（2026-06-29）**：逐文件 diff `community/aio_sandbox/*` vs 最新上游（剥 docstring 后
+> 判逻辑差）。补 **2 项真实对齐**：① provider 单例生命周期加锁（**#3730**）——锁在 `sandbox_provider.py`
+> 层，对所有 provider（含 `AioSandboxProvider`）生效，详见 [sandbox.md](sandbox.md) §provider 单例（核心收益
+> 正是防 AIO 的 idle-checker 线程在双重初始化时泄漏）；② **ErrorObservation 恢复重试**显式
+> `create_session` + `finally cleanup_session`——旧版只在新 id 上 `exec_command` 不建/拆 session，每次错误
+> 恢复都泄漏一个 session（见 §命令串行化）。**defer**：**#3729**（`acquire(*, user_id)` + `create(*, user_id)` +
+> 按 `(user_id, thread_id)` 归桶 + sandbox_id 嵌 user_id）属 IM channel owner-scoping（Gateway，触及
+> `app/channels/feishu.py`），同 task_tool #2676 / uploads #3579 不 port——mini 经 `get_effective_user_id()`
+> 已正确按用户隔离路径，无 IM channel 故无 owner 覆盖需求；AIO backend 的 `create`/`discover` 签名随 #3729
+> defer。mini 的 soft-load `agent_sandbox`（红线 #24，上游改硬 import）+ `%`-format 日志为 mini 已知选择 / cosmetic。
+
 ---
 
 ## 为什么需要 AIO 沙箱（痛点）
@@ -99,6 +110,11 @@ thread `acquire` 时从暖池秒级回收——**免冷启动**（起一个新�
 AIO 容器维护**单个**持久 shell session。并发 `exec_command` 会把 session 搞坏，返回
 `ErrorObservation`（非真输出）。故 `AioSandbox.execute_command` 用 `self._lock` 串行化。即便加了锁
 仍检测到 `ErrorObservation` 签名（如多进程共享同一沙箱），就在**新 session**（新 id）上重试一次。
+
+> **恢复 session 显式建/拆**：重试不是直接 `exec_command(id=fresh_id)` 了事——那样 fresh_id 对应的 session
+> 从未被显式创建，事后也没人清理，每次错误恢复都泄漏一个 session。修法是先 `shell.create_session(id=fresh_id)`，
+> `try` 里跑 `exec_command`，`finally` 里 `shell.cleanup_session(fresh_id)`（清理本身失败只 warning 不抛，
+> 免得掩盖原异常）。这样恢复路径的 session 生命周期自洽，长跑的多进程共享场景不再慢慢漏 session。
 
 ### `download_file` 显式防穿越
 

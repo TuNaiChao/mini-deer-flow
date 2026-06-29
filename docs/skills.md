@@ -1,5 +1,21 @@
 # 19. skills.md — 技能系统（SKILL.md 协议 / 发现 / 激活 / 安装 / allowed-tools 收紧）
 
+> **M14 六维重审（2026-06-28）**：12 文件逐个 diff 最新上游——`storage/__init__.py` /
+> `skill_storage.py` / `local_skill_storage.py` / `parser.py` / `validation.py` / `installer.py` /
+> `slash.py` / `types.py` / `security_scanner.py` / `tool_policy.py` / `permissions.py` / `__init__.py`。
+> 剥 docstring 后**逻辑差异几乎为零**：五大关注点 **mini 均已含**——
+> **#23** 安装防护（`is_unsafe_zip_member` 拒绝对路径/`..` + `is_symlink_member` 跳 symlink +
+> `safe_extract_skill_archive` 512MB zip 炸弹上限 + 每成员 `is_relative_to(dest)`）、
+> **#2626** allowed-tools 强制（`filter_tools_by_skill_allowed_tools`，None=legacy 全放行 / 空集=禁全部）、
+> **#3466** slash 加固（严格 `/name<ws|eol>` 正则 + `RESERVED_SLASH_SKILL_NAMES` 6 保留字 + 前导空白拒）、
+> **#2987** scanner JSON 容错（剥 markdown 围栏 + 花括号配平）、
+> per-user/public/custom 三布局（`load_skills` 扫 `public`+`custom` + extensions enabled 合并）。
+> 唯一真实漂移：**#3778** storage 单例生命周期——上游加了 `_skill_storage_lock = threading.Lock()`
+> + 锁内双检构建 + 锁内 `reset_skill_storage()`；mini 旧版**全裸**（并发冷启动会构出多份、reset 可在
+> 并发读当口清空全局）。已补。`local_skill_storage.py` 的 `resolve_path` import（mini 走
+> `config.paths`、上游走 `config.runtime_paths`）是 mini 没有 `runtime_paths.py` 的已知选择
+> （§2.2 🟢低，独立任务），不影响逻辑。
+
 > **一句话定位**：技能让 agent 复用「特定场景的操作流程」——把一段「希望 agent 遵循的步骤」沉淀
 > 成一份 SKILL.md 文件，而不是每次在对话里手写。本模块负责发现 / 解析 / 按需激活 / 安全安装技能，
 > 以及用 allowed-tools 收紧技能激活时的工具集。
@@ -137,6 +153,71 @@ Treat the task text as:
 
 ---
 
+## 数据流架构图（谁触发谁）
+
+技能系统有**四条触发路径**，都汇聚到 `get_or_new_skill_storage()` 这个单例入口，再分流到各自的
+消费者。下图把「文件 → 调用方 → 动作」串起来：
+
+```
+                         ┌─────────────────────────────────────────┐
+   config.yaml           │ config/skills_config.py (SkillsConfig)   │
+   extensions_config.json│   .path / .container_path / .get_skills_path()
+                         │ config/extensions_config.py              │
+                         │   is_skill_enabled() ← enabled_skills    │
+                         └────────────────────┬────────────────────┘
+                                              │
+                                              ▼
+   ┌─────────────┐   ┌────────────────────────────────────────────┐
+   │ lead_agent/  │   │ skills/storage/__init__.py                 │   ← #3778 单例入口
+   │ prompt.py    │──▶│   get_or_new_skill_storage()               │      _skill_storage_lock
+   │ (常驻注入)   │   │     └─反射→ LocalSkillStorage              │      锁内双检构建
+   └─────────────┘   └────────────────────┬───────────────────────┘
+   ┌─────────────┐                        │
+   │ subagents/  │─── get_or_new ─────────┤
+   │ executor    │                        │
+   └─────────────┘                        ▼
+   ┌─────────────────────────┐   ┌──────────────────────────────┐
+   │ SkillActivationMiddleware│   │ skill_storage.py (ABC 模板)   │
+   │ (按需激活 /skill-name)   │   │   load_skills() 扫 public+    │
+   │                          │   │   custom，合并 enabled 状态   │
+   │ ① parse_slash_skill_     │   │   validate_skill_name /       │
+   │   reference (严格语法)   │   │   validate_relative_path      │
+   │ ② resolve_slash_skill    │◀──│   ensure_safe_support_path    │
+   │   (启用+白名单内)        │   └──────────────────────────────┘
+   │ ③ _read_skill_content    │
+   │   (穿越拒绝+html.escape) │   ┌──────────────────────────────┐
+   │ ④ 注入隐藏 HumanMessage  │   │ parser.py / validation.py    │
+   └─────────────────────────┘   │   parse_skill_file (YAML fm)  │
+                                 │   _validate_skill_frontmatter │
+   ┌─────────────────────────┐   └──────────────────────────────┘
+   │ installer.py (.skill ZIP)│
+   │ ① safe_extract (穿越/    │   ┌──────────────────────────────┐
+   │   symlink/炸弹防御)      │   │ tool_policy.py               │
+   │ ② _validate_frontmatter  │   │   filter_tools_by_skill_     │──▶ agent 工具集收紧
+   │ ③ scan_archive (LLM 审)  │   │   allowed_tools              │    (M17 lead_agent)
+   │ ④ _move_staged (原子搬入)│   └──────────────────────────────┘
+   └───────────┬─────────────┘
+               │ 依赖
+               ▼
+   permissions.py (0o555/0o444 沙箱只读) + security_scanner.py (allow/warn/block)
+        ↑ create_chat_model（审查模型，独立调用方 attach_tracing=True）
+```
+
+**四条触发路径**：
+
+1. **常驻注入**（lead_agent/prompt.py）——`get_skills_prompt_section()` 经单例 `load_skills()`，
+   把启用技能列表写进系统提示；agent 自己判断何时 `read_file` 读 SKILL.md（渐进加载）。
+2. **按需激活**（SkillActivationMiddleware）——用户 `/skill-name <任务>`，中间件经单例加载、
+   解析、读盘、转义、注入当次模型调用（隐藏 HumanMessage）。
+3. **安装**（installer.py）——`.skill` ZIP 经安全流水线解压 + 审查 + 原子搬入 custom/。
+4. **工具收紧**（tool_policy.py）——agent 工厂按已加载技能的 `allowed-tools` 并集过滤工具集。
+
+**两个不变量**：（a）`get_or_new_skill_storage()` 是所有 storage 访问的唯一入口（单例 + 反射工厂，
+#3778 锁保护）；（b）读用户控制路径的两处（激活读盘 / storage 写入）都做 `resolve + relative_to`
+穿越校验。
+
+---
+
 ## 核心概念（名词 + 类比）
 
 ### ① allowed-tools 收紧（工具策略）
@@ -210,6 +291,38 @@ Gateway API 改了 enabled）的改动立即生效，无需重启。缓存只在
 再搬入暂存内容。若中途失败（如目标已存在 → `SkillAlreadyExistsError`），finally 清理预占目录。
 这保证：要么技能完整装好，要么像没装过（不留半截目录）。
 
+### 单例生命周期与并发（#3778）
+
+`get_or_new_skill_storage()` 返回的进程单例，在**冷启动并发**场景下有竞态——多个请求同时第一次
+调它，都看到 `_default_skill_storage is None`，于是都进构建分支，构出**多份**实例（每份都反射
+解析类、建存储、占资源）。更糟的是 `reset_skill_storage()` 若在并发读的当口把全局清空，读到的就
+是 `None`。
+
+**上游 #3778 的修法**（mini 已补齐）：
+
+1. 进程级 `_skill_storage_lock = threading.Lock()`。
+2. 构建走**锁内双检**（double-checked locking）：
+   ```python
+   app_config_now = get_app_config()
+   with _skill_storage_lock:
+       if _default_skill_storage is None or _default_skill_storage_config is not app_config_now:
+           _default_skill_storage = _make_storage(app_config_now.skills, **kwargs)
+           _default_skill_storage_config = app_config_now
+       return _default_skill_storage
+   ```
+   先无锁读 `app_config_now`（只读 config、无共享突变），再进锁复查条件——第一个拿到锁的构实例，
+   后到的看到实例已就绪直接复用。
+3. `reset_skill_storage()` 同样在锁内清空，不会清到一半被读。
+
+**为什么「锁内构造」而非「锁外构造再丢弃败者」**：`SkillStorage` 没有 `teardown()` 钩子，
+锁外构造的败者实例无法被清理（可能持有文件句柄 / 缓存）。所以选「锁内构造」镜像 `get_memory_storage()`，
+而非 sandbox_provider 的「锁外构造再丢败者」模式。`app_config_now` 的读取留在锁外是因为它只是
+一次 config 读取，不涉及共享状态突变，放锁外减少临界区。
+
+**测试锁住这个不变量**（`test_skills.py::TestSkillStorageSingleton`）：8 线程 + barrier 同时冷启动，
+桩构造器刻意 sleep 撑开竞态窗口——断言恰好构出 1 个实例、且 8 个调用方拿到的是同一对象；
+`reset` 后允许重建（counter 升到 2）。
+
 ---
 
 ## 文件结构
@@ -243,6 +356,93 @@ skills/public/example/SKILL.md  # 示例技能
 
 > **agent.py 工具过滤延后**：`filter_tools_by_skill_allowed_tools`（tool_policy.py）已就绪；
 > 在 agent 工厂里按已加载技能收紧工具集的接线留给 M17（lead_agent 全量重写时统一做）。
+
+---
+
+## 逐文件分析（每个文件做什么、为什么单独成文件）
+
+> 面向小白：技能模块拆成 12 个文件不是为了「显得多」，而是每个文件管**一种独立的责任**——
+> 改一处不会牵连另一处。下面逐个讲。
+
+### `types.py` — 数据形状（最底层，无依赖）
+定义 `Skill` dataclass（name/description/license/skill_dir/skill_file/relative_path/category/
+allowed_tools/enabled）+ `SkillCategory`（PUBLIC/CUSTOM 枚举）+ 常量 `SKILL_MD_FILE = "SKILL.md"`。
+还提供 `get_container_path()` / `get_container_file_path()`——把宿主路径翻译成沙箱容器内路径
+（`/mnt/skills/public/<name>/SKILL.md`）。**为什么单独**：纯数据定义，被几乎所有其它文件 import，
+放底层避免循环依赖。
+
+### `parser.py` — 读一份 SKILL.md
+`parse_skill_file()`：读文件 → 抽 YAML frontmatter（`---` 围栏之间的块）→ `yaml.safe_load` →
+校验 name/description 非空 → 组 `Skill`。`parse_allowed_tools()`：解析 frontmatter 的
+`allowed-tools` 字段（None=未声明 / list=白名单）。**为什么单独**：解析逻辑（正则 + YAML）独立
+于「技能怎么存、怎么激活」，复用度高（load_skills 和安装校验都调它）。
+
+### `validation.py` — 装入前校验 frontmatter
+`_validate_skill_frontmatter()`：检查 frontmatter 的**结构合法性**——有没有 `---` 围栏、key 是否
+都在 `ALLOWED_FRONTMATTER_PROPERTIES` 内、name/description 是否存在、name 是否 hyphen-case、
+长度上限。返回 `(ok, msg, name)`。**为什么和 parser 分开**：parser 是「读懂 SKILL.md」、偏宽松
+（解析失败返 None）；validation 是「安装前把关节」、偏严格（给作者明确报错，含 #3335 的行号 +
+引号提示）。两者的失败语义不同。
+
+### `slash.py` — `/skill-name` 语法解析
+`parse_slash_skill_reference()`：用严格正则 `^/([a-z0-9]+(?:-[a-z0-9]+)*)(?:\s+|$)` 解析
+`/name <任务>`，**跳过 6 个保留控制命令**（`RESERVED_SLASH_SKILL_NAMES`：new/help/memory/models/
+status/bootstrap）。`resolve_slash_skill_reference()`：在技能列表里找**启用且白名单内**的匹配。
+**为什么单独**：slash 语法 + 保留字是独立的小协议，激活中间件和测试都要单独复用这套解析。
+
+### `tool_policy.py` — allowed-tools 工具白名单
+`allowed_tool_names_for_skills()`：返回所有技能 `allowed-tools` 声明的并集（None=无声明→全放行，
+空集=有声明但禁全部）。`filter_tools_by_skill_allowed_tools()`：按白名单过滤工具列表。
+**为什么单独**：工具策略是「技能如何影响 agent 工具集」的独立关注点，和「技能怎么加载」解耦，
+方便 M17 agent 工厂单独接线。
+
+### `permissions.py` — 沙箱只读权限
+`make_skill_path_sandbox_readable()`：把单个文件/目录的 sandbox 组写位剥掉（目录→0o555，
+文件→0o444）。`make_skill_tree_sandbox_readable()`：递归对整棵技能子树做。`make_skill_written_path_
+sandbox_readable()`：对写入路径做，带穿越校验。**为什么单独**：权限位操作是 OS 层细节，独立于
+业务逻辑；installer 和 skill_manage 工具都调它。
+
+### `security_scanner.py` — LLM 内容安全审查
+`scan_skill_content()`：调 LLM 审一段文本，返 `allow`/`warn`/`block` + reason。
+`_extract_json_object()`：容错地从模型输出里取 JSON（剥 markdown 围栏 + 花括号配平，#2987）。
+**为什么单独**：审查是独立的外部调用（要创模型、要容错解析），和技能存储 / 激活完全解耦；
+模型不可用时保守回退 `block`。
+
+### `installer.py` — .skill ZIP 安装流水线
+`is_unsafe_zip_member()` / `is_symlink_member()` / `should_ignore_archive_entry()`：成员分类。
+`safe_extract_skill_archive()`：安全解压（拒穿越 + 跳 symlink + 512MB 上限 + 每成员 `is_relative_to`）。
+`resolve_skill_dir_from_archive()`：从解压结果定位技能根。`_prepare_skill_archive()` /
+`_scan_skill_archive_contents_or_raise()` / `_move_staged_skill_into_reserved_target()`：
+解压→审查→原子搬入三阶段。两个异常类 `SkillAlreadyExistsError` / `SkillSecurityScanError`。
+**为什么单独**：安装是技能系统最复杂、安全敏感度最高的流程（zip 炸弹 / symlink / 穿越都是真实
+攻击面），独立成文件便于隔离测试与审查。
+
+### `storage/skill_storage.py` — SkillStorage 抽象基类（模板方法）
+定义存储抽象：`load_skills()` 是**模板方法**（调子类的 `_iter_skill_files()` 扫文件 → 用 parser
+解析 → 合并 enabled → 排序），静态路径校验（`validate_skill_name` / `validate_relative_path` /
+`ensure_safe_support_path`），抽象原子操作（`write_custom_skill` / `delete_custom_skill` /
+`append_history` 等）。**为什么是 ABC**：技能存储可能有不同后端（本地 FS / 未来对象存储），
+模板方法让 `load_skills` 的扫描逻辑只写一遍，子类只实现介质相关的原子操作。
+
+### `storage/local_skill_storage.py` — 本地 FS 实现
+`LocalSkillStorage(SkillStorage)`：把抽象操作落到本地文件系统——`_iter_skill_files()` 扫
+`public/`+`custom/`，`write_custom_skill` / `read_custom_skill` / `delete_custom_skill` /
+`append_history` / `read_history` 都是直接的文件 IO。`install_skill_from_archive()` 串起 installer
+的解压→审查→搬入流水线（审查是 async LLM，留在事件循环；文件系统阶段跑 worker 线程）。
+**为什么单独**：和 ABC 分开，因为「本地 FS 的具体读写」是可替换的实现细节。
+
+### `storage/__init__.py` — 单例 + 反射工厂（#3778）
+`get_or_new_skill_storage()`：返回 storage 实例——给了 `skills_path` / `app_config` 就建新实例
+（请求级配置不污染单例），否则返回进程单例（首次创建后复用，按 AppConfig 身份失效重建）。
+`reset_skill_storage()`：清单例（测试 / 热重载用）。**#3778 锁**：`_skill_storage_lock` 保护
+单例构建与重置（详见下节「单例生命周期」）。**为什么单独**：单例 + 反射工厂是横切关注点，
+独立于具体存储实现——换存储后端只改 `SkillsConfig.use` 指向的类，工厂逻辑不变。
+
+### `__init__.py` — 公共 API 导出
+re-export 最常用的符号（`Skill` / `SkillCategory` / `parse_skill_file` / `parse_allowed_tools` /
+`RESERVED_SLASH_SKILL_NAMES` / `filter_tools_by_skill_allowed_tools` / `_validate_skill_frontmatter` 等），
+让外部 `from deerflow.skills import X` 一行到位。**为什么单独**：包的入口门面，
+控制对外暴露面 + 缩短调用方 import 路径。
 
 ---
 
@@ -336,11 +536,12 @@ result = get_or_new_skill_storage().install_skill_from_archive("path/to/skill.sk
 ### 跑测试
 
 ```bash
-cd backend && make test    # 含 test/test_skills.py（80 个 hermetic 测试）
+cd backend && make test    # 含 test/test_skills.py（85 个 hermetic 测试）
 ```
 
 测试约定：`LocalSkillStorage(host_path=tmp)` 直接构造（绕单例）；installer/security 经
-monkeypatch scan；ModelRequest 用桩；prompt 缓存每测前 `clear_skills_system_prompt_cache`。
+monkeypatch scan；ModelRequest 用桩；prompt 缓存每测前 `clear_skills_system_prompt_cache`；
+单例并发测试用「桩 storage + barrier + 慢构造」撑开竞态窗口验证 #3778 锁。
 
 ---
 
@@ -400,6 +601,11 @@ A：激活时所有动态内容（技能正文 + 用户文本）经 `html.escape
 **Q：装一个 .skill 会被 zip 炸弹炸吗？**
 A：不会。`safe_extract_skill_archive` 强制 512MB 总解压上限，超了抛错。还拒穿越成员、跳 symlink。
 
+**Q：归档里的 symlink 会被解压吗？**
+A：不会（#23）。`is_symlink_member` 据 `external_attr` 高 16 位的 `S_IFLNK` 标记识别 symlink 成员，
+`safe_extract_skill_archive` 遇到就 `continue` 跳过（只记 warning，不物化、不抛错）。防止 symlink
+把 `/etc/passwd` 之类指到技能目录外造成越权读。
+
 **Q：技能目录能被沙箱内 agent 改写吗？**
 A：不能。安装后权限收紧（目录 `0o555` / 文件 `0o444`，剥 sandbox 写位），跳 symlink。改写要走
 `skill_manage` 工具（受安全审查）。
@@ -415,3 +621,9 @@ Gateway 写技能后须调 `clear_skills_system_prompt_cache()` 失效缓存，�
 **Q：安全审查的 LLM 不可用会怎样？**
 A：保守回退 `block`（可执行内容尤其严格）。宁可误杀不可放过——审查坏了就当内容不安全，拒绝写入。
 配置 `skill_evolution.moderation_model_name` 可指定专用审查模型。
+
+**Q：多个请求同时第一次加载技能，会建多份 storage 吗？（#3778）**
+A：不会。`get_or_new_skill_storage()` 用 `_skill_storage_lock` + 锁内双检——并发冷启动只有一个
+调用方能进构建分支，其余看到实例已就绪直接复用。`reset_skill_storage()` 也在锁内清空，不会清到
+一半被并发读到。`SkillStorage` 无 `teardown()` 钩子，所以选「锁内构造」（败者无法被清理）而非
+sandbox_provider 的「锁外构造再丢败者」。

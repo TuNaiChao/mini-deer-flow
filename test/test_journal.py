@@ -148,6 +148,92 @@ class TestTokenBucketing:
         assert data["llm_call_count"] == 3
 
 
+class TestPerModelTokenBucketing:
+    """#3658：按模型归桶 token——一次 run 可能调多个模型（lead + 多个子代理）。
+
+    on_llm_end 从 ``response_metadata.model_name``（或 ``model``）取模型名，按模型累加进
+    ``_tokens_by_model``；``get_completion_data`` 带 ``token_usage_by_model``；外部记录
+    （子代理）也按 record 的 model_name 归桶。
+    """
+
+    async def test_response_metadata_model_name_bucketed(self, journal):
+        msg = AIMessage(
+            content="x",
+            usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            response_metadata={"model_name": "gpt-4o"},
+        )
+        journal.on_llm_end(_llm_response(msg), run_id=uuid4(), tags=["lead_agent"])
+        by_model = journal.get_completion_data()["token_usage_by_model"]
+        assert by_model["gpt-4o"]["total_tokens"] == 15
+        assert by_model["gpt-4o"]["input_tokens"] == 10
+        assert by_model["gpt-4o"]["output_tokens"] == 5
+
+    async def test_response_metadata_model_key_fallback(self, journal):
+        # response_metadata 用 ``model`` 键（非 ``model_name``）也要识别
+        msg = AIMessage(
+            content="x",
+            usage_metadata={"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+            response_metadata={"model": "claude-3"},
+        )
+        journal.on_llm_end(_llm_response(msg), run_id=uuid4(), tags=["lead_agent"])
+        by_model = journal.get_completion_data()["token_usage_by_model"]
+        assert by_model["claude-3"]["total_tokens"] == 5
+
+    async def test_multiple_models_accumulate_separately(self, journal):
+        """lead 用 gpt-4o、子代理用 claude-3 → 两个桶各自累加。"""
+        lead = AIMessage(
+            content="x",
+            usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            response_metadata={"model_name": "gpt-4o"},
+        )
+        sub = AIMessage(
+            content="y",
+            usage_metadata={"input_tokens": 100, "output_tokens": 50, "total_tokens": 150},
+            response_metadata={"model_name": "claude-3"},
+        )
+        journal.on_llm_end(_llm_response(lead), run_id=uuid4(), tags=["lead_agent"])
+        journal.on_llm_end(_llm_response(sub), run_id=uuid4(), tags=["subagent:gp"])
+        by_model = journal.get_completion_data()["token_usage_by_model"]
+        assert by_model["gpt-4o"]["total_tokens"] == 15
+        assert by_model["claude-3"]["total_tokens"] == 150
+
+    async def test_unknown_bucket_when_no_response_metadata(self, journal):
+        msg = AIMessage(content="x", usage_metadata={"input_tokens": 7, "output_tokens": 3, "total_tokens": 10})
+        journal.on_llm_end(_llm_response(msg), run_id=uuid4(), tags=["lead_agent"])
+        by_model = journal.get_completion_data()["token_usage_by_model"]
+        assert by_model["unknown"]["total_tokens"] == 10
+
+    async def test_external_records_bucket_by_model(self, journal):
+        """子代理经 record_external_llm_usage_records 回灌的 token 也按 model_name 归桶。"""
+        journal.record_external_llm_usage_records(
+            [
+                {
+                    "source_run_id": "ext-1",
+                    "caller": "subagent:gp",
+                    "input_tokens": 20,
+                    "output_tokens": 10,
+                    "total_tokens": 30,
+                    "model_name": "claude-3",
+                }
+            ]
+        )
+        by_model = journal.get_completion_data()["token_usage_by_model"]
+        assert by_model["claude-3"]["total_tokens"] == 30
+
+    async def test_completion_data_token_usage_by_model_is_copy(self, journal):
+        """get_completion_data 返回的 token_usage_by_model 是深拷贝——改它不污染 accumulator。"""
+        msg = AIMessage(
+            content="x",
+            usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            response_metadata={"model_name": "gpt-4o"},
+        )
+        journal.on_llm_end(_llm_response(msg), run_id=uuid4(), tags=["lead_agent"])
+        data = journal.get_completion_data()
+        data["token_usage_by_model"]["gpt-4o"]["total_tokens"] = 999  # 改返回值
+        # 再取一次——accumulator 未被污染
+        assert journal.get_completion_data()["token_usage_by_model"]["gpt-4o"]["total_tokens"] == 2
+
+
 # ---------------------------------------------------------------------------
 # sync → async flush
 # ---------------------------------------------------------------------------
@@ -279,6 +365,15 @@ class TestFirstHumanExtraction:
         """name='summary' 的 HumanMessage（摘要注入）不当首条 human。"""
         journal.on_chat_model_start({}, [[HumanMessage(content="摘要内容", name="summary")]], run_id=uuid4(), tags=["lead_agent"])
         assert journal.get_completion_data()["first_human_message"] is None
+
+    def test_hide_from_ui_human_ignored(self, journal):
+        """#3697：``additional_kwargs.hide_from_ui=True`` 的 HumanMessage（中间件注入的隐藏消息）不当首条 human。"""
+        hidden = HumanMessage(content="框架内部注入", additional_kwargs={"hide_from_ui": True})
+        journal.on_chat_model_start({}, [[hidden]], run_id=uuid4(), tags=["lead_agent"])
+        assert journal.get_completion_data()["first_human_message"] is None
+        # 后续正常 human 消息仍能被捕获
+        journal.on_chat_model_start({}, [[HumanMessage(content="真实用户输入")]], run_id=uuid4(), tags=["lead_agent"])
+        assert journal.get_completion_data()["first_human_message"] == "真实用户输入"
 
     def test_set_first_human_message_truncates(self, journal):
         journal.set_first_human_message("x" * 3000)

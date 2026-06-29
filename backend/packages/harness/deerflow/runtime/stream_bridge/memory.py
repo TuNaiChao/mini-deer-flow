@@ -58,13 +58,33 @@ class MemoryStreamBridge(StreamBridge):
         seq = self._counters[run_id] - 1
         return f"{ts}-{seq}"
 
+    @staticmethod
+    def _parse_event_seq(event_id: str) -> int | None:
+        """从 ``{ts}-{seq}`` 格式的事件 id 解析 per-run 序号。
+
+        ``seq``（由 :meth:`_next_id` 分配）每发一个事件 +1，等于该事件在 run 内的绝对 offset。
+        格式不符返回 ``None``。
+        """
+        _, sep, seq_text = event_id.rpartition("-")
+        if not sep:
+            return None
+        try:
+            return int(seq_text)
+        except ValueError:
+            return None
+
     def _resolve_start_offset(self, stream: _RunStream, last_event_id: str | None) -> int:
         if last_event_id is None:
             return stream.start_offset
 
-        for index, entry in enumerate(stream.events):
-            if entry.id == last_event_id:
-                return stream.start_offset + index + 1
+        # #3700：事件 id 内嵌 per-run 单调递增的 ``seq``，等于该事件的绝对 offset，所以用算术
+        # O(1) 定位事件，而非线性扫保留缓冲。仍在算出的 index 处核验 id，所以过期/被淘汰/外来/
+        # 畸形 id 仍回退到「从最早保留事件回放」——与旧的线性扫行为完全一致。
+        seq = self._parse_event_seq(last_event_id)
+        if seq is not None:
+            local_index = seq - stream.start_offset
+            if 0 <= local_index < len(stream.events) and stream.events[local_index].id == last_event_id:
+                return stream.start_offset + local_index + 1
 
         if stream.events:
             logger.warning(

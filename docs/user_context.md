@@ -3,6 +3,15 @@
 > 对应模块：**M3**（Phase 0，地基）
 > 源码：`backend/packages/harness/deerflow/runtime/user_context.py`、`runtime/__init__.py`
 
+> **Phase 0 全维重审（2026-06-28）**：逐行 diff 最新上游 `runtime/user_context.py`——**逻辑逐字等价**
+> （`CurrentUser` Protocol / `_current_user` ContextVar / `set/get/reset/require_current_user` /
+> `DEFAULT_USER_ID` / `get_effective_user_id` / `resolve_runtime_user_id`[runtime.context 优先→
+> contextvar→default 三级] / `_AutoSentinel` + `AUTO` + `resolve_user_id` 三态）。差异**仅注释中译**
+> （mini 把 docstring 译成中文方便新手；`CurrentUser` 的 Protocol 定义 mini 注明「测试用 SimpleNamespace」、
+> 上游注明「concrete impl 在 app.gateway.auth.models.User」——mini 无 Gateway 故措辞调整，**结构类型契约完全一致**）。
+> 本模块已在 M11（subagents user_id 跨隔离线程捕获）/ M12（tracing `resolve_runtime_user_id`）/ M18（worker
+> 捕获 user_id）多处消费并验证可用。无需补丁。
+
 ---
 
 ## 1. 一句话定位

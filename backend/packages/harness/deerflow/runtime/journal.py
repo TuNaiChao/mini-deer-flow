@@ -83,6 +83,10 @@ class RunJournal(BaseCallbackHandler):
         self._subagent_tokens = 0
         self._middleware_tokens = 0
 
+        # #3658：按模型分桶的 token 累加器——一次 run 可能调多个模型（lead + 多个子代理），
+        # 各模型 token 分开计，供 ``aggregate_tokens_by_thread`` 的 by_model 维度。
+        self._tokens_by_model: dict[str, dict[str, int]] = {}
+
         # 去重：LangChain 可能对同一 run_id 多次触发 on_llm_end
         self._counted_llm_run_ids: set[str] = set()
         self._counted_external_source_ids: set[str] = set()
@@ -225,7 +229,7 @@ class RunJournal(BaseCallbackHandler):
         if not self._first_human_msg and messages:
             for batch in reversed(messages):
                 for m in reversed(batch):
-                    if isinstance(m, HumanMessage) and m.name != "summary":
+                    if isinstance(m, HumanMessage) and m.name != "summary" and m.additional_kwargs.get("hide_from_ui") is not True:
                         caller = self._identify_caller(tags)
                         self.set_first_human_message(m.text)
                         self._put(
@@ -329,6 +333,12 @@ class RunJournal(BaseCallbackHandler):
                     else:
                         self._lead_agent_tokens += total_tk
 
+                    # #3658：从 response_metadata 取本次调用的模型名，按模型归桶。
+                    response_metadata = getattr(message, "response_metadata", None) or {}
+                    per_call_model: str | None = None
+                    if isinstance(response_metadata, Mapping):
+                        per_call_model = response_metadata.get("model_name") or response_metadata.get("model")
+                    self._record_model_usage(per_call_model, input_tk, output_tk, total_tk)
                     self._schedule_progress_flush()
 
         if messages:
@@ -432,17 +442,39 @@ class RunJournal(BaseCallbackHandler):
         # 默认 lead_agent：主 agent 图不注入回调 tag，而子代理与中间件会显式 tag 自己。
         return "lead_agent"
 
+    def _record_model_usage(
+        self,
+        model_name: str | None,
+        input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """#3658：把一次模型调用的 token 用量累加进按模型分的桶。
+
+        ``model_name`` 取不到时归 ``"unknown"``。``total_tokens<=0`` 跳过（防 0 值污染桶）。
+        """
+        if total_tokens <= 0:
+            return
+        bucket = self._tokens_by_model.setdefault(
+            model_name or "unknown",
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        bucket["input_tokens"] += int(input_tokens or 0)
+        bucket["output_tokens"] += int(output_tokens or 0)
+        bucket["total_tokens"] += int(total_tokens)
+
     # -- 公开方法（worker 调）--
 
     def record_external_llm_usage_records(
         self,
-        records: list[dict[str, int | str]],
+        records: list[dict[str, int | str | None]],
     ) -> None:
         """记录外部来源（如子代理）的 token 用量。
 
         每条 record 应含：
             source_run_id: 唯一标识（防双计）
             caller: 调用方 tag（如 "subagent:general-purpose"）
+            model_name: 真实按调用的模型名（str 或 None；缺失时回退到 ``"unknown"`` 桶）
             input_tokens / output_tokens: token 数
             total_tokens: 总 token 数（为 0/缺省时由 input+output 算）
         """
@@ -463,9 +495,11 @@ class RunJournal(BaseCallbackHandler):
             if total_tk <= 0:
                 continue
 
+            input_tk = record.get("input_tokens", 0) or 0
+            output_tk = record.get("output_tokens", 0) or 0
             self._counted_external_source_ids.add(source_id)
-            self._total_input_tokens += record.get("input_tokens", 0) or 0
-            self._total_output_tokens += record.get("output_tokens", 0) or 0
+            self._total_input_tokens += input_tk
+            self._total_output_tokens += output_tk
             self._total_tokens += total_tk
 
             caller = str(record.get("caller", ""))
@@ -475,6 +509,8 @@ class RunJournal(BaseCallbackHandler):
                 self._middleware_tokens += total_tk
             else:
                 self._lead_agent_tokens += total_tk
+            # #3658：外部记录（子代理）也按模型归桶——record 带 model_name 时用它。
+            self._record_model_usage(record.get("model_name"), input_tk, output_tk, total_tk)
 
             self._schedule_progress_flush()
 
@@ -585,6 +621,8 @@ class RunJournal(BaseCallbackHandler):
             "lead_agent_tokens": self._lead_agent_tokens,
             "subagent_tokens": self._subagent_tokens,
             "middleware_tokens": self._middleware_tokens,
+            # #3658：按模型归桶的 token（深拷贝防外部改 accumulator）。
+            "token_usage_by_model": {model: dict(usage) for model, usage in self._tokens_by_model.items()},
             "message_count": self._msg_count,
             "last_ai_message": self._last_ai_msg,
             "first_human_message": self._first_human_msg,

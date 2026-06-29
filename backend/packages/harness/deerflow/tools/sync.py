@@ -72,7 +72,6 @@ def make_sync_tool_wrapper(coro: Callable[..., Any], tool_name: str) -> Callable
         （复制 contextvar，避免跨线程丢失上下文）；否则直接 ``asyncio.run``。
     """
     config_param = _get_runnable_config_param(coro)
-    inner = coro.func if isinstance(coro, functools.partial) else coro
 
     def run_coroutine(*args: Any, **kwargs: Any) -> Any:
         try:
@@ -83,10 +82,12 @@ def make_sync_tool_wrapper(coro: Callable[..., Any], tool_name: str) -> Callable
         try:
             if loop is not None and loop.is_running():
                 # 运行中的循环不能嵌套 asyncio.run —— 卸到线程池在新循环里跑。
+                # 直接调 coro(*args, **kwargs)：若 coro 是 functools.partial，partial 的
+                # __call__ 会正确合并已绑定参数 + 本次参数（旧版先取 .func 会丢绑定参数）。
                 context = contextvars.copy_context()
-                future = _SYNC_TOOL_EXECUTOR.submit(context.run, lambda: asyncio.run(inner(*args, **kwargs)))
+                future = _SYNC_TOOL_EXECUTOR.submit(context.run, lambda: asyncio.run(coro(*args, **kwargs)))
                 return future.result()
-            return asyncio.run(inner(*args, **kwargs))
+            return asyncio.run(coro(*args, **kwargs))
         except Exception as e:
             logger.error("同步包装调用工具 %r 失败: %s", tool_name, e, exc_info=True)
             raise

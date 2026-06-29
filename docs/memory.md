@@ -1,5 +1,15 @@
 # 18. memory.md — 记忆系统（LLM 抽取 + 去抖队列 + per-user 原子存储 + 注入）
 
+> **M13 全维重审（2026-06-27）**：7 文件逐个 diff 最新上游——确认 #2627（同步 LLM 路径 `asyncio.to_thread`+
+> `model.invoke`）/ #20（user_id 跨 `threading.Timer` 捕获）/ #3429（`memory.token_counting` 配置 + tiktoken 冷却降级）/
+> #3592 的 correction 信号 prompt 文本 / per-user 隔离 + `(user_id, agent_name)` 缓存键 **mini 均已含**。
+> 补 **2 个 bug 对齐**：① **#3697** `filter_messages_for_memory` 过滤 `hide_from_ui` 消息（中间件注入的
+> 隐藏消息不进记忆 LLM，防框架内部文本污染 + `__memory` 自放大循环）；② **#3719** 空白/纯空白 fact 跳过
+> （旧合并条件 `fact_key is not None and ...` 在 `fact_key is None` 时不跳过、空 fact 仍被 append）。
+> **#3592 guaranteed injection**（`guaranteed_categories`/`guaranteed_token_budget`，correction fact 在 token
+> 压力下保底注入）跨 prompt.py+memory_config+lead_agent/prompt 3 模块、是新增特性非 bug，归后续专项。
+> 详见 [todo.md](todo.md) §3.1-B。
+
 > **一句话定位**：记忆让 agent **跨会话记住用户**——把对话里关于用户的事实/偏好/上下文抽出来
 > 存成 `memory.json`，下次对话时注入系统提示，实现个性化。本模块负责抽取（LLM）+ 去抖队列
 > + per-user 原子存储 + 预算受限的注入。
@@ -209,10 +219,22 @@ LLM 被要求只返 JSON，但有些 provider 仍会把 JSON 包在思考痕迹 
 ### fact 去重 + 置信度阈值 + max_facts 裁剪
 
 - **去重**：新 fact 的 content 经 `casefold()`（大小写无关）与已有比对，重复不加。
+- **空白 fact 跳过（#3719）**：content 经 `.strip()` 后为空（`_fact_content_key` 返回 `None`）的 fact
+  直接 `continue` 不加——旧版把 `fact_key is None` 与「在 existing 里」合并成一个条件
+  （`fact_key is not None and ...`），导致空白 fact（key 为 None）条件为 False、不跳过，**空 fact 仍被
+  append** 进记忆。M13 拆成两步守卫：`if fact_key is None: continue` + `if fact_key in existing: continue`。
 - **置信度阈值**：低于 `fact_confidence_threshold`（默认 0.7）的 fact 丢弃——LLM 推测的不该进
   长期记忆。
 - **max_facts 裁剪**：超 `max_facts`（默认 100）时按置信度降序留 top——低置信度的老 fact 让位给
   高置信度的新 fact。
+
+### hide_from_ui 消息不进记忆（#3697）
+
+`filter_messages_for_memory` 在处理 human 消息时，先查 `additional_kwargs.get("hide_from_ui")`——
+带此标记的（中间件注入的隐藏消息：TodoMiddleware 的 `todo_reminder`、ViewImageMiddleware、
+DynamicContextMiddleware 的 `__memory` 载荷等）**直接跳过**，绝不进记忆 LLM。原因：这些是**框架内部
+文本**，不是用户真实输入，进了记忆会污染长期记忆；更糟的是 `__memory` 载荷若被当成对话又抽取出新
+fact，会触发**自我放大循环**（记忆越滚越大）。这条过滤在剥 `<uploaded_files>` 块**之前**。
 
 ### 上传记忆剔除（session-scoped 不该进长期记忆）
 
@@ -250,6 +272,24 @@ config/memory_config.py        # MemoryConfig + get_memory_config()（get_app_co
 
 > **summarization_hook.py 未建**：它依赖 M16 SummarizationMiddleware（摘要前抢拍记忆），M16 未
 > 落地，待 M16 接入时补。
+
+### 逐文件：为什么这么拆
+
+- **`storage.py`** — `MemoryStorage` ABC + `FileMemoryStorage`（mtime 缓存 + 原子写）+ `create_empty_memory`。
+  **为什么单独**：存储 I/O（读/写/缓存/原子性）独立于「抽什么/怎么抽」，便于换后端（如未来 SQLite）
+  只改这一文件。
+- **`message_processing.py`** — `filter_messages_for_memory`（过滤 hide_from_ui / 上传块 / tool 中间步）+
+  `detect_correction`/`detect_reinforcement`（纠正信号）。**为什么单独**：消息筛选是纯函数、无副作用，
+  独立成文件便于单测、且被 queue（入队前过滤）与 middleware 共享。
+- **`queue.py`** — `ConversationContext` + `MemoryUpdateQueue`（去抖合并 + `user_id` 跨 Timer 捕获）。
+  **为什么单独**：去抖 + 跨线程状态是独立于「更新逻辑」的并发控制关注点，单独成文件隔离
+  `threading.Timer` 的复杂性。
+- **`prompt.py`** — 抽取 prompt 模板 + `format_memory_for_injection`（预算截断）+ `_count_tokens`
+  （tiktoken 冷却降级）。**为什么单独**：prompt 文本 + token 计数是与逻辑无关的「内容 + 度量」层，
+  独立成文件便于在调 prompt 时不碰更新/存储代码。
+- **`updater.py`** — `MemoryUpdater`（同步 LLM 路径 `model.invoke` #2627）+ `_apply_updates`（去重 +
+  空白跳过 #3719 + max_facts）+ fact CRUD + JSON 容错 + 上传剔除。**为什么单独**：这是模块最重、
+  改动最频的文件（抽取 + 应用更新 + CRUD 全在这），与存储/队列/筛选解耦。
 
 ---
 
@@ -400,3 +440,15 @@ A：不会。per-user + per-agent 隔离：Alice 的 `code-reviewer` 记忆在
 **Q：`_get_memory_context` 出错会让 agent 起不来吗？**
 A：不会。它吞掉所有异常返回 `""`（记忆是 nice-to-have，不能让它挂起 agent 启动）。`DynamicContextMiddleware`
 的注入也有 5s 超时降级——tiktoken 卡住时跳过注入而非挂起请求。
+
+**Q：correction fact 会在 token 预算紧张时被优先保底注入吗？（#3592）**
+A：**mini 目前不会**——这是上游 #3592 的 `guaranteed_categories`/`guaranteed_token_budget` 机制：
+为指定类别（如 `correction`）预留独立 token 预算，常规 fact 按置信度截断时 correction 仍保底注入。
+mini 的 `format_memory_for_injection` 当前是统一的置信度排序 + 预算截断，无保底通道。该特性跨
+`prompt.py` + `memory_config` + `lead_agent/prompt` 3 模块、属新增能力（非 bug），M13 未零碎半挂，
+归后续专项补齐（见 [todo.md](todo.md) §3.1-B）。
+
+**Q：`hide_from_ui` 的消息会进记忆吗？（#3697）**
+A：不会。`filter_messages_for_memory` 直接跳过带 `hide_from_ui` 的 human 消息（TodoMiddleware 的
+`todo_reminder`、ViewImageMiddleware、DynamicContextMiddleware 的 `__memory` 载荷等框架内部文本）——
+否则会污染长期记忆，`__memory` 还可能自放大。

@@ -144,6 +144,53 @@ class TestLastEventIdReconnect:
         assert out == ["2", "3"]
 
 
+class TestResumeOffsetO1:
+    """#3700：subscribe(last_event_id) 用事件 id 内嵌的 seq 算术 O(1) 定位，而非线性扫缓冲。
+
+    事件 id 形如 ``{ts_ms}-{seq}``，``seq`` 是 per-run 单调序号且 == 该事件的绝对 offset。
+    算出 index 后仍核验该处 id，不符则回退（行为与旧线性扫一致）。
+    """
+
+    def test_parse_event_seq_extracts_offset(self):
+        assert MemoryStreamBridge._parse_event_seq("1700000000000-0") == 0
+        assert MemoryStreamBridge._parse_event_seq("1700000000000-5") == 5
+        assert MemoryStreamBridge._parse_event_seq("1700000000000-12") == 12
+
+    def test_parse_event_seq_returns_none_for_malformed(self):
+        # 无 ``-`` 分隔
+        assert MemoryStreamBridge._parse_event_seq("nohyphen") is None
+        # seq 段非整数
+        assert MemoryStreamBridge._parse_event_seq("1700000000000-abc") is None
+
+    async def test_resume_uses_embedded_seq_arithmetic(self):
+        """有效 last_event_id 经算术定位 → 从该事件之后续播（O(1)，不扫缓冲）。"""
+        bridge = MemoryStreamBridge(queue_maxsize=10)
+        for i in range(5):
+            await bridge.publish("r", "e", str(i))
+        await bridge.publish_end("r")
+        # e2 的 id 内嵌 seq=2；算术 local_index = 2 - start_offset(0) = 2
+        e2_id = bridge._streams["r"].events[2].id
+        assert MemoryStreamBridge._parse_event_seq(e2_id) == 2
+        out = [e.data for e in [e async for e in bridge.subscribe("r", last_event_id=e2_id)] if e is not END_SENTINEL]
+        assert out == ["3", "4"]
+
+    async def test_foreign_id_with_plausible_seq_falls_back(self):
+        """id 能解析出 seq，但算出 index 处的事件 id 不匹配（外来/猜测 id）→ 回退到最早。
+
+        证明 O(1) 算术不被盲信：算出 index 后仍核验该处 id，不符则回退（与旧线性扫行为一致）。
+        """
+        bridge = MemoryStreamBridge(queue_maxsize=10)
+        for i in range(4):
+            await bridge.publish("r", "e", str(i))
+        await bridge.publish_end("r")
+        # 真实 e1 的 ts 未知，构造一个 seq=1 但 ts 完全不同的外来 id
+        foreign_id = "0000000000000-1"
+        assert MemoryStreamBridge._parse_event_seq(foreign_id) == 1  # 能解析
+        # 算出 local_index=1，但 events[1].id != foreign_id → 回退 → 全量 e0..e3
+        out = [e.data for e in [e async for e in bridge.subscribe("r", last_event_id=foreign_id)] if e is not END_SENTINEL]
+        assert out == ["0", "1", "2", "3"]
+
+
 # ---------------------------------------------------------------------------
 # 落后恢复
 # ---------------------------------------------------------------------------

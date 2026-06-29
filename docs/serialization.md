@@ -4,6 +4,16 @@
 > 配套测试：[test/test_serialization.py](../test/test_serialization.py)
 > 本文面向「刚接触 JSON 序列化 / 线协议的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐函数 diff `serialization.py` vs 最新上游。补 **1 项行为对齐**
+> （3 处联动改动）：① `serialize_lc_object` 加 **LangGraph `Interrupt` 分支**——`Interrupt` 是
+> `__slots__` 类（无 `model_dump`/`dict`/`__dict__`），否则会落到 `str()` 兜底产出畸形 payload；
+> 现规范化成 `{"value": ..., "id": ...}`；② `serialize_channel_values` **不再剥 `__interrupt__`**
+> （#3595：LangGraph SDK 据此键从中断的 values chunk 识别「人在环路」中断事件），只剥 `__pregel_*`，
+> 其值由 ① 的 Interrupt 分支规范化；③ `serialize(mode="values")` 改用
+> `serialize_channel_values_for_api`——values 快照把完整 state 流给前端，必须像 REST 端点一样
+> 剥掉 `hide_from_ui` 消息里的 base64 图片 payload（之前 values 模式漏剥）。`converters.py` 与
+> 上游 AST 级零漂移。
+
 ---
 
 ## 1. 一句话定位
@@ -19,11 +29,12 @@
 先看「没有它」会怎样：
 
 - **`json.dumps` 直接炸**。LangChain 消息是 pydantic 对象，`json.dumps(message)` 报 `TypeError: not JSON serializable`。每个调用方各自 `message.model_dump()` 会产生格式漂移（字段名、嵌套深度不一致）。
-- **内部键泄漏给前端**。LangGraph 的图状态（channel values）里有 `__pregel_node_finished`、`__interrupt__` 这类**内部实现键**，是给 LangGraph 引擎自己用的，发到前端既没用又暴露实现细节、还可能让前端解析崩。
+- **内部键泄漏给前端**。LangGraph 的图状态（channel values）里有 `__pregel_node_finished` 这类**内部实现键**，是给 LangGraph 引擎自己用的，发到前端既没用又暴露实现细节、还可能让前端解析崩。
+- **畸形对象炸序列化**。LangGraph 的 `Interrupt`（中断点）是 `__slots__` 类，没有 `model_dump`/`dict`/`__dict__`——`json.dumps` 直接炸，连 `str()` 兜底都只能产出无用字符串。
 - **响应体爆炸**。`ViewImageMiddleware` 把**完整 base64 图片**塞进 `hide_from_ui` 的 human 消息当模型上下文。历史回放端点若原样返回，一条消息可能几 MB——前端卡死、流量浪费。
 - **格式不兼容外部 API**。内部用 LangChain 消息，但要对接 OpenAI 兼容协议（前端 / SDK 按 OpenAI 格式期望 `{"role": "assistant", "tool_calls": [...]}`），不转就对接不上。
 
-serialization + converters 解决这些：**统一递归序列化** + **剥 `__pregel_*`/`__interrupt__`** + **剥 base64 图片块** + **LangChain↔OpenAI 转换**。
+serialization + converters 解决这些：**统一递归序列化**（含 `Interrupt` → `{value, id}`）+ **剥 `__pregel_*`**（保留 `__interrupt__` 让 SDK 识别中断）+ **剥 base64 图片块** + **LangChain↔OpenAI 转换**。
 
 ---
 
@@ -43,7 +54,9 @@ LangChain 的消息（`HumanMessage` / `AIMessage` / `SystemMessage` / `ToolMess
 
 LangGraph 图运行时，状态存在一组 **channel（频道）** 里。`channel_values` 是「所有频道的当前值」这个 dict，是图状态的全貌。
 
-其中混着 LangGraph 引擎自己的内部键，都以 `__pregel_` 开头（Pregel 是 LangGraph 底层执行模型的名字），外加 `__interrupt__`（中断状态）。这些是**引擎内部账本**，对前端毫无意义，序列化时必须剥掉，以对齐 LangGraph Platform API 的返回（它也不暴露这些）。
+其中混着 LangGraph 引擎自己的内部键，都以 `__pregel_` 开头（Pregel 是 LangGraph 底层执行模型的名字）。这些是**引擎内部账本**，对前端毫无意义，序列化时必须剥掉，以对齐 LangGraph Platform API 的返回（它也不暴露这些）。
+
+> 注意 `__interrupt__`（中断状态）**不剥**——见 §4.2。LangGraph SDK 需要靠这个键从 values chunk 识别「人在环路」中断事件（#3595）；它的值（`Interrupt` 对象列表）由 `serialize_lc_object` 的 Interrupt 分支规范化成 `{"value": ..., "id": ...}`。
 
 ### 3.4 hide_from_ui / data: image_url
 
@@ -70,18 +83,19 @@ OpenAI 的消息格式是事实上的行业标准：`{"role": "user"|"assistant"
 - **剥内部键的逻辑只写一处**——改 `__pregel_*` 规则只改 `serialize_channel_values`。
 - **剥图片的逻辑只写一处**——防某个端点漏剥导致响应爆炸。
 
-### 4.2 剥 `__pregel_*` 为何要剥
+### 4.2 剥 `__pregel_*` 为何要剥 / `__interrupt__` 为何不剥
 
-这些键是 LangGraph 引擎的**内部执行账本**：
+`__pregel_*` 键是 LangGraph 引擎的**内部执行账本**：
 - `__pregel_node_finished`：记录哪些节点跑完了。
-- `__interrupt__`：记录中断点（人在环路 / 工具确认）。
 
 它们：
 1. 对前端无意义（前端不关心引擎内部节点状态）。
 2. 暴露实现细节（引擎版本变了键名可能变）。
 3. 可能让前端解析崩（结构不预期）。
 
-对齐 LangGraph Platform API——官方 API 也不返回这些。规则：**键以 `__pregel_` 开头，或等于 `__interrupt__`，就剥**。注意：只剥这两个精确模式，普通的双下划线自定义键（`__custom__`）保留——用户自己的 state 不该被误删。
+对齐 LangGraph Platform API——官方 API 也不返回这些。规则：**键以 `__pregel_` 开头就剥**。注意：只剥这个精确前缀，普通的双下划线自定义键（`__custom__`）保留——用户自己的 state 不该被误删。
+
+> **`__interrupt__` 例外（#3595）**：早期版本也剥它。但 LangGraph SDK 需要靠 `__interrupt__` 这个键从 values chunk 里识别「人在环路」中断事件（工具确认 / `ask_clarification` 触发的中断）——剥了 SDK 就识别不出中断，前端拿不到「需要用户输入」的信号。所以现在**保留** `__interrupt__`，它的值（`Interrupt` 对象列表）交给 `serialize_lc_object` 的 Interrupt 分支（§4.4）规范化成 `{"value": ..., "id": ...}`，既不泄漏引擎内部结构，又保住 SDK 的中断检测。
 
 ### 4.3 base64 图片剥离的体积问题
 
@@ -102,7 +116,10 @@ OpenAI 的消息格式是事实上的行业标准：`{"role": "user"|"assistant"
 3. `list` / `tuple` → 递归每个元素（tuple 变 list，因为 JSON 没 tuple）。
 4. 有 `model_dump()` → pydantic v2。
 5. 有 `dict()` → pydantic v1 / 旧对象。
-6. 兜底 `str(obj)`（再不行 `repr`）。
+6. 是 LangGraph `Interrupt` → 规范化成 `{"value": obj.value, "id": obj.id}`，递归（§4.2 保留的 `__interrupt__` 其值就是 `Interrupt` 列表）。
+7. 兜底 `str(obj)`（再不行 `repr`）。
+
+> **为什么 Interrupt 要单列一步（#3595）**：`Interrupt` 是 `__slots__` 类——没有 `model_dump`、没有 `dict`、连 `__dict__` 都没有。所以它跳过第 4/5 步，若不专门接住，会一路落到第 7 步 `str()`，产出 `<Interrupt ...>` 这种对前端毫无用处的字符串，SDK 也解析不出中断内容。专门识别后，它变成干净的 `{"value": ..., "id": ...}`。`langgraph.types.Interrupt` 是软 import（`try/except ImportError`）——langgraph 在 mini 已是硬依赖，软 import 只是为防御性兼容。
 
 这条链保证**任何对象都不会让序列化抛异常**——最坏退化成字符串。这对「出风口」过滤器很重要：一条脏数据不该让整个响应 500。
 

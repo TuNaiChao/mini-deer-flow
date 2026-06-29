@@ -6,6 +6,21 @@
 
 小白第一次读，先把下面三个名词记住，后面的设计都是围绕它们展开的。
 
+> **Phase 2 全维重审（2026-06-29）**：逐文件 diff `sandbox/*` + `community/aio_sandbox/*` vs 最新上游
+> （剥 docstring 后判逻辑差）。补 **4 项真实对齐**（均闭环）。① **#3730** provider 单例生命周期加锁
+> ——`get_sandbox_provider` 裸 check-then-create 在多 OS 线程（主循环 + IM channel 线程）下会双重初始化，
+> `reset`/`shutdown`/`set` 也都裸触全局；补 `_provider_lock` 守卫所有 4 个位点，且**回调（构造 /
+> reset / shutdown / resolve_class）在锁外跑**避免自死锁，输家实例被 shutdown 防泄漏（见 §provider 单例）。②
+> **search.py** `should_ignore_name` 由 O(n) fnmatch 循环改预计算 frozenset + 编译正则（os.walk 热路径）。③
+> **#3786** 沙箱审计放行合法 heredoc——`shlex.split` 失败时由 `return 'block'` 改 `pass`（高危模式在 shlex
+> 前已检查，见 §SandboxAuditMiddleware；属 M16，2026-06-26 漂移清单漏列，本轮发现补上）。④ AIO
+> ErrorObservation 恢复重试显式 `create_session`/`cleanup_session`（见 [aio_sandbox.md](aio_sandbox.md)）。
+> **defer**：**#3729**（`acquire(*, user_id)` + 按 `(user_id, thread_id)` 归桶 + sandbox_id 嵌 user_id）属 IM
+> channel owner-scoping（Gateway，触及 `app/channels/feishu.py`），同 task_tool #2676 / uploads #3579 不 port；
+> `tools.py` 的 ACP workspace 路径翻译 / custom mounts / MCP allowed paths（=#3597，已在 defer 清单）是 mini
+> 未建的 additive 特性；AIO backend 的 `create(*, user_id)` / `discover` 签名随 #3729 defer。mini 的
+> `security.py` provider 标记列表、AIO soft-load（红线 #24）、`%`-format 日志为 mini 已知选择 / cosmetic。
+
 ---
 
 ## 为什么需要沙箱（痛点）
@@ -131,6 +146,12 @@ LLM 流式 chunk 超时强相关。环境变量 `DEERFLOW_WRITE_FILE_MAX_BYTES` 
 复合命令（`cmd1 && cmd2 ; cmd3`）quote-aware 拆开逐条分级，取最严档；但跨语句的结构性攻击
 （`while true; do bash & done`）先整串扫再拆。输入消毒：空 / 超长（>10KB）/含 NUL 直接 block。
 
+> **#3786 合法 heredoc 放行**：分级时先对**原文**跑高危模式检查，再用 `shlex.split` 解析 token 复跑高危。
+> `shlex.split` 对合法 heredoc（`python3 << 'EOF' ... EOF`）这类多行 shell 形式会抛 `ValueError`——旧版
+> 直接 `return 'block'`，把合法 heredoc 也挡了。#3786 改成 `pass`（落后面）继续走中危检查：高危在 shlex
+> **之前**已对原文查过，所以 heredoc 体内的 `cat /etc/shadow` 仍会被 block；只有既高危又中危都不命中的
+> 合法 heredoc 才放行。fail-closed 不变性保住（高危永远在原文阶段拦），合法用法不再误伤。
+
 ---
 
 ## 文件结构
@@ -188,6 +209,20 @@ reset_sandbox_provider()                             # 清缓存（让 config �
 shutdown_sandbox_provider()                          # 先 shutdown 再清（应用退出用）
 set_sandbox_provider(provider)                       # 测试注入
 ```
+
+> **#3730 单例生命周期加锁**：provider 单例可被多个 OS 线程触达（主事件循环 + IM channel 线程各自跑
+> 一个循环）。旧版 `get_sandbox_provider` 是裸 check-then-create——两个线程同时首次调用会**各建一个
+> provider**，后到的覆盖全局，被覆盖那个（如 `AioSandboxProvider` 起了 idle-checker 线程）就泄漏了
+> （唯一 join 它的 `shutdown()` 只从被覆盖的引用可达）。`reset`/`shutdown`/`set` 也都裸触全局，与 in-flight
+> 的 `get` 竞争会把 `None` / 半拆除实例交给调用方。
+>
+> 修法：一把模块级 `_provider_lock` 守卫所有 4 个位点。但**回调（`resolve_class` 动态 import、provider
+> `__init__` / `reset()` / `shutdown()`）都在锁外跑**——它们是插件代码（`config.sandbox.use` 指向任意类），
+> 可能慢、甚至重入这些生命周期函数；用非重入 `threading.Lock` 跨着会自死锁、还会在慢拆除期间挡住所有并发
+> `get()`。所以 `get` 的快路径是「一次带锁读」；冷启动在锁外构造、再回锁下裁决（谁先装谁赢）；输家在锁外
+> `shutdown()` 自己建的实例防泄漏。`reset`/`shutdown` 在锁下摘引用、锁外跑回调。这与 M14 `get_memory_storage`
+> / `get_skill_storage`（#3778）同源模式。5 项并发回归测试（`test_sandbox_provider_lifecycle.py`）钉死：
+> 8 线程冷启动见同一单例 / reset·shutdown·set 与 get 竞争绝不返回 None / 输家被 shutdown。
 
 ### 7 个工具（`sandbox/tools.py`，都是 `@tool` 装饰的 `StructuredTool`）
 

@@ -4,6 +4,18 @@
 > 配套测试：[test/test_journal.py](../test/test_journal.py)
 > 本文面向「刚接触回调机制 / token 计费 / 异步刷盘的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐函数 diff `journal.py` vs 最新上游。M18 已 port 的
+> **#3658**（按模型归桶：`on_llm_end` 取 `response_metadata.model_name` → `_record_model_usage`
+> 分桶 `_tokens_by_model` → `get_completion_data` 返 `token_usage_by_model`）+ **#3697**
+> （`on_chat_model_start` 抓首条 human 也过滤 `hide_from_ui`）经核对**与上游一致、无需补丁**。
+> 本轮补 2 处 minor 对齐：① `record_external_llm_usage_records` 形参类型加 `None`
+> （`model_name` 可为 None，落 `"unknown"` 桶）+ docstring 补 `model_name` 字段说明；②
+> `_counted_external_source_ids.add` 顺序对齐上游（功能等价）。**defer**：上游把内联的
+> `_message_text` 合并进了 `utils/messages.py::message_to_text`（mini 还有 memory /
+> tool_output_budget 共 3 处内联等价，跨 M7/M13/M16 的重构、join 语义略异），归附加专项
+> （同 Phase 0 defer 决定）。journal 侧的 #3658 token 归桶端到端数据流见
+> [runs.md](runs.md) §6.1。
+
 ---
 
 ## 1. 一句话定位

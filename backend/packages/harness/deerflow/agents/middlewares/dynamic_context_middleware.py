@@ -40,7 +40,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 if TYPE_CHECKING:
     from deerflow.config.app_config import AppConfig
@@ -63,8 +63,15 @@ def _extract_date(content: str) -> str | None:
 
 
 def is_dynamic_context_reminder(message: object) -> bool:
-    """判断 message 是否为隐藏的动态上下文提醒。"""
-    return isinstance(message, HumanMessage) and bool(message.additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY))
+    """判断 message 是否为隐藏的动态上下文提醒。
+
+    同时认 HumanMessage 和 SystemMessage：上游已把动态上下文提醒从 HumanMessage 迁到
+    SystemMessage（HumanMessage 形态仅旧 checkpoint 残留，上游注释标注 deprecated）。mini 当前
+    仍以 HumanMessage 注入（见 :meth:`DynamicContextMiddleware._make_reminder_and_user_messages`），
+    但此处放开类型，让 :class:`SystemMessageCoalescingMiddleware` 的「重复日期提醒去重」对两种
+    形态都生效——对齐上游 + 向前兼容（mini 若日后也迁到 SystemMessage 注入，此处无需再改）。
+    """
+    return isinstance(message, (HumanMessage, SystemMessage)) and bool(message.additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY))
 
 
 def _last_injected_date(messages: list) -> str | None:

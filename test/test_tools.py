@@ -535,6 +535,202 @@ class TestViewImageHelpers:
 
 
 # ===========================================================================
+# present_files（M15：多文件 + 路径归一化 + 穿越校验）
+# ===========================================================================
+
+
+class TestPresentFileTool:
+    """present_files 工具——对齐上游重写后的多文件 + 路径校验逻辑。"""
+
+    @pytest.fixture(autouse=True)
+    def _paths_on_tmp(self, tmp_path, monkeypatch):
+        """把 present_file_tool 用的 get_paths 钉到 tmp_path，让 resolve_virtual_path
+        解析出的物理路径与 thread_data.outputs_path 同根（生产里两者同源）。"""
+        import sys
+
+        from deerflow.config.paths import Paths
+        from deerflow.runtime.user_context import get_effective_user_id
+
+        # 必须用 sys.modules 取真模块：builtins/__init__ 把 present_file_tool
+        # （StructuredTool）重新导出，遮蔽了同名子模块，dotted import 会拿到工具对象。
+        pft_mod = sys.modules["deerflow.tools.builtins.present_file_tool"]
+        monkeypatch.setattr(pft_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
+        self._tmp = tmp_path
+        self._user_id = get_effective_user_id()
+
+    def _outputs_dir(self, thread_id="t1"):
+        return self._tmp / "users" / self._user_id / "threads" / thread_id / "user-data" / "outputs"
+
+    def _runtime(self, *, thread_id="t1"):
+        outputs = self._outputs_dir(thread_id)
+        outputs.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(
+            context={"thread_id": thread_id},
+            state={"thread_data": {"outputs_path": str(outputs)}},
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+    def test_normalize_virtual_path_under_outputs(self):
+        from deerflow.tools.builtins.present_file_tool import (
+            OUTPUTS_VIRTUAL_PREFIX,
+            _normalize_presented_filepath,
+        )
+
+        outputs = self._outputs_dir()
+        outputs.mkdir(parents=True, exist_ok=True)
+        (outputs / "report.md").write_text("x")
+        rt = self._runtime()
+        normalized = _normalize_presented_filepath(rt, "/mnt/user-data/outputs/report.md")
+        assert normalized == f"{OUTPUTS_VIRTUAL_PREFIX}/report.md"
+
+    def test_normalize_host_path_under_outputs(self):
+        """宿主侧绝对路径（非 /mnt/user-data 前缀）也能归一化，只要落在 outputs 下。"""
+        from deerflow.tools.builtins.present_file_tool import (
+            OUTPUTS_VIRTUAL_PREFIX,
+            _normalize_presented_filepath,
+        )
+
+        outputs = self._outputs_dir()
+        outputs.mkdir(parents=True, exist_ok=True)
+        (outputs / "chart.png").write_text("x")
+        rt = self._runtime()
+        normalized = _normalize_presented_filepath(rt, str(outputs / "chart.png"))
+        assert normalized == f"{OUTPUTS_VIRTUAL_PREFIX}/chart.png"
+
+    def test_normalize_rejects_traversal(self):
+        """/mnt/user-data/outputs/../../etc/passwd 经 resolve_virtual_path 挡穿越。"""
+        from deerflow.tools.builtins.present_file_tool import _normalize_presented_filepath
+
+        rt = self._runtime()
+        with pytest.raises(ValueError):
+            _normalize_presented_filepath(rt, "/mnt/user-data/outputs/../../etc/passwd")
+
+    def test_normalize_rejects_path_outside_outputs(self):
+        """合法虚拟前缀但解析后落在 outputs 之外（workspace）→ ValueError。"""
+        from deerflow.tools.builtins.present_file_tool import _normalize_presented_filepath
+
+        rt = self._runtime()
+        with pytest.raises(ValueError):
+            _normalize_presented_filepath(rt, "/mnt/user-data/workspace/secret.md")
+
+    def test_normalize_errors_when_state_missing(self):
+        from deerflow.tools.builtins.present_file_tool import _normalize_presented_filepath
+
+        rt = SimpleNamespace(context={"thread_id": "t1"}, state=None, config={"configurable": {}})
+        with pytest.raises(ValueError, match="state"):
+            _normalize_presented_filepath(rt, "/mnt/user-data/outputs/x.md")
+
+    def test_normalize_errors_when_outputs_path_missing(self):
+        from deerflow.tools.builtins.present_file_tool import _normalize_presented_filepath
+
+        rt = SimpleNamespace(
+            context={"thread_id": "t1"},
+            state={"thread_data": {}},  # 无 outputs_path
+            config={"configurable": {}},
+        )
+        with pytest.raises(ValueError, match="outputs path"):
+            _normalize_presented_filepath(rt, "/mnt/user-data/outputs/x.md")
+
+    def test_get_thread_id_fallback_chain(self):
+        from deerflow.tools.builtins.present_file_tool import _get_thread_id
+
+        # 1) runtime.context 命中
+        assert _get_thread_id(SimpleNamespace(context={"thread_id": "c1"}, config={})) == "c1"
+        # 2) context 无 → runtime.config 命中
+        assert _get_thread_id(SimpleNamespace(context=None, config={"configurable": {"thread_id": "c2"}})) == "c2"
+
+    def test_tool_multi_file_success_returns_command(self):
+        from langgraph.types import Command
+
+        from deerflow.tools.builtins.present_file_tool import OUTPUTS_VIRTUAL_PREFIX, present_file_tool
+
+        outputs = self._outputs_dir()
+        outputs.mkdir(parents=True, exist_ok=True)
+        (outputs / "a.md").write_text("a")
+        (outputs / "b.md").write_text("b")
+        rt = self._runtime()
+        # 直接调底层函数（绕过 LangChain 注入）：runtime + filepaths + tool_call_id。
+        result = present_file_tool.func(rt, ["/mnt/user-data/outputs/a.md", "/mnt/user-data/outputs/b.md"], "call-1")
+        assert isinstance(result, Command)
+        assert result.update["artifacts"] == [
+            f"{OUTPUTS_VIRTUAL_PREFIX}/a.md",
+            f"{OUTPUTS_VIRTUAL_PREFIX}/b.md",
+        ]
+        # 成功也回一条 ToolMessage
+        msgs = result.update["messages"]
+        assert msgs and msgs[0].tool_call_id == "call-1"
+
+    def test_tool_bad_path_returns_error_toolmessage(self):
+        """路径不合法 → 不抛、不写 artifacts，只回错误 ToolMessage。"""
+        from langgraph.types import Command
+
+        from deerflow.tools.builtins.present_file_tool import present_file_tool
+
+        rt = self._runtime()
+        result = present_file_tool.func(rt, ["/etc/passwd"], "call-2")
+        assert isinstance(result, Command)
+        assert result.update.get("artifacts") is None  # 不写 artifacts
+        msg = result.update["messages"][0]
+        assert msg.tool_call_id == "call-2"
+        assert "Error" in msg.content
+
+
+class TestResolveVirtualPath:
+    """Paths.resolve_virtual_path（M15 新增）—— 虚拟→物理 + 穿越校验。"""
+
+    def _paths(self, tmp_path):
+        from deerflow.config.paths import Paths
+
+        return Paths(base_dir=tmp_path)
+
+    def test_legit_virtual_resolves_under_user_data(self, tmp_path):
+        p = self._paths(tmp_path)
+        phys = p.resolve_virtual_path("t1", "/mnt/user-data/outputs/r.md", user_id="u1")
+        assert phys == (tmp_path / "users" / "u1" / "threads" / "t1" / "user-data" / "outputs" / "r.md").resolve()
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "/mnt/user-data/outputs/../../etc/passwd",  # 穿越
+            "/mnt/user-dataX/foo",  # 前缀混淆（段边界）
+            "/etc/passwd",  # 完全无关前缀
+        ],
+    )
+    def test_rejects_bad_paths(self, tmp_path, bad):
+        p = self._paths(tmp_path)
+        with pytest.raises(ValueError):
+            p.resolve_virtual_path("t1", bad, user_id="u1")
+
+
+# ===========================================================================
+# sync 包装：functools.partial 绑定参数保留（M15 对齐上游修正）
+# ===========================================================================
+
+
+class TestSyncWrapperPartial:
+    def test_preserves_partial_bound_args(self):
+        """make_sync_tool_wrapper 直接调 coro(*args)，故 partial 已绑定参数被保留。
+
+        旧版 ``inner = coro.func`` 会丢绑定参数；本测试锁住修正。"""
+        import functools
+
+        from deerflow.tools.sync import make_sync_tool_wrapper
+
+        captured = {}
+
+        async def real_impl(a, bound, config=None):
+            captured["args"] = (a, bound, config)
+            return "ok"
+
+        partial_coro = functools.partial(real_impl, bound="BOUND")
+        wrapper = make_sync_tool_wrapper(partial_coro, "test_tool")
+        result = wrapper("A")
+        assert result == "ok"
+        # bound 参数必须保留（旧 bug 会丢、且大概率 TypeError）
+        assert captured["args"] == ("A", "BOUND", None)
+
+
+# ===========================================================================
 # setup_agent
 # ===========================================================================
 

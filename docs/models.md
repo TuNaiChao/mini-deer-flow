@@ -1,8 +1,18 @@
 # 6. models.md — 模型工厂（thinking / tracing）
 
 > 对应模块：**M-models**（Phase 1）
-> 源码：`backend/packages/harness/deerflow/models/factory.py`、`models/__init__.py`
+> 源码：`backend/packages/harness/deerflow/models/factory.py`、`models/__init__.py`、`models/vllm_provider.py`
 > 关联配置：`config/model_config.py`（`ModelConfig`）、`config/app_config.py`（`AppConfig.get_model_config`）
+
+> **Phase 1 全维重审（2026-06-29）**：逐函数 diff `models/{factory,__init__,vllm_provider}.py`
+> vs 最新上游（剥 docstring 后判逻辑差）。**无真实漂移**——`vllm_provider.py`（`VllmChatModel`
+> 保 vLLM `reasoning` 字段）2026-06-26 已补、与上游一致；`factory.py` 的差异全是：① cosmetic
+> （import 风格 / 错误提示中英）；② mini 的**防御性增强**（`_maybe_build_tracing_callbacks`
+> 包了 try/except 防 tracing 不可导入、`get_default_model` 便利函数、空 models 配置的友好报错）；
+> ③ 上游对 `CodexChatModel` / `MindIEChatModel` 的特殊处理——这两个 provider mini **有意不 ship**
+> （§2.2 🟢低，langchain 已有 `ChatAnthropic` 等替代，mini 经 env/`$VAR` 直读），port 了反而
+> ImportError。故无需补丁。`get_model_config` 的 O(1) 索引（#3688）已在 Phase 0 port，factory
+> 透传受益。
 
 ---
 
@@ -134,23 +144,71 @@ LangChain 只在「标准 OpenAI」时自动开 `stream_usage`。但 DeerFlow �
 
 `reasoning_effort`（low/medium/high）不是所有模型都支持。工厂根据 `supports_reasoning_effort` 决定：不支持时，无论你从 kwargs 还是 config 传了 `reasoning_effort`，都**剔除**——否则模型类报 `TypeError`。
 
+### 4.6 为什么 vLLM 推理模型需要专门的 provider（VllmChatModel）？
+
+**vLLM** 是一个「自己在 GPU 机器上跑大模型」的开源推理引擎，对外暴露一个和 OpenAI 一模一样的 HTTP 接口。所以一般情况下，你直接用 LangChain 自带的 `langchain_openai:ChatOpenAI` 连它就行——**不需要**本节这个专门 provider。
+
+只有一种情况需要：**你在 vLLM 上跑「会先想一想的推理模型」（reasoning model，比如 Qwen3 开了思考模式）**。这时会遇到一个字段丢失的坑。
+
+**问题是什么？** vLLM 0.19.0 跑推理模型时，会在返回结果里多塞一个 OpenAI 官方接口里**没有**的字段：`reasoning`（模型的思考过程）。但 LangChain 默认的 `ChatOpenAI` 不认识这个非标准字段，会把它**直接丢掉**。
+
+**为什么丢掉会出问题？** 在「想完→调工具→继续想」这种交替流程里，vLLM 期望**上一轮 AI 的思考内容要在下一轮原样回传给它**（这样模型才知道自己刚才想到了哪）。一旦被 LangChain 丢掉，下一轮请求里就没了这个字段，vLLM 的行为就会出问题。
+
+**怎么解决？** `models/vllm_provider.py` 提供了 `VllmChatModel`——它继承 `ChatOpenAI`（所以 OpenAI 兼容的所有行为都还在），只**重写三个方法**，把 `reasoning` 字段在三处都保住：
+
+```
+                vLLM 返回的 reasoning 字段
+                          │
+   ┌──────────────────────┼──────────────────────┐
+   ▼                      ▼                      ▼
+非流式响应            流式 delta              多轮请求
+(_create_chat_result) (_convert_chunk_... )  (_get_request_payload)
+保住到 AIMessage      保住到 message          回灌到 outgoing
+.additional_kwargs    chunk 的                payload 的 assistant
+                      additional_kwargs       消息上
+```
+
+| 钩子（被重写的方法） | 保住 reasoning 的地方 | 为什么需要 |
+|----------------------|----------------------|-----------|
+| `_create_chat_result` | 非流式响应的 `AIMessage.additional_kwargs` | 一次返回完整结果时别丢 |
+| `_convert_chunk_to_generation_chunk` | 流式 delta 的 message chunk | 一块一块吐时每一块都别丢，拼起来才完整 |
+| `_get_request_payload` | outgoing payload 的 assistant 消息 | 多轮时把上一轮的 reasoning 原样回传给 vLLM |
+
+**额外赠送**：vLLM 0.19.0 的 Qwen 解析器用 `extra_body.chat_template_kwargs.enable_thinking` 开关思考，但 DeerFlow 早期文档用的是旧键名 `thinking`。`_get_request_payload` 在发请求前会顺手把 `thinking` 归一化成 `enable_thinking`，让旧配置继续能用（工厂 §4.1 的 vLLM 关闭路径与之配套）。
+
+> **什么时候用 `VllmChatModel`，什么时候用普通 `ChatOpenAI`？**
+> - 跑 vLLM **推理模型**（开了思考、会返回 `reasoning` 字段）→ 用 `deerflow.models.vllm_provider:VllmChatModel`。
+> - 跑 vLLM **普通模型**（不思考，比如 Qwen2.5-VL 这类视觉/对话模型）→ 用默认 `langchain_openai:ChatOpenAI` 就行，没有 reasoning 字段需要保。
+> - 不跑 vLLM（用云 API、Ollama 等）→ 完全用不到本文件。
+
 ---
 
 ## 5. 文件结构
 
 ```
 models/
-├── __init__.py      # 导出 create_chat_model / get_default_model
-└── factory.py       # 工厂主体（本模块核心）
+├── __init__.py          # 导出 create_chat_model / get_default_model
+├── factory.py           # 工厂主体（本模块核心）
+└── vllm_provider.py     # vLLM 推理模型专用 provider（VllmChatModel）
 
 config/
 ├── model_config.py  # ModelConfig（模型档案 schema）
 └── app_config.py    # AppConfig.get_model_config(name)（按名查找）
 ```
 
+**逐文件作用**：
+
+- **`__init__.py`**——模块门面。只导出两个公开函数 `create_chat_model` / `get_default_model`，把内部辅助函数挡在包外。**为什么单独成文件**：Python 包的入口约定，外部 `from deerflow.models import create_chat_model` 就靠它。
+- **`factory.py`**——工厂主体，本模块的核心。把「找到类 → 读配置 → 处理 thinking/stream/tracing 等特殊参数 → 实例化」收口到 `create_chat_model` 一个函数。**为什么单独成文件**：这是所有 provider 共用的通用逻辑，与具体 provider 无关，独立成文件方便维护、单测（`test/test_model.py`）。
+- **`vllm_provider.py`**——vLLM 推理模型专用 provider（`VllmChatModel` + 几个辅助函数）。它**不是**工厂的一部分，而是一个「可以被 config 的 `use` 字段反射加载的具体模型类」，和 `langchain_openai:ChatOpenAI` 是同层东西。**为什么单独成文件**：它只服务 vLLM 推理模型这一个窄场景（见 §4.6），独立成文件让通用工厂（factory.py）不被 vLLM 专有兼容代码污染；不用 vLLM 的人完全不需要读它。
+
 `factory.py` 内部分四块：
 - **辅助函数**：`_deep_merge_dicts`、`_vllm_disable_chat_template_kwargs`、`_enable_stream_usage_by_default`、`_apply_stream_chunk_timeout_default`、`_maybe_build_tracing_callbacks`
 - **公开 API**：`create_chat_model(...)`、`get_default_model()`
+
+`vllm_provider.py` 内部分两块：
+- **模块级辅助函数**：`_normalize_vllm_chat_template_kwargs`（旧键名 `thinking` → `enable_thinking`）、`_reasoning_to_text`（从 reasoning 字段抠文本）、`_convert_delta_to_message_chunk_with_reasoning`（流式 delta 转 message chunk）、`_restore_reasoning_field`（把 reasoning 回灌到 payload assistant 消息）
+- **`VllmChatModel` 类**：继承 `ChatOpenAI`，重写 `_get_request_payload` / `_create_chat_result` / `_convert_chunk_to_generation_chunk` 三个钩子
 
 ---
 
@@ -278,6 +336,35 @@ cfg = AppConfig(models=[ModelConfig(name="t", use="fake:X", model="m", temperatu
 model = create_chat_model("t", app_config=cfg)  # 显式注入，不读磁盘
 ```
 
+### 7.7 vLLM 自托管推理模型（用 VllmChatModel 保住 reasoning）
+
+当你在 vLLM 上跑 Qwen3 这类**会思考的推理模型**时，把 `use` 写成
+`deerflow.models.vllm_provider:VllmChatModel`（详见 §4.6）。其余字段和普通 OpenAI 兼容
+模型一样。完整可注释示例见 `config.example.yaml`「路径 D」。
+
+```yaml
+models:
+  - name: qwen3-32b-vllm
+    use: deerflow.models.vllm_provider:VllmChatModel   # ← 关键：用 VllmChatModel 而非 ChatOpenAI
+    model: Qwen/Qwen3-32B
+    api_key: $VLLM_API_KEY
+    base_url: http://localhost:8000/v1
+    supports_thinking: true
+    when_thinking_enabled:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true      # Qwen 系开关思考的键名（旧键名 thinking 也会被自动归一化）
+```
+
+```python
+model = create_chat_model("qwen3-32b-vllm", thinking_enabled=True)
+# 模型返回的 reasoning 字段会被保住到 AIMessage.additional_kwargs["reasoning"]，
+# 多轮「想完→调工具→继续想」时也会原样回传给 vLLM，不会丢。
+```
+
+> 注意：`VllmChatModel` 只在「vLLM + 推理模型」这个窄场景下需要。跑 vLLM 普通模型（如
+> Qwen2.5-VL 视觉模型）仍用默认 `langchain_openai:ChatOpenAI`——没有 reasoning 字段要保。
+
 ---
 
 ## 8. 与其它模块的关系
@@ -349,14 +436,24 @@ create_chat_model(..., attach_tracing=False)
 
 你给非 OpenAI provider（如 DeepSeek/Ollama）传了 `stream_chunk_timeout`。工厂本应自动剔除——如果你看到这个错，说明工厂逻辑被改坏了，检查 `_apply_stream_chunk_timeout_default`。
 
+### Q7：vLLM 推理模型多轮对话丢失了「思考内容」/ 行为异常
+
+你很可能在 vLLM 上跑推理模型（如 Qwen3 开了思考），但 `use` 用了默认的
+`langchain_openai:ChatOpenAI`。LangChain 的 OpenAI 适配器会丢掉 vLLM 多出来的非标准
+`reasoning` 字段，导致多轮「想完→调工具→继续想」时上一轮思考没回传。
+
+改成 `use: deerflow.models.vllm_provider:VllmChatModel`（见 §4.6 / §7.7）。
+非推理的 vLLM 模型（如 Qwen2.5-VL）不需要改，保持 `ChatOpenAI` 即可。
+
 ---
 
 ## 小结
 
-模型工厂的精髓是**把 provider 差异和运维坑收口到一个函数**。记住三件事：
+模型工厂的精髓是**把 provider 差异和运维坑收口到一个函数**。记住四件事：
 
 1. **配置驱动**：换模型只改 `config.yaml`，靠反射加载。
 2. **thinking/stream/tracing 三大坑都自动处理**：四路径关闭、240s 超时、stream_usage 默认开、attach_tracing 双调用方。
-3. **fail-fast**：能力不匹配（如不支持 thinking 却要求开）直接报错，不静默。
+3. **vLLM 推理模型有专门 provider**：跑 vLLM 推理模型时用 `VllmChatModel`（`vllm_provider.py`）保住非标准的 `reasoning` 字段；其它情况用默认 `ChatOpenAI`。
+4. **fail-fast**：能力不匹配（如不支持 thinking 却要求开）直接报错，不静默。
 
 下一个要读的文档：`docs/config.md`（了解 `ModelConfig` 与 `AppConfig` 全貌）。

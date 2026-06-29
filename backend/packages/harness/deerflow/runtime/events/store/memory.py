@@ -5,6 +5,13 @@
 性能优化：除了 ``_events``（全量），还维护 ``_messages``（仅 message 的投影，
 同样的 dict 对象、无拷贝，按 seq 排序），让消息分页用 bisect 做 O(log m + page)，
 而不是每次请求重扫所有事件。
+
+进一步优化（#3686）：再维护按 ``run_id`` 分桶的两组投影 ``_events_by_run`` /
+``_messages_by_run``（同样是原始 dict 对象、无拷贝，按 seq 排序）。这样单次 run
+维度的读（``list_events`` / ``list_messages_by_run``）只触碰该 run 的事件
+（O(该 run 的事件数)），而不是每次都重扫整个 thread 的事件日志（O(该 thread 的
+事件数)）——一个 thread 里可能累积成百上千个 run 的事件，但单次请求往往只关心
+其中一个 run。这是 thread 级 ``_messages`` 投影在 run 维度的对应物。
 """
 
 from __future__ import annotations
@@ -21,6 +28,13 @@ class MemoryRunEventStore(RunEventStore):
         # ``_events`` 的 message-only 投影（同一个 dict 对象，无拷贝），按 seq 排序，
         # 让消息分页用 bisect 做 O(log m + page)，而非每次重扫所有事件。
         self._messages: dict[str, list[dict]] = {}  # thread_id -> 按 seq 排序的消息列表
+        # 上面两个列表的 run 分桶投影（同一个 dict 对象、无拷贝），按 seq 排序。
+        # 单次 run 维度的读（``list_events`` / ``list_messages_by_run``）因此只花
+        # O(该 run 的事件数)，而非 O(该 thread 的事件数)：没有这两组投影的话，这两
+        # 个读即使一个 run 只握着寥寥几条事件，也会在每次请求时重扫整个 thread 的
+        # 事件日志。这是 thread 级 ``_messages`` 投影在 run 维度的对应物（#3686）。
+        self._events_by_run: dict[str, dict[str, list[dict]]] = {}  # thread_id -> run_id -> 按 seq 排序的事件
+        self._messages_by_run: dict[str, dict[str, list[dict]]] = {}  # thread_id -> run_id -> 按 seq 排序的消息
         self._seq_counters: dict[str, int] = {}  # thread_id -> 上次分配的 seq
 
     def _next_seq(self, thread_id: str) -> int:
@@ -52,8 +66,10 @@ class MemoryRunEventStore(RunEventStore):
             "created_at": created_at or datetime.now(UTC).isoformat(),
         }
         self._events.setdefault(thread_id, []).append(record)
+        self._events_by_run.setdefault(thread_id, {}).setdefault(run_id, []).append(record)
         if category == "message":
             self._messages.setdefault(thread_id, []).append(record)
+            self._messages_by_run.setdefault(thread_id, {}).setdefault(run_id, []).append(record)
         return record
 
     async def put(
@@ -102,23 +118,25 @@ class MemoryRunEventStore(RunEventStore):
             return messages[-limit:]
 
     async def list_events(self, thread_id, run_id, *, event_types=None, limit=500):
-        all_events = self._events.get(thread_id, [])
-        filtered = [e for e in all_events if e["run_id"] == run_id]
+        # ``_events_by_run`` 已经按 run 分桶且按 seq 排序，所以只触碰该 run 的事件，
+        # 而不是扫整个 thread。
+        run_events = self._events_by_run.get(thread_id, {}).get(run_id, [])
         if event_types is not None:
-            filtered = [e for e in filtered if e["event_type"] in event_types]
-        return filtered[:limit]
+            run_events = [e for e in run_events if e["event_type"] in event_types]
+        return run_events[:limit]
 
     async def list_messages_by_run(self, thread_id, run_id, *, limit=50, before_seq=None, after_seq=None):
-        all_events = self._events.get(thread_id, [])
-        filtered = [e for e in all_events if e["run_id"] == run_id and e["category"] == "message"]
-        if before_seq is not None:
-            filtered = [e for e in filtered if e["seq"] < before_seq]
+        # 单 run、仅 message、按 seq 排序：seq 窗口是一段连续切片，用 bisect
+        # （O(log m_run)）只在该 run 的消息上定位，而非重扫整个 thread 的事件日志。
+        messages = self._messages_by_run.get(thread_id, {}).get(run_id, [])
+        lo = 0 if after_seq is None else bisect.bisect_right(messages, after_seq, key=lambda e: e["seq"])
+        hi = len(messages) if before_seq is None else bisect.bisect_left(messages, before_seq, key=lambda e: e["seq"])
+        window = messages[lo:hi]
+        # ``after_seq`` 游标向前翻页（取前 ``limit`` 条）；否则取最后 ``limit`` 条
+        # （最新一页，或恰好结束在 ``before_seq`` 之前的那一页）。与旧的过滤式语义一致。
         if after_seq is not None:
-            filtered = [e for e in filtered if e["seq"] > after_seq]
-        if after_seq is not None:
-            return filtered[:limit]
-        else:
-            return filtered[-limit:] if len(filtered) > limit else filtered
+            return window[:limit]
+        return window[-limit:]
 
     async def count_messages(self, thread_id):
         return len(self._messages.get(thread_id, []))
@@ -126,6 +144,8 @@ class MemoryRunEventStore(RunEventStore):
     async def delete_by_thread(self, thread_id):
         events = self._events.pop(thread_id, [])
         self._messages.pop(thread_id, None)
+        self._events_by_run.pop(thread_id, None)
+        self._messages_by_run.pop(thread_id, None)
         self._seq_counters.pop(thread_id, None)
         return len(events)
 
@@ -138,4 +158,7 @@ class MemoryRunEventStore(RunEventStore):
         self._events[thread_id] = remaining
         # message 投影与存活对象保持同步（同一个存活的 dict 对象）。
         self._messages[thread_id] = [e for e in remaining if e["category"] == "message"]
+        # 从 run 分桶投影里删掉被删除的 run（#3686）。
+        self._events_by_run.get(thread_id, {}).pop(run_id, None)
+        self._messages_by_run.get(thread_id, {}).pop(run_id, None)
         return removed

@@ -2,7 +2,8 @@
 
 覆盖（对齐 ALIGNMENT_OUTLINE M9 测试要求）：
 - serialize_lc_object：标量/dict/list 递归、pydantic model_dump、fallback str。
-- serialize_channel_values：剥 ``__pregel_*`` / ``__interrupt__``，保留其余键、递归。
+- serialize_channel_values：剥 ``__pregel_*``，保留 ``__interrupt__``（#3595：SDK 据此识别
+  中断事件；其值由 serialize_lc_object 的 Interrupt 分支规范化成 {value, id}）、递归。
 - strip_data_url_image_blocks：只剥 hide_from_ui 消息里的 ``data:`` image_url 块，
   保留顺序/数量；text 块、https URL、非 hide_from_ui 消息不动。
 - serialize_channel_values_for_api：组合剥 __pregel_* + 剥 base64 图片。
@@ -83,6 +84,23 @@ class TestSerializeLcObject:
 
         assert serialize_lc_object(NoDump()) == "string-form"
 
+    def test_langgraph_interrupt_serialized_as_value_id(self):
+        # Interrupt 是 __slots__ 类（无 model_dump/dict/__dict__），否则会落到 str()
+        # 产出一个畸形 payload。序列化为 {"value": ..., "id": ...}（对齐 LangGraph API）。
+        from langgraph.types import Interrupt
+
+        out = serialize_lc_object(Interrupt(value={"ask": "how big?"}, id="int-1"))
+        assert out == {"value": {"ask": "how big?"}, "id": "int-1"}
+
+    def test_langgraph_interrupt_default_id(self):
+        # Interrupt 不显式传 id 时，langgraph 给个默认 id（"placeholder-id"）；
+        # serialize_lc_object 用 getattr(obj, "id", None) 取，有就用、没有才 None。
+        from langgraph.types import Interrupt
+
+        out = serialize_lc_object(Interrupt(value="plain"))
+        assert out["value"] == "plain"
+        assert isinstance(out["id"], str)  # langgraph 默认 id
+
 
 # ---------------------------------------------------------------------------
 # serialize_channel_values（剥 __pregel_*）
@@ -90,7 +108,8 @@ class TestSerializeLcObject:
 
 
 class TestSerializeChannelValues:
-    def test_strips_pregel_and_interrupt(self):
+    def test_strips_pregel_keeps_interrupt(self):
+        # #3595：``__interrupt__`` 故意保留（SDK 据此识别中断事件）；只剥 ``__pregel_*``。
         out = serialize_channel_values(
             {
                 "__pregel_node_finished": {"x": 1},
@@ -100,7 +119,8 @@ class TestSerializeChannelValues:
             }
         )
         assert "__pregel_node_finished" not in out
-        assert "__interrupt__" not in out
+        assert "__interrupt__" in out  # 保留
+        assert out["__interrupt__"] == ["something"]
         assert out["messages"] == [{"role": "user", "content": "hi"}]
         assert out["title"] == "t"
 
@@ -113,7 +133,8 @@ class TestSerializeChannelValues:
                 "keep": 4,
             }
         )
-        assert out == {"keep": 4}
+        # pregel_* 剥掉；__interrupt__ 保留
+        assert out == {"__interrupt__": 3, "keep": 4}
 
     def test_recurses_values(self):
         class M(BaseModel):
@@ -256,6 +277,22 @@ class TestSerializeModeDispatch:
     def test_values_mode_dict(self):
         out = serialize({"__pregel_x": 1, "keep": 2}, mode="values")
         assert out == {"keep": 2}
+
+    def test_values_mode_strips_base64_images(self):
+        # values 快照把完整 state 流给前端，所以必须像 REST 端点一样剥掉
+        # hide_from_ui 消息里的 base64 图片 payload（走 serialize_channel_values_for_api）。
+        hidden = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看这张图"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}},
+            ],
+            "additional_kwargs": {"hide_from_ui": True},
+        }
+        out = serialize({"messages": [hidden], "__pregel_x": 1}, mode="values")
+        assert "__pregel_x" not in out
+        # data: 图片块被剥，只剩 text 块
+        assert [b["type"] for b in out["messages"][0]["content"]] == ["text"]
 
     def test_values_mode_non_dict(self):
         # 非 dict 走 serialize_lc_object

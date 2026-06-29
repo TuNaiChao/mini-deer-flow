@@ -8,11 +8,16 @@ mini 适配：用 ``deerflow.config.paths.resolve_path``（非 ``runtime_paths``
 
 from __future__ import annotations
 
+import threading
+
 from deerflow.skills.storage.local_skill_storage import LocalSkillStorage
 from deerflow.skills.storage.skill_storage import SkillStorage
 
 _default_skill_storage: SkillStorage | None = None
 _default_skill_storage_config: object | None = None  # 单例所基于的 AppConfig 身份
+# 保护单例构建/重置的进程级锁（#3778）：冷启动并发调用只能构出一个实例，
+# reset_skill_storage() 也不能在并发读的当口把全局清空。
+_skill_storage_lock = threading.Lock()
 
 
 def get_or_new_skill_storage(**kwargs) -> SkillStorage:
@@ -58,17 +63,23 @@ def get_or_new_skill_storage(**kwargs) -> SkillStorage:
         return _default_skill_storage
 
     app_config_now = get_app_config()
-    if _default_skill_storage is None or _default_skill_storage_config is not app_config_now:
-        _default_skill_storage = _make_storage(app_config_now.skills, **kwargs)
-        _default_skill_storage_config = app_config_now
-    return _default_skill_storage
+    # 在锁内做双检构建（#3778）：竞态的冷启动调用方只能构出一个实例，
+    # reset_skill_storage() 也没法在并发读的当口把全局清空。这里选择「在锁内构造」
+    # ——镜像 get_memory_storage()，而非 sandbox_provider 的「锁外构造再丢弃败者」——
+    # 因为 SkillStorage 没有 teardown 钩子，败者留下的孤儿实例无法被清理。
+    with _skill_storage_lock:
+        if _default_skill_storage is None or _default_skill_storage_config is not app_config_now:
+            _default_skill_storage = _make_storage(app_config_now.skills, **kwargs)
+            _default_skill_storage_config = app_config_now
+        return _default_skill_storage
 
 
 def reset_skill_storage() -> None:
     """清缓存单例（测试与热重载场景用）。"""
     global _default_skill_storage, _default_skill_storage_config
-    _default_skill_storage = None
-    _default_skill_storage_config = None
+    with _skill_storage_lock:
+        _default_skill_storage = None
+        _default_skill_storage_config = None
 
 
 __all__ = [

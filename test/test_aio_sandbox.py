@@ -268,11 +268,20 @@ class _FakeShellApi:
     def __init__(self, outputs: list[str] | None = None):
         self._outputs = outputs or []
         self.calls = []
+        self.created_sessions: list[str] = []
+        self.cleaned_sessions: list[str] = []
 
     def exec_command(self, command, id=None, no_change_timeout=None):
         self.calls.append(command)
         out = self._outputs.pop(0) if self._outputs else "ok"
         return _FakeResult(output=out)
+
+    def create_session(self, id=None):
+        # #3730/#3786 恢复路径：ErrorObservation 重试现在显式 create/cleanup session。
+        self.created_sessions.append(id)
+
+    def cleanup_session(self, id):
+        self.cleaned_sessions.append(id)
 
 
 class _FakeSandboxApi:
@@ -319,13 +328,16 @@ def test_aio_sandbox_execute_command_empty_output_returns_placeholder(fake_sdk):
 
 
 def test_aio_sandbox_execute_command_error_observation_retry(fake_sdk):
-    """输出含 ErrorObservation 签名 → 在新 session 重试。"""
+    """输出含 ErrorObservation 签名 → 在新 session 重试，并显式建/拆恢复 session（不泄漏）。"""
     sbx = AioSandbox("a1", "http://localhost:8080")
     sbx._client.shell = _FakeShellApi(outputs=["'ErrorObservation' object has no attribute 'exit_code'", "recovered"])
     out = sbx.execute_command("bad")
     assert out == "recovered"
     # 第二次调用带 id 参数（新 session）。
     assert len(sbx._client.shell.calls) == 2
+    # 恢复 session 被显式创建并在 finally 里清理——不泄漏。
+    assert len(sbx._client.shell.created_sessions) == 1
+    assert sbx._client.shell.created_sessions == sbx._client.shell.cleaned_sessions
 
 
 def test_aio_sandbox_read_file(fake_sdk):

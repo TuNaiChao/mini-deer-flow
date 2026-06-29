@@ -1,5 +1,19 @@
 # 21. community.md — 联网能力（搜索 / 抓取 provider 框架）
 
+> **M21 六维重审（2026-06-28）**：12 个 provider 逐个 diff 最新上游（aio_sandbox/brave/browserless/
+> ddg_search/exa/firecrawl/image_search/infoquest/jina_ai/searxng/serper/tavily），剥 docstring 后核对。
+> 结论：**所有 fix mini 均已含**——**#3423** DDG Wikipedia region 推断（7 个 Unicode 码点范围 → jp-ja/kr-ko/
+> cn-zh/ru-ru/gr-el/il-he/xa-ar，**已含**）/ **#3418** jina reader proxy 支持（`coerce_proxy` + `crawl(proxy=...,
+> trust_env=...)`，**已含**）/ 各 provider 入参强转与 fail-closed（搜索/抓取失败返空不拖垮 agent）。
+> 差异**全是 mini 的重构 + 文档措辞**：mini 把共享 helper 抽进 [`_common.py`](../backend/packages/harness/deerflow/community/_common.py)
+> （`get_tool_extras`——返 `{}` 而非 None、调用方免判空；`coerce_bool`/`coerce_timeout`/`coerce_proxy`/
+> `normalize_search_result`/`truncate_content`），上游等价逻辑内联在各 provider 里；mini 用 `%-format` 日志、
+> 中文注释。**defer（3 个 additive 特性，非 fix）**：**#3585 fastCRW**（88 行，`firecrawl` 库的薄封装变体）、
+> **#3675 GroundRoute**（166 行，纯 `httpx`、最易补）、**#3575 Serper Google Images**（`image_search` 经 Serper，
+> 含其专属 SSRF 守卫 `_safe_public_url` 过滤返回的图片 URL）——mini 已有 9 个搜索 provider + DDG image_search，
+> 这三个是可选新增变体，归后续按需补（§3.1-A「视需求，低」）。properly 接线需 config.example + 文档 + 测试，
+> 不零碎半挂。
+
 > **一句话定位**：本模块给 agent 装「眼睛和手」——能**搜网页**（web_search）找最新信息、能**抓网页**
 > （web_fetch）读某个 URL 的内容。这是 agent「知道训练数据之外的事」的核心来源（训练数据有截止日期，
 > 联网让它能答「今天天气」「最新论文」这类问题）。

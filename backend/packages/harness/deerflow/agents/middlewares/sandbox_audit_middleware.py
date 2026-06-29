@@ -170,8 +170,9 @@ def _classify_single_command(command: str) -> str:
             if pattern.search(joined):
                 return "block"
     except ValueError:
-        # shlex 遇未闭合引号失败 → 当可疑。
-        return "block"
+        # heredoc 与其它多行 shell 形式可能是合法 bash 但 shlex 解析不了。
+        # 原始高危模式已在上面检查过（normalized），这里不直接 block——继续走中危模式检查（#3786）。
+        pass
 
     for pattern in _MEDIUM_RISK_PATTERNS:
         if pattern.search(normalized):

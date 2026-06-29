@@ -1,5 +1,20 @@
 # 20. mcp.md — MCP 集成（外部工具协议 / 三传输 / 会话池 / OAuth / mtime 缓存失效）
 
+> **M20 六维重审（2026-06-28）**：6 文件逐个 diff 最新上游（`__init__`/`cache`/`client`/`oauth`/
+> `session_pool`/`tools`），剥 docstring 后核对五大关注点——**#3772 工具发现失败隔离**（real bug，已补，
+> 见下）/ **#30 OAuth token 刷新竞态**（双检锁 `async with lock`+re-check，**已含**）/ **#3379 stdio 会话
+> 在 owning loop 关闭** + **#3089 跨调用持久** + **#3203 HTTP/SSE 跳过池化**（session_pool 完整架构：
+> `owning_loop` 追踪 + 跨循环驱逐 + in-flight 去重 + `SESSION_CLOSE_TIMEOUT=5.0`，**均已含**）/ OAuth
+> 配置装配（`from_extensions_config` 等价）/ mtime 缓存失效（**已含**，且 mini 的 `cache.py` 用
+> `asyncio.get_running_loop()` 替代上游已废弃的 `get_event_loop()`，**Python 3.14 适配更优**）。
+> **#3772 唯一漂移已补**：上游把「发现所有工具」从 `client.get_tools()`（一把梭，一个坏 server 全丢）改为
+> 按服务器独立 `client.get_tools(server_name=name)` + `asyncio.gather` + try/except——单个坏 server 只丢自己，
+> 健康 server 照常贡献工具。mini 旧版是一把梭，已对齐。
+> **defer / 不 port**：**#3597** stdio MCP 产物文件的虚拟路径翻译（9 个函数 ~370 行：workspace 快照 +
+> 路径重写 + 文件名去重，跨 `tools.py`+`session_pool` 的域特性）归后续专项；**#3294** auth interceptor 透传
+> channel `user_id` 属 Gateway auth（同 task_tool 用户上下文，不 port）。session_pool 用 `Any` 而非
+> `ClientSession` 类型注解是 mini 的软加载适配（mcp 是可选包）。
+
 > **一句话定位**：MCP（Model Context Protocol）是一个「让 agent 调用外部工具」的开放协议——
 > 别人写好的工具服务器（文件系统、数据库、浏览器、Git……）按 MCP 规范暴露，agent 不用改代码
 > 就能用。本模块负责**发现**这些外部工具、**按需调用**它们，并处理好**有状态会话**、
@@ -76,8 +91,12 @@ build_servers_config  ──→ {server: {transport, command/url, ...}}
         ▼
 MultiServerMCPClient(servers_config, tool_interceptors=[oauth, ...], tool_name_prefix=True)
         │
-        ▼  await client.get_tools()
-发现工具（经临时会话）──→ [BaseTool, BaseTool, ...]
+        ▼  #3772：按服务器独立发现 + asyncio.gather（单个坏 server 不拖累其它）
+        │  async def load_server_tools(name):
+        │      try: return await client.get_tools(server_name=name)
+        │      except Exception: return []   ← 坏 server 只丢自己
+        │  tools_by_server = await asyncio.gather(*(load_server_tools(n) for n in servers))
+发现工具（经临时会话）──→ [BaseTool, BaseTool, ...]   （坏 server 的 [] 被摊平丢弃）
         │
         ▼  仅 stdio 工具
 _make_session_pool_tool  ──→ StructuredTool（每次调用复用池中持久会话）
@@ -88,6 +107,11 @@ get_available_tools() 拼进 agent 工具集
 
 `tool_name_prefix=True`：每个 MCP 工具名加 `{server_name}_` 前缀（如 `filesystem_read_file`），
 防多服务器间工具名撞车（红线 #18 工具按 name 去重的延伸）。
+
+**#3772 发现失败隔离**：旧版 `client.get_tools()` 一把梭——任何一个 server 的工具发现抛错，整个调用
+抛异常被外层 except 吞成 `[]`，**所有** MCP 工具一起丢。现在按 server 独立 `get_tools(server_name=...)`
++ `asyncio.gather` + 每 server try/except：坏 server 返回 `[]` 只丢自己，健康 server 照常贡献工具。
+`asyncio.gather` 并发发起（不串行等待慢 server），任一抛错被 `load_server_tools` 内 except 兜住。
 
 ---
 

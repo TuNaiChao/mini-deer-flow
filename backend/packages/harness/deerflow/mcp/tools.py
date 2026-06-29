@@ -9,6 +9,7 @@ OAuth 头 → 构造 ``MultiServerMCPClient`` → 发现工具 → **仅 stdio �
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -256,8 +257,16 @@ async def get_mcp_tools() -> list[BaseTool]:
             tool_name_prefix=True,
         )
 
-        # 从所有服务器发现工具定义（经临时会话；持久会话包装在下面应用）。
-        tools = await client.get_tools()
+        # 按服务器独立发现工具——单个坏 MCP 服务器不让健康服务器的工具一起丢（#3772）。
+        async def load_server_tools(server_name: str) -> list[BaseTool]:
+            try:
+                return await client.get_tools(server_name=server_name)
+            except Exception as e:
+                logger.warning("MCP 服务器 '%s' 工具发现失败，跳过: %s", server_name, e, exc_info=True)
+                return []
+
+        tools_by_server = await asyncio.gather(*(load_server_tools(name) for name in servers_config))
+        tools = [tool for server_tools in tools_by_server for tool in server_tools]
         logger.info("成功从 MCP 服务器加载 %d 个工具", len(tools))
 
         # 给每个工具包上持久会话逻辑。仅池化 stdio 会话。HTTP/SSE 传输内部用

@@ -7,10 +7,10 @@
    （``additional_kwargs.subagent_status``，issue bytedance/deer-flow#3146）——前端从结构化
    字段读状态而非解析 task 返回串的前缀，契约在此处一处落实，防「新增返回路径忘贴」漂移。
 
-2. 三个工厂：``_build_runtime_middlewares``（lead/subagent 共享前 9 步）/
+2. 三个工厂：``_build_runtime_middlewares``（lead/subagent 共享前置段）/
    ``build_lead_runtime_middlewares`` / ``build_subagent_runtime_middlewares``。把 lead 和
-   subagent 都需要的中间件（ToolOutputBudget / ThreadData / Uploads[仅 lead] / Sandbox /
-   DanglingToolCall / LLMErrorHandling / SandboxAudit / ToolErrorHandling）集中装配。
+   subagent 都需要的中间件（InputSanitization / ToolOutputBudget / Uploads[仅 lead] / ThreadData
+   / Sandbox / DanglingToolCall / LLMErrorHandling / SandboxAudit / ToolErrorHandling）集中装配。
 
 红线 #15：``wrap_tool_call`` 里 ``handler`` 抛 ``GraphBubbleUp`` 必须 ``raise`` 原样上抛——
 否则 ClarificationMiddleware 的中断、subagent 的 interrupt 都会被下面的 ``except Exception`` 吞掉。
@@ -136,22 +136,32 @@ def _build_runtime_middlewares(
 
     Guardrail（``app_config.guardrails``）mini 标真正可选未做——此处不留分支，跳过该步。
     """
+    from deerflow.agents.middlewares.input_sanitization_middleware import InputSanitizationMiddleware
     from deerflow.agents.middlewares.llm_error_handling_middleware import LLMErrorHandlingMiddleware
     from deerflow.agents.middlewares.thread_data_middleware import ThreadDataMiddleware
     from deerflow.agents.middlewares.tool_output_budget_middleware import ToolOutputBudgetMiddleware
     from deerflow.sandbox.middleware import SandboxMiddleware
 
-    middlewares: list[AgentMiddleware] = [
-        ToolOutputBudgetMiddleware.from_app_config(app_config),
-        ThreadDataMiddleware(lazy_init=lazy_init),
-        SandboxMiddleware(lazy_init=lazy_init),
-    ]
+    # 顺序对齐上游 build_lead_runtime_middlewares（mini 跳过 #8 Guardrail）：
+    #   InputSanitization(#1, 最外层 wrap_model_call) → ToolOutputBudget(#2) → Uploads(#3, 仅 lead)
+    #   → ThreadData(#4) → Sandbox(#5) → DanglingToolCall(#6) → LLMErrorHandling(#7)
+    #   → [Guardrail(#8) 跳过] → SandboxAudit(#9) → ToolErrorHandling(#10)。
+    #
+    # InputSanitization 必须第一：它是包在最外层的 wrap_model_call，所有内层中间件（含
+    # LLMErrorHandling 的重试）看到的都是已净化消息（提示词注入标签被转义）。
+    # Uploads 从 runtime.context 取 thread_id、自己解析 uploads_dir（不读 thread_data state），
+    # 故与 ThreadData 无硬先后依赖——Uploads 提前到 ThreadData 之前，对齐上游顺序。
+    middlewares: list[AgentMiddleware] = [InputSanitizationMiddleware(), ToolOutputBudgetMiddleware.from_app_config(app_config)]
 
     if include_uploads:
         from deerflow.agents.middlewares.uploads_middleware import UploadsMiddleware
 
-        # insert(2) → 排在 ThreadData 之后、Sandbox 之前（Part D 顺序 1/2/3/4）。
-        middlewares.insert(2, UploadsMiddleware())
+        # 排在 ThreadData 之前、ToolOutputBudget 之后（对齐上游）。
+        middlewares.append(UploadsMiddleware())
+
+    middlewares.append(ThreadDataMiddleware(lazy_init=lazy_init))
+
+    middlewares.append(SandboxMiddleware(lazy_init=lazy_init))
 
     if include_dangling_tool_call_patch:
         from deerflow.agents.middlewares.dangling_tool_call_middleware import DanglingToolCallMiddleware
@@ -160,7 +170,7 @@ def _build_runtime_middlewares(
 
     middlewares.append(LLMErrorHandlingMiddleware(app_config=app_config))
 
-    # Guardrail 中间件（真正可选）：mini 未引入 guardrails 独立模块，此处跳过（M16 第 7 步）。
+    # Guardrail 中间件（真正可选）：mini 未引入 guardrails 独立模块，此处跳过（#8）。
 
     from deerflow.agents.middlewares.sandbox_audit_middleware import SandboxAuditMiddleware
 

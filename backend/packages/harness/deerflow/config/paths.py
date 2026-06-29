@@ -238,6 +238,54 @@ class Paths:
         """
         return self.thread_user_data_dir(user_id, thread_id) / "outputs"
 
+    def resolve_virtual_path(
+        self,
+        thread_id: str,
+        virtual_path: str,
+        *,
+        user_id: str,
+    ) -> Path:
+        """把沙箱虚拟路径（如 ``/mnt/user-data/outputs/report.pdf``）解析为宿主物理路径。
+
+        对齐上游 ``Paths.resolve_virtual_path``（M15 落地，配合 ``present_files`` 多文件
+        + 路径校验）。前导 ``/`` 先剥；要求**精确段边界**匹配 ``VIRTUAL_PATH_PREFIX``
+        （拒绝 ``mnt/user-dataX`` 这类前缀混淆）；解析后强制 ``relative_to(base)``
+        校验，挡 ``..`` 路径穿越。
+
+        与上游的差异：mini 的 ``thread_user_data_dir`` 把 ``user_id`` 放在**首位**且为
+        必传（上游 ``sandbox_user_data_dir`` 是 ``user_id=None`` 可选、内部兜底默认用户），
+        故本方法 ``user_id`` 亦为必传 keyword——mini 全链路显式传 ``get_effective_user_id()``。
+
+        Args:
+            thread_id: 线程 id。
+            virtual_path: 沙箱内视角的虚拟路径（``/mnt/user-data/...``）。
+            user_id: 用户 id（必传；mini 的物理布局按 ``users/{user_id}/threads/...`` 隔离）。
+
+        Returns:
+            解析后的绝对宿主路径。
+
+        Raises:
+            ValueError: 路径不以 ``VIRTUAL_PATH_PREFIX`` 开头，或解析后落到 base 之外
+                （路径穿越）。
+        """
+        stripped = virtual_path.lstrip("/")
+        prefix = VIRTUAL_PATH_PREFIX.lstrip("/")
+
+        # 要求精确段边界匹配，避免前缀混淆（如 "mnt/user-dataX/..."）。
+        if stripped != prefix and not stripped.startswith(prefix + "/"):
+            raise ValueError(f"Path must start with /{prefix}")
+
+        relative = stripped[len(prefix) :].lstrip("/")
+        base = self.thread_user_data_dir(user_id, thread_id).resolve()
+        actual = (base / relative).resolve()
+
+        try:
+            actual.relative_to(base)
+        except ValueError:
+            raise ValueError("Access denied: path traversal detected")
+
+        return actual
+
     def ensure_thread_dirs(self, thread_id: str, *, user_id: str) -> Path:
         """确保某线程的 workspace/uploads/outputs 三目录存在，返回用户数据根。
 

@@ -2,6 +2,15 @@
 
 > 一句话定位：M-build 是 mini-deer-flow 对齐 deer-flow 的**第 0 步**——它不实现任何业务功能，只解决一个问题：**让「写完代码能跑测试、能 lint」这件事成立**。跳过它，后面所有模块都会撞上「代码写完了但环境跑不起来」的坑（M-models 已踩过：`uv` 锁住了、包没装）。
 
+> **Phase 0 全维重审（2026-06-28）**：diff `Makefile` + `pyproject.toml` + `langgraph.json` vs 最新上游。
+> mini 的 6 个 target（`install` / `dev` / `test` / `test-blocking-io` / `lint` / `format`）与上游**命名与语义对齐**。
+> **有意不 port** 的上游 target 均依赖 mini 不做的层：`dev`/`gateway`（上游跑 `uvicorn app.gateway.app:app`，
+> mini 无 Gateway 故 `dev` 跑 `langgraph dev` 读 `langgraph.json`）；`migrate-rev`（alembic，mini 走 `create_all`
+> 教学简化）；`detect-blocking-io`（上游 `scripts/detect_blocking_io_static.py` + `tests/blocking_io/` 严格
+> 运行时 gate，mini 是教学版无此 gate）。`lint`/`format`：上游用 `uvx ruff`，mini 用 `uv run ruff`（等价，
+> mini 已锁 ruff 于 dev 依赖）。`pyproject.toml` 的 ruff 配置（line-length=240、双引号、3.12+）一致。
+> 无需补丁。
+
 ---
 
 ## 零基础先读：这些名词是什么

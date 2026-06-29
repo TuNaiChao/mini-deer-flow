@@ -17,6 +17,7 @@ release（释放）。为什么要 provider，而不是每次 ``new LocalSandbox
 from __future__ import annotations
 
 import asyncio
+import threading
 from abc import ABC, abstractmethod
 
 from deerflow.config import get_app_config
@@ -73,6 +74,17 @@ class SandboxProvider(ABC):
 # ---------------------------------------------------------------------------
 
 _default_sandbox_provider: SandboxProvider | None = None
+# 守卫 ``_default_sandbox_provider`` 的每一次读写。该单例可被多个 OS 线程触达（例如
+# 主事件循环与跑自己一个循环的 Feishu channel 线程），裸的 check-then-create 会双重
+# 初始化 provider，而未同步的 reset / shutdown 与 get 竞争会把 ``None`` 或半成品实例
+# 交给调用方。下面所有对全局的访问都持本锁，包括 ``get_sandbox_provider()`` 的读+返回。
+#
+# 锁只守卫引用交换。provider 回调（``__init__`` / ``reset()`` / ``shutdown()``）与
+# ``resolve_class()`` 里的动态 import 都在锁**外**跑：它们是插件代码（``config.sandbox.use``
+# 解析到任意类），可能很慢，更糟的是可能重入这些生命周期函数。用非重入
+# ``threading.Lock`` 跨着它们会自死锁，还会在一次慢拆除期间挡住所有并发 ``get()``。
+# 把回调挪到锁外，两个问题都避开了（#3730）。
+_provider_lock = threading.Lock()
 
 
 def get_sandbox_provider(**kwargs) -> SandboxProvider:
@@ -83,11 +95,29 @@ def get_sandbox_provider(**kwargs) -> SandboxProvider:
     再清，``set_sandbox_provider()`` 注入自定义（测试）实例。
     """
     global _default_sandbox_provider
-    if _default_sandbox_provider is None:
-        config = get_app_config()
-        cls = resolve_class(config.sandbox.use, SandboxProvider)
-        _default_sandbox_provider = cls(**kwargs)
-    return _default_sandbox_provider
+    # 快路径：一次带锁的读，让并发的 reset / shutdown 没法在 check 与 return 之间把全局置空。
+    with _provider_lock:
+        if _default_sandbox_provider is not None:
+            return _default_sandbox_provider
+
+    # 冷启动。resolve + 构造在锁外做：import 与 provider 构造器是插件代码，不能在非重入锁下跑。
+    # 构造可能与另一个调用方竞争；在锁下裁决谁装上去。
+    config = get_app_config()
+    cls = resolve_class(config.sandbox.use, SandboxProvider)
+    provider = cls(**kwargs)
+
+    with _provider_lock:
+        if _default_sandbox_provider is None:
+            _default_sandbox_provider = provider
+            return provider
+        # 我们输了安装竞争：另一个线程先到。``winner`` 在同一把锁下读，所以一定是存活实例、绝非 None。
+        winner = _default_sandbox_provider
+
+    # 丢弃刚建出来的实例（锁外）。对构造有副作用的 provider（如 ``AioSandboxProvider`` 起了
+    # idle-checker 线程），拆除这个孤儿免得泄漏（issue #3721）。
+    if hasattr(provider, "shutdown"):
+        provider.shutdown()
+    return winner
 
 
 def reset_sandbox_provider() -> None:
@@ -98,21 +128,30 @@ def reset_sandbox_provider() -> None:
     ``shutdown_sandbox_provider()``。
     """
     global _default_sandbox_provider
-    if _default_sandbox_provider is not None:
-        _default_sandbox_provider.reset()
+    # 锁下摘引用，锁外跑 provider 的 ``reset()`` 回调（见 ``_provider_lock`` 注）。
+    with _provider_lock:
+        provider = _default_sandbox_provider
         _default_sandbox_provider = None
+    if provider is not None:
+        provider.reset()
 
 
 def shutdown_sandbox_provider() -> None:
     """先 shutdown（释放所有沙箱）再清单例。应用退出时调。"""
     global _default_sandbox_provider
-    if _default_sandbox_provider is not None:
-        if hasattr(_default_sandbox_provider, "shutdown"):
-            _default_sandbox_provider.shutdown()
+    # 锁下摘引用，锁外跑（可能很慢的）``shutdown()`` 回调（见 ``_provider_lock`` 注）。
+    with _provider_lock:
+        provider = _default_sandbox_provider
         _default_sandbox_provider = None
+    if provider is not None and hasattr(provider, "shutdown"):
+        provider.shutdown()
 
 
 def set_sandbox_provider(provider: SandboxProvider) -> None:
-    """注入自定义 provider（测试用）。"""
+    """注入自定义 provider（测试用）。
+
+    注意：之前装的 provider 会被**替换但不 shutdown**；被覆盖实例的生命周期由调用方自负。
+    """
     global _default_sandbox_provider
-    _default_sandbox_provider = provider
+    with _provider_lock:
+        _default_sandbox_provider = provider

@@ -30,12 +30,9 @@ import logging
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, cast
 
 from langgraph.checkpoint.base import empty_checkpoint
-
-if TYPE_CHECKING:
-    from langchain_core.messages import HumanMessage
 
 from deerflow.config.app_config import AppConfig
 from deerflow.runtime.serialization import serialize
@@ -628,30 +625,6 @@ def _extract_llm_error_fallback_message(value: Any) -> str | None:
         return None
 
     return walk(value)
-
-
-def _extract_human_message(graph_input: dict) -> "HumanMessage | None":
-    """从 graph_input 抽或构造一个 HumanMessage 供事件记录用。
-
-    返回 LangChain HumanMessage，让调用方能用 .model_dump() 拿到 checkpoint 对齐的序列化格式。
-    """
-    from langchain_core.messages import HumanMessage
-
-    messages = graph_input.get("messages")
-    if not messages:
-        return None
-    last = messages[-1] if isinstance(messages, list) else messages
-    if isinstance(last, HumanMessage):
-        return last
-    if isinstance(last, str):
-        return HumanMessage(content=last) if last else None
-    if hasattr(last, "content"):
-        content = last.content
-        return HumanMessage(content=content)
-    if isinstance(last, dict):
-        content = last.get("content", "")
-        return HumanMessage(content=content) if content else None
-    return None
 
 
 def _unpack_stream_item(

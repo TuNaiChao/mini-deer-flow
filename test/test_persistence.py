@@ -102,7 +102,7 @@ async def test_memory_backend_is_noop():
 
 
 async def test_sqlite_wal_pragmas_fire(sqlite_dir: Path):
-    """红线 #2：每条新连接开 WAL / synchronous=NORMAL / foreign_keys=ON。"""
+    """红线 #2：每条新连接开 WAL / synchronous=NORMAL / foreign_keys=ON / busy_timeout=30000。"""
     db_path = sqlite_dir / "deerflow.db"
     url = f"sqlite+aiosqlite:///{db_path}"
     await init_engine("sqlite", url=url, sqlite_dir=str(sqlite_dir))
@@ -113,10 +113,12 @@ async def test_sqlite_wal_pragmas_fire(sqlite_dir: Path):
         mode = (await conn.execute(text("PRAGMA journal_mode"))).scalar()
         synchronous = (await conn.execute(text("PRAGMA synchronous"))).scalar()
         foreign_keys = (await conn.execute(text("PRAGMA foreign_keys"))).scalar()
+        busy_timeout = (await conn.execute(text("PRAGMA busy_timeout"))).scalar()
 
     assert mode == "wal"
     assert synchronous == 1  # NORMAL
     assert foreign_keys == 1  # ON
+    assert busy_timeout == 30000  # 30s，锁竞争等待窗口（默认只有 5s）
 
 
 async def test_sqlite_wal_persists_in_db_file(sqlite_dir: Path):
@@ -368,6 +370,66 @@ async def test_aggregate_tokens_by_thread(repo: RunRepository):
     assert agg["by_model"]["gpt"] == {"tokens": 150, "runs": 2}
     assert agg["by_caller"]["lead_agent"] == 100
     assert agg["by_caller"]["subagent"] == 50
+
+
+async def test_aggregate_tokens_by_thread_per_model(repo: RunRepository):
+    """#3658 SQL 侧：run 带 ``token_usage_by_model`` 时，按真计费模型逐模型归桶
+    （一个 run 可能贡献给多个模型桶），而非按行的 model_name GROUP BY。"""
+    # run-1：model_name=gpt-4，但实际用了 gpt-4(70) + gpt-4o-mini(30) 两个模型
+    await repo.put("m1", thread_id="t1", user_id="alice", status="pending", model_name="gpt-4")
+    await repo.update_run_completion(
+        "m1",
+        status="success",
+        total_tokens=100,
+        total_input_tokens=60,
+        total_output_tokens=40,
+        token_usage_by_model={
+            "gpt-4": {"input_tokens": 40, "output_tokens": 30, "total_tokens": 70},
+            "gpt-4o-mini": {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+        },
+    )
+    # run-2：老行，无 token_usage_by_model → 回退到 model_name
+    await repo.put("m2", thread_id="t1", user_id="alice", status="pending", model_name="claude")
+    await repo.update_run_completion("m2", status="success", total_tokens=50, lead_agent_tokens=50)
+
+    agg = await repo.aggregate_tokens_by_thread("t1")
+    assert agg["total_tokens"] == 150
+    assert agg["total_runs"] == 2
+    # 按真计费模型归桶：gpt-4 只收 run-1 的 70，gpt-4o-mini 收 30，claude 回退收 50
+    assert agg["by_model"]["gpt-4"] == {"tokens": 70, "runs": 1}
+    assert agg["by_model"]["gpt-4o-mini"] == {"tokens": 30, "runs": 1}
+    assert agg["by_model"]["claude"] == {"tokens": 50, "runs": 1}
+    assert agg["by_caller"]["lead_agent"] == 50
+
+
+async def test_update_run_completion_persists_token_usage_by_model(repo: RunRepository):
+    """#3658 SQL 侧：update_run_completion 把 token_usage_by_model 写进列。"""
+    await repo.put("c1", thread_id="t1", user_id="alice", status="pending", model_name="gpt")
+    await repo.update_run_completion(
+        "c1",
+        status="success",
+        total_tokens=10,
+        token_usage_by_model={"gpt": {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10}},
+    )
+    got = await repo.get("c1", user_id=None)
+    assert got["token_usage_by_model"] == {"gpt": {"input_tokens": 4, "output_tokens": 6, "total_tokens": 10}}
+
+
+async def test_update_run_progress_persists_token_usage_by_model(repo: RunRepository):
+    """#3658 SQL 侧：update_run_progress 也写 token_usage_by_model（仅 status=running 行）。"""
+    await repo.put("p1", thread_id="t1", user_id="alice", status="running", model_name="gpt")
+    await repo.update_run_progress(
+        "p1",
+        total_tokens=10,
+        token_usage_by_model={"gpt": {"total_tokens": 10}},
+    )
+    got = await repo.get("p1", user_id=None)
+    assert got["token_usage_by_model"] == {"gpt": {"total_tokens": 10}}
+
+    # None 时不覆盖已有值
+    await repo.update_run_progress("p1", total_tokens=20)
+    got2 = await repo.get("p1", user_id=None)
+    assert got2["token_usage_by_model"] == {"gpt": {"total_tokens": 10}}
 
 
 async def test_update_run_progress_only_running(repo: RunRepository):

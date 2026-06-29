@@ -79,6 +79,7 @@ def _install_fake_adapter(
     *,
     tools_by_name: dict[str, list] | None = None,
     create_session_cm_factory=None,
+    failing_servers: set[str] | None = None,
 ):
     """注入 fake ``langchain_mcp_adapters`` + ``mcp`` 进 sys.modules。
 
@@ -86,8 +87,11 @@ def _install_fake_adapter(
         tools_by_name: ``{server_name: [fake_tools]}``，决定 ``get_tools()`` 返回。
             默认空 dict → 所有服务器无工具。
         create_session_cm_factory: 产出 fake async context manager 的可调用（``create_session``）。
+        failing_servers: ``get_tools(server_name=X)`` 时，对这里列出的服务器抛
+            ``RuntimeError``——用于测 #3772 单服务器发现失败隔离（默认空集，不抛）。
     """
     tools_by_name = tools_by_name or {}
+    failing_servers = failing_servers or set()
 
     # ---- MultiServerMCPClient：记录 servers_config，get_tools 返回按前缀分发的 fake tools ----
     class _FakeClient:
@@ -95,10 +99,17 @@ def _install_fake_adapter(
             self.servers_config = servers_config
             self.kwargs = kwargs
 
-        async def get_tools(self):
+        async def get_tools(self, server_name=None):
+            # 生产 #3772 路径：按服务器独立发现。坏服务器（在 failing_servers 里）抛错，
+            # 由 get_mcp_tools 内的 load_server_tools 捕获后返回 []，不拖累其它服务器。
+            if server_name is not None:
+                if server_name in failing_servers:
+                    raise RuntimeError(f"fake discovery failure for {server_name}")
+                return list(tools_by_name.get(server_name, []))
+            # 聚合回退路径（与真实库的 get_tools() 语义一致）。
             result = []
-            for server_name in self.servers_config:
-                result.extend(tools_by_name.get(server_name, []))
+            for name in self.servers_config:
+                result.extend(tools_by_name.get(name, []))
             return result
 
     fake_pkg = types.ModuleType("langchain_mcp_adapters")
@@ -875,6 +886,59 @@ class TestGetMcpTools:
         names = [t.name for t in tools]
         assert "alpha_tool1" in names
         assert "beta_tool1" in names
+
+    @pytest.mark.asyncio
+    async def test_one_failing_server_does_not_block_others(self, monkeypatch):
+        """#3772：单个 MCP 服务器发现失败不拖累其它健康服务器。
+
+        ``broken`` 的 ``get_tools(server_name="broken")`` 抛错，被 ``load_server_tools``
+        内 try/except 捕获后返回 ``[]``；``good`` 的工具照常贡献。
+        """
+        tool_good = _fake_tool("good_tool1")
+        _install_fake_adapter(
+            monkeypatch,
+            tools_by_name={"good": [tool_good], "broken": []},
+            failing_servers={"broken"},
+        )
+
+        from deerflow.config.extensions_config import ExtensionsConfig
+
+        cfg = ExtensionsConfig(
+            mcp_servers=[
+                McpServerConfig(name="good", type="stdio", command="g"),
+                McpServerConfig(name="broken", type="stdio", command="b"),
+            ]
+        )
+        monkeypatch.setattr(ExtensionsConfig, "from_file", classmethod(lambda cls, *a, **kw: cfg))
+
+        tools = await tools_module.get_mcp_tools()
+        names = [t.name for t in tools]
+        assert "good_tool1" in names
+        # broken 的发现失败被隔离——不贡献任何工具
+        assert all(not n.startswith("broken") for n in names)
+        assert len(tools) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_servers_failing_returns_empty_not_raise(self, monkeypatch):
+        """#3772：所有服务器发现都失败 → 返回 ``[]``（不抛错到调用方）。"""
+        _install_fake_adapter(
+            monkeypatch,
+            tools_by_name={"a": [], "b": []},
+            failing_servers={"a", "b"},
+        )
+
+        from deerflow.config.extensions_config import ExtensionsConfig
+
+        cfg = ExtensionsConfig(
+            mcp_servers=[
+                McpServerConfig(name="a", type="stdio", command="x"),
+                McpServerConfig(name="b", type="stdio", command="y"),
+            ]
+        )
+        monkeypatch.setattr(ExtensionsConfig, "from_file", classmethod(lambda cls, *a, **kw: cfg))
+
+        tools = await tools_module.get_mcp_tools()
+        assert tools == []
 
     @pytest.mark.asyncio
     async def test_stdio_tool_wrapped_with_session_pool(self, monkeypatch):

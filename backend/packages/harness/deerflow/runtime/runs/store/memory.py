@@ -21,6 +21,22 @@ class MemoryRunStore(RunStore):
 
     def __init__(self) -> None:
         self._runs: dict[str, dict[str, Any]] = {}
+        # 二级索引：thread_id -> 插入序 run_id 集合（dict 当有序集合用），与 ``_runs`` 同步维护，
+        # 让 per-thread 查询不必 O(全部内存 run) 全扫。镜像 ``RunManager`` 在它自己的内存 record
+        # 上维护的同款索引（#3562）。
+        self._runs_by_thread: dict[str, dict[str, None]] = {}
+
+    def _index_run(self, run_id: str, thread_id: str) -> None:
+        """把 *run_id* 登记到 *thread_id* 的二级索引桶里。"""
+        self._runs_by_thread.setdefault(thread_id, {})[run_id] = None
+
+    def _unindex_run(self, run_id: str, thread_id: str) -> None:
+        """从 *thread_id* 桶移除 *run_id*，桶空了就摘掉键。"""
+        bucket = self._runs_by_thread.get(thread_id)
+        if bucket is not None:
+            bucket.pop(run_id, None)
+            if not bucket:
+                self._runs_by_thread.pop(thread_id, None)
 
     async def put(
         self,
@@ -52,6 +68,7 @@ class MemoryRunStore(RunStore):
             "created_at": created_at or now,
             "updated_at": now,
         }
+        self._index_run(run_id, thread_id)
 
     async def get(self, run_id, *, user_id=None):
         run = self._runs.get(run_id)
@@ -62,7 +79,12 @@ class MemoryRunStore(RunStore):
         return run
 
     async def list_by_thread(self, thread_id, *, user_id=None, limit=100):
-        results = [r for r in self._runs.values() if r["thread_id"] == thread_id and (user_id is None or r.get("user_id") == user_id)]
+        # 用 thread 索引做 O(该 thread 的 run 数) 查找，而非扫每个 run（#3562）。
+        # ``self._runs.get`` 是纵深防御：丢弃索引里还在、但 ``_runs`` 已没有的陈旧 id。
+        run_ids = self._runs_by_thread.get(thread_id)
+        if not run_ids:
+            return []
+        results = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and (user_id is None or run.get("user_id") == user_id)]
         results.sort(key=lambda r: r["created_at"], reverse=True)
         return results[:limit]
 
@@ -81,7 +103,9 @@ class MemoryRunStore(RunStore):
             self._runs[run_id]["updated_at"] = datetime.now(UTC).isoformat()
 
     async def delete(self, run_id):
-        self._runs.pop(run_id, None)
+        run = self._runs.pop(run_id, None)
+        if run is not None:
+            self._unindex_run(run_id, run["thread_id"])
 
     async def update_run_completion(self, run_id, *, status, **kwargs):
         if run_id in self._runs:
@@ -119,13 +143,25 @@ class MemoryRunStore(RunStore):
         total_input_tokens / total_output_tokens / total_runs / by_model / by_caller。
         """
         statuses = ("success", "error", "running") if include_active else ("success", "error")
-        completed = [r for r in self._runs.values() if r["thread_id"] == thread_id and r.get("status") in statuses]
+        # 用 thread 索引做 O(该 thread 的 run 数) 查找，而非扫进程里每个 run（同 ``list_by_thread``，#3562）。
+        run_ids = self._runs_by_thread.get(thread_id) or ()
+        completed = [run for run_id in run_ids if (run := self._runs.get(run_id)) is not None and run.get("status") in statuses]
         by_model: dict[str, dict] = {}
         for r in completed:
-            model = r.get("model_name") or "unknown"
-            entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
-            entry["tokens"] += r.get("total_tokens", 0)
-            entry["runs"] += 1
+            usage_by_model = r.get("token_usage_by_model") or {}
+            if usage_by_model:
+                # #3658：按模型归桶——一次 run 可能调多个模型（lead + 多个子代理），各模型 token 分开计。
+                for model, usage in usage_by_model.items():
+                    entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
+                    entry["tokens"] += usage.get("total_tokens", 0)
+                    entry["runs"] += 1
+            else:
+                # 兜底：per-model 落地前写的旧行，把整 run 归到它的单一 ``model_name``。
+                # 保留 legacy 的 lead-only 行为，而非静默丢老数据。
+                model = r.get("model_name") or "unknown"
+                entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
+                entry["tokens"] += r.get("total_tokens", 0)
+                entry["runs"] += 1
         return {
             "total_tokens": sum(r.get("total_tokens", 0) for r in completed),
             "total_input_tokens": sum(r.get("total_input_tokens", 0) for r in completed),

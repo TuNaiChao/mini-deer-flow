@@ -50,6 +50,7 @@ from .stream_bridge_config import StreamBridgeConfig
 from .subagents_config import SubagentsAppConfig
 from .summarization_config import ContextSize, SummarizationConfig
 from .title_config import TitleConfig
+from .token_budget_config import TokenBudgetConfig
 from .token_usage_config import TokenUsageConfig
 from .tool_output_config import ToolOutputConfig
 from .tool_search_config import ToolSearchConfig
@@ -132,6 +133,7 @@ __all__ = [
     "SummarizationConfig",
     "ContextSize",
     "TitleConfig",
+    "TokenBudgetConfig",
     "TokenUsageConfig",
     "ToolOutputConfig",
     "ToolSearchConfig",

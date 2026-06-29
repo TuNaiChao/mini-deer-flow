@@ -65,8 +65,11 @@ def filter_messages_for_memory(messages: list[Any]) -> list[Any]:
     """只留用户输入与最终 AI 回复（跳过工具调用中间步 / 纯上传消息）。
 
     规则：
-    - human 消息：剥 ``<uploaded_files>`` 块；剥光后为空则跳过它**及其后紧跟的 AI 回复**
-      （纯上传轮不贡献记忆）。
+    - human 消息：带 ``hide_from_ui`` 的（中间件注入的隐藏消息）**直接跳过**（#3697）——
+      TodoMiddleware 的 todo_reminder、ViewImageMiddleware、DynamicContextMiddleware 的
+      ``__memory`` 等框架内部文本绝不能进记忆 LLM，否则会污染长期记忆，``__memory`` 载荷
+      还可能触发自我放大循环。然后剥 ``<uploaded_files>`` 块；剥光后为空则跳过它**及其后
+      紧跟的 AI 回复**（纯上传轮不贡献记忆）。
     - ai 消息：无 tool_calls 才留（有 tool_calls 是中间步，不是最终回复）。
     """
     filtered = []
@@ -75,6 +78,9 @@ def filter_messages_for_memory(messages: list[Any]) -> list[Any]:
         msg_type = getattr(msg, "type", None)
 
         if msg_type == "human":
+            # hide_from_ui 的隐藏消息（中间件注入）不进记忆（#3697）。
+            if getattr(msg, "additional_kwargs", {}).get("hide_from_ui"):
+                continue
             content_str = extract_message_text(msg)
             if "<uploaded_files>" in content_str:
                 stripped = _UPLOAD_BLOCK_RE.sub("", content_str).strip()

@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from .checkpointer_config import CheckpointerConfig
 from .circuit_breaker_config import CircuitBreakerConfig
@@ -31,6 +31,7 @@ from .stream_bridge_config import StreamBridgeConfig
 from .subagents_config import SubagentsAppConfig
 from .summarization_config import SummarizationConfig
 from .title_config import TitleConfig
+from .token_budget_config import TokenBudgetConfig
 from .token_usage_config import TokenUsageConfig
 from .tool_output_config import ToolOutputConfig
 from .tool_search_config import ToolSearchConfig
@@ -99,6 +100,10 @@ class AppConfig(BaseModel):
         default_factory=SafetyFinishReasonConfig,
         description="provider 安全 finish_reason 拦截中间件配置",
     )
+    token_budget: TokenBudgetConfig = Field(
+        default_factory=TokenBudgetConfig,
+        description="单 run token 预算强制中间件配置（M16 TokenBudgetMiddleware）",
+    )
     circuit_breaker: CircuitBreakerConfig = Field(
         default_factory=CircuitBreakerConfig,
         description="LLM 调用熔断配置（连续失败短路，M16 LLMErrorHandlingMiddleware）",
@@ -146,6 +151,14 @@ class AppConfig(BaseModel):
     # --- 追踪（M12 落地，当前环境变量驱动）---
     tracing: dict[str, Any] = Field(default_factory=dict, description="追踪配置（M12 落地）")
 
+    # name -> config 查找表（#3688），由下方 ``_build_name_indexes`` 在校验后构建，
+    # 让 ``get_model_config`` / ``get_tool_config`` 由 O(n) ``next(...)`` 线性扫变 O(1)
+    # dict 查。``get_tool_config`` 每次 community 工具调用跑 2-3 次（如 web_search）、
+    # ``get_model_config`` 每次 agent 构建跑数次，旧扫全在热路径上。PrivateAttr 不参与
+    # 序列化。reload 时构造新 ``AppConfig``，索引随之刷新。
+    _models_by_name: dict[str, ModelConfig] = PrivateAttr(default_factory=dict)
+    _tools_by_name: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
+
     @field_validator("models", "tools", "tool_groups", mode="before")
     @classmethod
     def _coerce_null_list_sections(cls, value: Any) -> Any:
@@ -156,6 +169,30 @@ class AppConfig(BaseModel):
         归一成 ``[]``，与字段 ``default_factory=list`` 一致。
         """
         return [] if value is None else value
+
+    @model_validator(mode="after")
+    def _build_name_indexes(self) -> "AppConfig":
+        """构建 name -> config 查找表，让 ``get_*_config`` O(1)（#3688）。
+
+        ``get_tool_config`` 每次 community 工具调用跑 2-3 次、``get_model_config`` 每次
+        agent 构建跑数次，旧的 ``next(...)`` 线性扫全在热路径。这里在 model 校验后
+        （reload 会构出新 ``AppConfig``，索引随之刷新）一次性建表。``setdefault`` 在
+        重名时保留**首个**条目，与旧 ``next(...)`` 的首匹配语义一致。
+        """
+        models_by_name: dict[str, ModelConfig] = {}
+        for model in self.models:
+            models_by_name.setdefault(model.name, model)
+        tools_by_name: dict[str, dict[str, Any]] = {}
+        for tool in self.tools:
+            # mini 的 tools 是 list[dict]（M15 落地时类型化为 ToolConfig）；只索引
+            # 带 "name" 的 dict 条目，与旧 next(...isinstance(t, dict)...) 过滤一致。
+            if isinstance(tool, dict):
+                name = tool.get("name")
+                if name:
+                    tools_by_name.setdefault(name, tool)
+        self._models_by_name = models_by_name
+        self._tools_by_name = tools_by_name
+        return self
 
     def get_model_config(self, name: str | None) -> ModelConfig | None:
         """按名称查找模型配置。
@@ -169,10 +206,8 @@ class AppConfig(BaseModel):
             return None
         if name is None:
             return self.models[0]
-        for m in self.models:
-            if m.name == name:
-                return m
-        return None
+        # #3688：O(1) dict 查表，替代旧的 O(n) 线性扫。
+        return self._models_by_name.get(name)
 
     def get_tool_config(self, name: str) -> dict[str, Any] | None:
         """按名称查找工具配置（对应 config.yaml 中 tools[].name）。
@@ -187,7 +222,8 @@ class AppConfig(BaseModel):
         Returns:
             匹配的工具配置 dict；未找到时返回 None。
         """
-        return next((t for t in self.tools if isinstance(t, dict) and t.get("name") == name), None)
+        # #3688：O(1) dict 查表，替代旧的 O(n) next(...) 线性扫。
+        return self._tools_by_name.get(name)
 
 
 # --- 全局配置单例 ---

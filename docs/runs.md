@@ -8,6 +8,17 @@
 最省事——本篇回答「这张图**怎么跑起来**、跑到一半用户取消怎么办、进程崩了重启后那些没跑完的 run
 怎么办」。图本身是静态产物（M17），run 是它的**一次动态执行**。
 
+> **M18 全维重审（2026-06-28）**：逐文件 diff 最新上游（`runs/{manager,worker,schemas,naming,store/*}`），
+> 剥 docstring 后状态机不变量（busy 重试 #2 / orphan 恢复 #7 / shutdown drain #6 / 幂等 cancel / create_or_reject
+> 消除 TOCTOU / rollback 快照 #5）**逻辑完全一致**（差异全为注释翻译）。补 **3 项对齐**：
+> ① **#3562**——`MemoryRunStore` 补 `_runs_by_thread` 二级索引（`RunManager` 早已有，但 `MemoryRunStore`
+> 缺；`list_by_thread` / `aggregate_tokens_by_thread` 由 O(全部 run) 全扫改为 O(该 thread 的 run 数)）；
+> ② **#3658**——按模型归桶 token（跨 `token_collector` + `journal._record_model_usage` + `RunRecord.token_usage_by_model`
+> + `RunStore` + 聚合读侧 5 处的整体 port，见 §7.1）；③ **#3697**——`journal` 抓首条 human 时也过滤 `hide_from_ui`
+> （M13 在 memory 侧补过，journal 侧漏）。**#3732**（preserve resume command）已对齐——worker 把 `graph_input`
+> 直传 `agent.astream`，无吞 `Command(resume=...)` 的预处理。清理 worker 里 1 个死函数 `_extract_human_message`
+> （定义未调用，上游无）。
+
 ---
 
 ## 0. 这个模块解决什么问题
@@ -174,6 +185,10 @@ interrupted 以外的终态」。
    - 否则 → status success；
 7. finally：flush journal + 持久化 completion + 标题回写 thread_meta + `publish_end`。
 
+> **#3732 对齐**：worker 把 `graph_input` **原样**传给 `agent.astream`，没有任何吞 `Command(resume=...)`
+> 的预处理。human-in-the-loop 的「恢复」走 LangGraph 原生路径——前端把 resume payload 当 `graph_input`
+> 传进来，langgraph 自己识别 `Command(resume=...)` 并驱动 interrupt 节点继续。所以 worker 这侧**无需特判**。
+
 ### 4.1 abort 在迭代边界检查
 
 `record.abort_event.is_set()` 在 `astream` 的每个 chunk 之间检查。为什么不在 task cancel 时立即停？
@@ -225,7 +240,8 @@ class RunContext:
 两个实现：
 
 - **`MemoryRunStore`**（[store/memory.py](../backend/packages/harness/deerflow/runtime/runs/store/memory.py)）：
-  内存 dict，默认 / 测试用；
+  内存 dict，默认 / 测试用；**#3562 后也维护 `_runs_by_thread` 二级索引**（与 `RunManager` 对称），
+  让它的 `list_by_thread` / `aggregate_tokens_by_thread` 走索引而非全扫；
 - **`RunRepository`**（`persistence.run.sql`）：SQLAlchemy ORM，持久化。
 
 `RunManager` 给了 store 时，元数据双写（内存 + store），让 run 历史跨进程重启存活。ABC 提前到 Phase 1
@@ -239,12 +255,51 @@ class RunContext:
 | **agents(M17)** | `agent_factory`（`make_lead_agent`）由 worker 调用构建图 |
 | **checkpointer(M5)** | `RunContext.checkpointer`——run 写 checkpoint；rollback 读 pre-run 快照 |
 | **events/store(M6)** | `RunContext.event_store`——RunJournal 写事件 |
-| **journal(M7)** | worker 注入 RunJournal 作 callback + `__run_journal` 哨兵；token 用量 / completion 从它取 |
+| **journal(M7)** | worker 注入 RunJournal 作 callback + `__run_journal` 哨兵；token 用量（**含 #3658 按模型归桶**）/ completion 从它取 |
 | **stream_bridge(M8)** | worker 把流式 chunk 发到 bridge；`publish_end` 收尾 |
 | **serialization(M9)** | chunk 经 `serialize(mode=...)` 转 JSON 再发 bridge |
 | **tracing(M12)** | worker 注入 Langfuse metadata（session/user/name/tags） |
 | **user_context(M3)** | `get_effective_user_id()` 给 Langfuse metadata |
 | **persistence(M4)** | `RunRepository(RunStore)` SQL 实现 |
+
+### 6.1 按模型归桶 token —— #3658 端到端数据流
+
+「一个 run 里调了 `gpt-4o` 又调了 `gpt-4o-mini`，各自花了多少 token？」要回答这个，token 不能只记
+一个总数，得**按模型分桶**。#3658 是一条跨 5 个模块的纵向 port（写侧 → 传递 → 读侧）：
+
+```
+① 写侧（run 进行中，逐次 LLM 调用记下来）
+   journal.on_llm_end(每条 AIMessage)
+        │  message.response_metadata.model_name  ← langchain 标准位置，provider 返回的真模型
+        │  message.usage_metadata.{input,output,total}_tokens
+        ▼
+   journal._record_model_usage(model_name, input, output, total)
+        │  total<=0 跳过；model_name 为 None → 桶名 "unknown"
+        │  累加进 self._tokens_by_model[model] = {tokens, runs}
+        │
+   子代理路径：SubagentTokenCollector.on_llm_end 同样取 model_name → 记录带 "model_name" 字段
+        → record_external_llm_usage_records → 同一个 _record_model_usage（子代理 token 回灌父 run）
+
+② 传递（run 结束，journal → worker → manager → store）
+   journal.get_completion_data()
+        │  返回 token_usage_by_model: {model: {tokens, runs}}（深拷贝，防外部改）
+        ▼
+   worker → run_manager.update_run_completion(token_usage_by_model=...)
+        ▼
+   RunRecord.token_usage_by_model（内存 dataclass 字段）+ store 行的 token_usage_by_model（持久化）
+
+③ 读侧（查询历史花销）
+   store.aggregate_tokens_by_thread(thread_id)   ← #3562 后走 _runs_by_thread 索引
+        │  遍历该 thread 的 completed run
+        │  优先读 row.token_usage_by_model → 逐模型累加 tokens / 计数 runs
+        │  老行（无 token_usage_by_model，#3658 之前）→ 回退 row.model_name（单模型时代的字段）
+        ▼
+   {model: {tokens, runs}}  ← UI 展示「各模型花了多少」
+```
+
+**为什么用 `response_metadata.model_name` 而非 config 里写的 model？** 一个 agent 可能路由到多个模型
+（主模型 + 小模型兜底 / 子代理换模型）；真正的计费模型由 provider **返回**的 `response_metadata` 决定，
+不是配置里声明的那一个。记配置里的会错把兜底模型算成主模型。
 
 ## 7. 设计要点回顾
 

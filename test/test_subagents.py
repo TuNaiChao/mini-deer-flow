@@ -455,6 +455,33 @@ class TestTokenCollector:
         # 清副本不影响内部
         assert len(col.snapshot_records()) == 1
 
+    def test_captures_model_name_from_response_metadata(self):
+        """#3658：record 带 model_name（从 response_metadata.model_name 取），供父 journal 按模型归桶。"""
+        col = SubagentTokenCollector(caller="subagent:gp")
+        msg = AIMessage(content="x")
+        msg.usage_metadata = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        msg.response_metadata = {"model_name": "claude-3"}
+        resp = SimpleNamespace(generations=[[ChatGeneration(message=msg)]])
+        col.on_llm_end(resp, run_id="r1")
+        recs = col.snapshot_records()
+        assert recs[0]["model_name"] == "claude-3"
+
+    def test_captures_model_key_fallback(self):
+        """response_metadata 用 ``model`` 键（非 model_name）也要识别。"""
+        col = SubagentTokenCollector(caller="c")
+        msg = AIMessage(content="x")
+        msg.usage_metadata = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        msg.response_metadata = {"model": "gpt-4o"}
+        resp = SimpleNamespace(generations=[[ChatGeneration(message=msg)]])
+        col.on_llm_end(resp, run_id="r1")
+        assert col.snapshot_records()[0]["model_name"] == "gpt-4o"
+
+    def test_model_name_none_when_no_response_metadata(self):
+        col = SubagentTokenCollector(caller="c")
+        resp = SimpleNamespace(generations=[[_gen("a", {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})]])
+        col.on_llm_end(resp, run_id="r1")
+        assert col.snapshot_records()[0]["model_name"] is None
+
 
 # ===========================================================================
 # executor machinery（单 scheduler pool + 持久化隔离事件循环）
@@ -577,6 +604,39 @@ class TestExecutorExecution:
         result = ex.execute("task")
         assert result.status == SubagentStatus.COMPLETED
         assert len(result.ai_messages) == 1
+
+    def test_execute_seen_set_seeded_from_holder_messages(self, monkeypatch):
+        """#3687：``seen_message_ids`` 必须从 result_holder 自带的 ai_messages 预填，
+        否则流式重发同 id 消息会重复入列。锁住集合初始化那行。"""
+        ex = self._make_executor()
+        holder = SubagentResult(
+            task_id="h",
+            trace_id=ex.trace_id,
+            status=SubagentStatus.RUNNING,
+            started_at=datetime.now(),
+            ai_messages=[
+                AIMessage(content="pre1", id="pre1").model_dump(),
+                AIMessage(content="pre2", id="pre2").model_dump(),
+            ],
+        )
+        # pre1 重发（应去重）+ 一条新消息 new1（应入列）
+        chunks = [_chunk_with_ai("pre1", "pre1"), _chunk_with_ai("new1", "new1")]
+        monkeypatch.setattr(ex, "_create_agent", lambda tools=None, deferred_setup=None: _FakeAgent(chunks))
+        result = ex.execute("task", result_holder=holder)
+        ids = [m.get("id") for m in (result.ai_messages or [])]
+        assert ids == ["pre1", "pre2", "new1"]  # pre1 未重复
+
+    def test_execute_dedups_many_distinct_ids_and_repeats(self, monkeypatch):
+        """#3687：大量不同 id 全收录 + 同 id 重复全折叠——验证 O(1) 集合去重不改变语义。"""
+        ex = self._make_executor()
+        chunks = [_chunk_with_ai("dup", "m1") for _ in range(8)]  # m1 重复 8 次
+        chunks += [_chunk_with_ai(f"c{i}", f"d{i}") for i in range(20)]  # 20 个不同 id
+        monkeypatch.setattr(ex, "_create_agent", lambda tools=None, deferred_setup=None: _FakeAgent(chunks))
+        result = ex.execute("task")
+        ids = [m.get("id") for m in (result.ai_messages or [])]
+        assert ids.count("m1") == 1  # 8 次折叠成 1
+        assert len(ids) == 21  # m1 + d0..d19
+        assert len(set(ids)) == len(ids)  # 无任何残留重复
 
     def test_execute_failed_on_exception(self, monkeypatch):
         ex = self._make_executor()
@@ -807,3 +867,143 @@ class TestExecutorDegradation:
         assert captured["checkpointer"] is False
         assert isinstance(captured["middleware"], list)
         assert len(captured["middleware"]) >= 1
+
+
+# ===========================================================================
+# SubagentExecutor 追踪接线（M12：#17 图根 callbacks + #3611 Langfuse span 归属）
+# ===========================================================================
+
+
+class TestSubagentTracingWiring:
+    """子代理运行时的 tracing 接线——红线 #17（图根挂 tracing callbacks）+ #3611
+    （Langfuse span 归属父 thread）。
+
+    hermetic：不跑真 agent / 真 LLM / 真 Langfuse 后端。把 ``_build_initial_state``
+    与 ``_create_agent`` 打桩短路，让 ``_aexecute`` 走到 ``agent.astream(...)`` 调用，
+    在那里捕获 ``run_config`` 并断言：① tracing callbacks 追加在图根（#17）；
+    ② ``inject_langfuse_metadata`` 被以正确的字段映射调用（#3611）。fake astream 不 yield
+    任何 chunk → ``final_state=None`` → ``final_result="No response generated"``，执行器正常完成。
+    """
+
+    def _make_executor(self, *, name="deep_research", user_id="user-123", thread_id="thread-abc", model_name="gpt-4o"):
+        return SubagentExecutor(
+            config=SubagentConfig(name=name, description="d", model=model_name),
+            tools=[],
+            app_config=_make_app_config(),
+            thread_id=thread_id,
+            user_id=user_id,
+        )
+
+    async def _drive_and_capture(self, ex, monkeypatch, *, tracing_callbacks=None):
+        """短路装配 + 跑 ``_aexecute`` 到 astream，捕获 ``run_config`` 与 inject 调用。"""
+
+        captured: dict = {}
+        inject_calls: list[dict] = []
+
+        async def _fake_build_initial_state(task):
+            return {}, [], None
+
+        def _fake_create_agent(tools=None, *, deferred_setup=None):
+            def astream(state, *, config=None, context=None, stream_mode=None):
+                # config 是同一个 dict，inject 已就地改过——拷一份快照
+                captured["config"] = dict(config or {})
+                captured["context"] = context
+
+                async def _empty():
+                    return
+                    yield  # 标记为 async generator
+
+                return _empty()
+
+            return SimpleNamespace(astream=astream)
+
+        monkeypatch.setattr(ex, "_build_initial_state", _fake_build_initial_state)
+        monkeypatch.setattr(ex, "_create_agent", _fake_create_agent)
+        if tracing_callbacks is not None:
+            monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: tracing_callbacks)
+        else:
+            monkeypatch.setattr(executor_module, "build_tracing_callbacks", lambda: [])
+
+        def _spy_inject(config, **kwargs):
+            inject_calls.append({"kwargs": kwargs})
+
+        monkeypatch.setattr(executor_module, "inject_langfuse_metadata", _spy_inject)
+
+        await ex._aexecute("task prompt")
+        return captured, inject_calls
+
+    def test_user_id_stored_on_executor(self):
+        # task_tool 经 resolve_runtime_user_id 捕获 user_id 传入；executor 存为 self.user_id
+        ex = self._make_executor(user_id="owner-1")
+        assert ex.user_id == "owner-1"
+        # 默认 None（无 runtime 的构造路径，如直接单测）
+        ex2 = SubagentExecutor(
+            config=SubagentConfig(name="x", description="d", model="gpt-4o"),
+            tools=[],
+            app_config=_make_app_config(),
+        )
+        assert ex2.user_id is None
+
+    async def test_tracing_callbacks_appended_at_graph_root(self, monkeypatch):
+        """#17：build_tracing_callbacks() 的返回追加进 run_config['callbacks']（在 collector 之后）。"""
+        sentinel_a, sentinel_b = object(), object()
+        ex = self._make_executor()
+        captured, _inject = await self._drive_and_capture(ex, monkeypatch, tracing_callbacks=[sentinel_a, sentinel_b])
+        callbacks = captured["config"]["callbacks"]
+        # collector（SubagentTokenCollector）在前，tracing callbacks 追加在后
+        assert sentinel_a in callbacks and sentinel_b in callbacks
+        assert callbacks.index(sentinel_a) < callbacks.index(sentinel_b)
+        # collector 仍在（tracing 追加不覆盖既有 callbacks）
+        assert callbacks[0].__class__.__name__ == "SubagentTokenCollector"
+
+    async def test_tracing_callbacks_empty_list_leaves_callbacks_untouched(self, monkeypatch):
+        """tracing 未启用（返回 []）→ callbacks 只有 collector，不报错。"""
+        ex = self._make_executor()
+        captured, _inject = await self._drive_and_capture(ex, monkeypatch, tracing_callbacks=[])
+        callbacks = captured["config"]["callbacks"]
+        assert len(callbacks) == 1
+        assert callbacks[0].__class__.__name__ == "SubagentTokenCollector"
+
+    async def test_langfuse_metadata_field_mapping(self, monkeypatch):
+        """#3611：inject_langfuse_metadata 以父 thread_id / 捕获 user_id / subagent:<name> 调用。"""
+        ex = self._make_executor(name="deep_research", user_id="owner-9", thread_id="thread-xyz", model_name="gpt-4o-mini")
+        _captured, inject_calls = await self._drive_and_capture(ex, monkeypatch)
+        assert len(inject_calls) == 1
+        kwargs = inject_calls[0]["kwargs"]
+        assert kwargs["thread_id"] == "thread-xyz"
+        assert kwargs["user_id"] == "owner-9"
+        assert kwargs["assistant_id"] == "subagent:deep-research"
+        assert kwargs["model_name"] == "gpt-4o-mini"
+
+    async def test_subagent_name_normalized_to_trace_name(self, monkeypatch):
+        """子代理名归一化对齐 lead-agent 命名形状：小写 + 下划线转连字符。"""
+        cases = [
+            ("Deep_Research", "subagent:deep-research"),
+            ("web-fetch", "subagent:web-fetch"),
+            ("Code_Reviewer_V2", "subagent:code-reviewer-v2"),
+        ]
+        for raw, expected in cases:
+            ex = self._make_executor(name=raw)
+            _captured, inject_calls = await self._drive_and_capture(ex, monkeypatch)
+            assert inject_calls[0]["kwargs"]["assistant_id"] == expected, f"name={raw!r}"
+
+    async def test_empty_name_falls_back_to_subagent(self, monkeypatch):
+        """config.name 为空 → assistant_id 退到 'subagent'（不带冒号后缀）。"""
+        ex = self._make_executor(name="")
+        _captured, inject_calls = await self._drive_and_capture(ex, monkeypatch)
+        assert inject_calls[0]["kwargs"]["assistant_id"] == "subagent"
+
+    async def test_environment_tag_from_deer_flow_env(self, monkeypatch):
+        """environment 经 DEER_FLOW_ENV / ENVIRONMENT 解析，传进 inject（→ langfuse_tags）。"""
+        monkeypatch.setenv("DEER_FLOW_ENV", "staging")
+        ex = self._make_executor()
+        _captured, inject_calls = await self._drive_and_capture(ex, monkeypatch)
+        assert inject_calls[0]["kwargs"]["environment"] == "staging"
+
+    async def test_environment_falls_back_to_environment_var(self, monkeypatch):
+        """DEER_FLOW_ENV 未设时回退 ENVIRONMENT。"""
+        monkeypatch.delenv("DEER_FLOW_ENV", raising=False)
+        monkeypatch.setenv("ENVIRONMENT", "prod")
+        ex = self._make_executor()
+        _captured, inject_calls = await self._drive_and_capture(ex, monkeypatch)
+        assert inject_calls[0]["kwargs"]["environment"] == "prod"

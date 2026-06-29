@@ -1,5 +1,20 @@
 # 23. uploads.md — 文件上传 + markitdown 转换（路径安全 + symlink 防御 + soft-load）
 
+> **M23 六维重审（2026-06-28）**：逐文件 diff 最新上游（`uploads/__init__`/`manager`/`conversion` +
+> `agents/middlewares/uploads_middleware` + `config/uploads_config`）。结论：**核心函数逐个对齐，零逻辑漂移**。
+> 关注点核对：**#3311** UploadsMiddleware 扫描经 `run_in_executor` 卸出事件循环（**已含**，且 `run_in_executor`
+> 拷 contextvar、`get_effective_user_id` 得以保留）/ **#2623** 拒 symlink 上传目标 + **#2794** Windows
+> 适配（mini 用 `open_upload_file_no_symlink`/`write_upload_file_no_symlink` + `UnsafeUploadPathError` 显式
+> 封装，**比上游 harness 层更完整**——上游的等价 symlink 防御在 Gateway `app/` 层，不在 harness uploads
+> 模块）/ per-thread 目录布局（`users/{user_id}/threads/{thread_id}/user-data/uploads`，**已含**）/
+> `claim_unique_filename` 重复名 `_N` 改名 / 拒目录输入 / markitdown 转换（`convert_file_to_markdown`，
+> soft-load + 转换 worker 池 `convert_with_pool`，活跃循环里复用单 worker）。
+> **结构性差异（非漂移）**：mini 把转换逻辑放 `uploads/conversion.py`、上游放 `utils/file_conversion.py`
+> （组织选择）；mini 多了 `convert_with_pool`/`make_conversion_pool`（转换 worker 池）+ `*_no_symlink` 封装。
+> **不 port**：上游 `get_uploads_dir`/`ensure_uploads_dir` 加了可选 `user_id` kwarg（**#3579** IM channel
+> owner-scoping——channel worker 经 `_channel_storage_user_id` 透传连接 owner 的 user_id）。mini 无 `app/channels/`
+> （§2.3 设计不 port），HTTP/embedded 调用方用 `get_effective_user_id()` 已正确，故不 port（同 task_tool 用户上下文）。
+
 > **一句话定位**：本模块给 agent 装「文件柜」——用户上传 PDF / PPT / Word / Excel 后，本模块**安全地**
 > 存到 per-user per-thread 隔离的目录，再用 `markitdown` 把这些二进制文档**转成 markdown**（agent 只读
 > 得懂文本），让 agent 能「看懂」用户传来的文件。核心是**安全**：路径穿越防御 + symlink 防御（防沙箱逃逸）。

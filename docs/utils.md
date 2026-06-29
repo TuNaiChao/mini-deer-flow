@@ -1,7 +1,14 @@
 # 4. utils.md — 公共工具（time + messages）
 
 > 对应模块：**M1**（Phase 0，地基）
-> 源码：`backend/packages/harness/deerflow/utils/time.py`、`utils/messages.py`、`utils/__init__.py`
+> 源码：`backend/packages/harness/deerflow/utils/time.py`、`utils/messages.py`、`utils/__init__.py`、`utils/network.py`、`utils/readability.py`
+
+> **Phase 0 全维重审（2026-06-28）**：逐文件 diff 最新上游（`utils/{time,messages,network,readability,file_conversion}.py`），剥 docstring 后判逻辑差。
+> - **`time.py` / `messages.py` 核心 / `network.py`**：**逻辑零漂移**。`time.py` 仅注释中译；`messages.py` 的 `message_content_to_text` + `get_original_user_content_text` 与上游等价；`network.py`（`PortAllocator` 端口分配器）AST 级一致（仅 mini 多一行 `from __future__ import annotations`，无行为差）。
+> - **defer `messages.py::message_to_text`**：上游新增的「整条消息→文本」合并 helper（handles BaseMessage **或** dict-shaped），mini 有 **3 处内联等价实现**（`RunJournal._message_text` / `memory.message_processing.extract_message_text` / `tool_output_budget_middleware._message_text`），合并是跨 M7/M13/M16 三模块的重构（join 语义还略有差异：有的按换行、有的无分隔），非 bug——归后续专项。
+> - **defer `readability.py::Article.to_message` + subprocess 提取器**：上游 `Article.to_message()` 返回多模态 `list[dict]`（按图片 markdown 切分出 `image_url` 块，供视觉模型）；上游提取器走 subprocess 调 node Readability.js（catch `subprocess.CalledProcessError`），mini 走 `from readabilipy import simple_json_from_html_string` + 自有 `_fallback_extract`。两者都能跑、mini 的被 jina_ai/browserless/infoquest community provider 用（`to_markdown()`），多模态 + subprocess 策略属 **M21 community 范畴**（已审），附加特性非 bug。
+> - **`file_conversion.py`**：上游放 `utils/file_conversion.py`，mini 放 `uploads/conversion.py`（M23 已记录的组织选择）。
+> 无需补丁。
 
 ---
 

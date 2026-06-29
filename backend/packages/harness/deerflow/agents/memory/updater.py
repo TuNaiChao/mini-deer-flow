@@ -622,7 +622,12 @@ class MemoryUpdater:
                     continue
                 normalized_content = raw_content.strip()
                 fact_key = _fact_content_key(normalized_content)
-                if fact_key is not None and fact_key in existing_fact_keys:
+                # 空白/纯空白 content（fact_key 为 None）：与已存在 fact 同样跳过（#3719）。
+                # 旧版用 ``fact_key is not None and fact_key in existing`` 合并条件，导致
+                # fact_key is None 时条件为 False、不跳过，空 fact 仍被 append 进记忆。
+                if fact_key is None:
+                    continue
+                if fact_key in existing_fact_keys:
                     continue
 
                 fact_entry = {

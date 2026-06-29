@@ -8,6 +8,15 @@
 （懂了配置系统）再看本篇最省事——自定义 agent 的存储就是「per-user 目录里两份文件」，
 名字校验 + per-user 隔离是它的两个核心约束。
 
+> **M22 全维重审（2026-06-28）**：逐文件 diff 最新上游 `config/agents_config.py`，剥 docstring 后
+> **零逻辑漂移**——差异仅中英注释翻译 + `from __future__ import annotations`。五大关注点 **mini 均已含**：
+> ① **per-user 布局** `users/{user_id}/agents/{agent_name}/{SOUL.md,config.yaml}`；
+> ② **legacy 只读回退** `{base_dir}/agents/{name}/`（兼容旧安装）；③ **#3390 防御** `resolve_agent_dir`
+> 要求 `config.yaml` 才认（防 memory/storage 写残留目录被误当 agent）；④ **AGENT_NAME_PATTERN** 严格
+> 校验（`^[A-Za-z0-9-]+$`，红线 #32，setup/update_agent + memory + client 共用）；⑤ **名称小写归一**
+> （防大小写碰撞）。上游多的 `config/agents_api_config.py` 是 Gateway 专属（§2.3 不 port）。
+> 562 项 hermetic 测试（`test_agents_config.py`：8 类全场景——校验/路径/resolve 三态/load 回退/soul/list 并集/隔离）。
+
 ---
 
 ## 为什么需要自定义 agent（痛点）
@@ -244,7 +253,7 @@ def list_custom_agents(*, user_id: str | None = None) -> list[AgentConfig]: ...
 
 ## 应用方法
 
-### 创建一个自定义 agent（M15 setup_agent 工具，待落地）
+### 创建一个自定义 agent（M15 setup_agent 工具，已落地）
 
 用户在**引导回合**调 `setup_agent`，工具会：
 
@@ -262,12 +271,12 @@ agent_dir.mkdir(parents=True, exist_ok=True)
 (agent_dir / "config.yaml").write_text(yaml.safe_dump(config_dict), encoding="utf-8")
 ```
 
-### 自更新（M15 update_agent 工具，待落地）
+### 自更新（M15 update_agent 工具，已落地）
 
 在**自定义 agent 的普通回合**里调 `update_agent`，工具读现有 config.yaml、部分更新、原子
 写回（temp + rename）。
 
-### lead agent 注入 SOUL（M17 custom-agent 分支，待落地）
+### lead agent 注入 SOUL（M17 custom-agent 分支，已落地）
 
 ```python
 from deerflow.config.agents_config import load_agent_soul, load_agent_config

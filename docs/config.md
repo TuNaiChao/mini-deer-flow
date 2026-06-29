@@ -3,6 +3,17 @@
 > 对应模块：**M0**（Phase 0，地基）
 > 源码：`backend/packages/harness/deerflow/config/`（`app_config.py` + 17 个子配置 + `paths.py` + `reload_boundary.py`）
 
+> **Phase 0 全维重审（2026-06-28）**：逐文件 diff 最新上游，剥 docstring 后判逻辑差。**M0 config**
+> 仅 1 项真实漂移（已补）+ 1 项有意结构选择（沿用）。**补 #3688**：`AppConfig.get_model_config` /
+> `get_tool_config` 旧版是 O(n) 线性扫（`for m in models` / `next(t for t in tools)`），上游已用
+> `PrivateAttr` dict + `_build_name_indexes` model_validator 改 O(1)。这两个 getter 在热路径
+> （`get_tool_config` 每次 community 工具调用跑 2-3 次、`get_model_config` 每次 agent 构建跑数次），
+> 现 port 为 name→config dict 查表，`setdefault` 保重名首条（与旧首匹配语义一致）。详见 §5.7。
+> **沿用 §5.5**：mini 不 port 上游 `checkpointer_config` 等模块级单例层（`get_checkpointer_config` /
+> `ensure_config_loaded` / `load_xxx_from_dict`）——mini 统一从 `app_config` 读（M19 已认定）。
+> 其余子配置（`model_config` / `checkpointer_config` / `database_config` 等）剥 docstring 后**字段与默认
+> 完全等价**（mini 用「属性 + docstring」，上游用 `Field(description=...)`，行为同）。无需补丁。
+
 ---
 
 ## 1. 一句话定位
@@ -201,6 +212,53 @@ deer 给 memory / title / checkpointer 等都配了**模块级单例**（`get_me
 
 `get_app_config()` 每次调用时比较 `config.yaml` 的 mtime 和缓存值，**变了就重新加载**。这让 Gateway 和 LangGraph 的配置读数与 yaml 编辑保持一致，无需手动重启。但 `startup-only` 字段即便重载了也不会真正生效（引擎已建好），需要进程重启——这就是「热重载边界」。
 
+### 5.7 为什么 `get_model_config` / `get_tool_config` 要预建索引？（#3688）
+
+config.yaml 里 `models: [...]` 和 `tools: [...]` 是**列表**，每项有 `name`。代码常需要「按名查某项」——`get_model_config("deepseek-chat")`、`get_tool_config("web_search")`。
+
+**朴素实现是线性扫**（旧版 mini 就是这样）：
+
+```python
+def get_model_config(self, name):
+    for m in self.models:        # 遍历整个 models 列表
+        if m.name == name:
+            return m
+    return None
+```
+
+列表有 N 项就要扫 N 次。问题：这两个 getter 在**热路径**——
+
+- `get_tool_config` 在每个 community 工具（web_search / web_fetch / image_search）**每次调用**时被 `_common.py::get_tool_extras` 读 2-3 次（取 api_key / 超时 / proxy 等额外字段）；
+- `get_model_config` 在每次 agent 构建（`create_chat_model`）+ 每个绑定工具的中间件（`tool_error_handling` / `lead_agent`）都调一次。
+
+一次对话可能触发几十次扫表。models/tools 列表通常很短（几个），单次扫开销可忽略，但**累积起来是纯浪费**——结果每次都一样（config 在两次 reload 间不变）。
+
+**#3688 的修法**：在 `AppConfig` 校验完成后（`@model_validator(mode="after")`），**一次性**把列表预建成 name→config 的 dict：
+
+```python
+@model_validator(mode="after")
+def _build_name_indexes(self):
+    models_by_name = {}
+    for model in self.models:
+        models_by_name.setdefault(model.name, model)   # 重名保留首条
+    self._models_by_name = models_by_name
+    # tools 同理
+    return self
+
+def get_model_config(self, name):
+    ...
+    return self._models_by_name.get(name)   # O(1) dict 查
+```
+
+几个关键设计点：
+
+- **`PrivateAttr`**：索引是 `_models_by_name: dict = PrivateAttr(...)`。pydantic 的 `PrivateAttr` 让它**不参与序列化**（`model_dump()` 里不出现）——它是派生缓存，不是配置数据，不该被 dump 出来再 load 回去。
+- **`setdefault` 保首条**：如果用户在 yaml 里写了两个同名 model，`setdefault` 保留**先出现**的那个——与旧 `for` 循环的「首匹配」语义完全一致，不会因为换实现而改变行为。
+- **model_validator `after`**：在所有字段校验通过后才建表，保证读到的 `self.models` / `self.tools` 是已规整过的（`None` 已被 §5.3 归一成 `[]`）。
+- **reload 自动刷新**：`get_app_config()` 检测到 yaml 变了会**新构一个 `AppConfig`**，新实例的 `_build_name_indexes` 重新跑，索引自然刷新——旧实例的索引不会污染新实例（见 `test_fresh_config_does_not_inherit_stale_index`）。
+
+> 这是「**用空间换时间**」的经典优化：多用一个 dict 的内存（几条记录），换掉热路径上的重复线性扫。对教学版而言，它还示范了 pydantic 的 `PrivateAttr` + `model_validator(after)` 这对常见组合「**校验后派生私有状态**」。
+
 ---
 
 ## 6. 文件结构
@@ -249,7 +307,8 @@ class AppConfig(BaseModel):
     stream_bridge: StreamBridgeConfig | None = None
     # ... 其余子配置
 
-    def get_model_config(self, name: str | None) -> ModelConfig | None
+    def get_model_config(self, name: str | None) -> ModelConfig | None   # #3688：O(1) dict 查（name=None→首个）
+    def get_tool_config(self, name: str) -> dict[str, Any] | None        # #3688：O(1) dict 查
 
 def get_app_config() -> AppConfig        # 单例 + mtime 热重载
 def reload_config() -> AppConfig         # 强制重载

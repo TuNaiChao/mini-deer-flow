@@ -4,6 +4,15 @@
 > 配套测试：[test/test_stream_bridge.py](../test/test_stream_bridge.py)
 > 本文面向「刚接触 SSE / 流式 / 生产者-消费者的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐文件 diff `stream_bridge/{base,memory,async_provider,__init__}.py`
+> vs 最新上游（剥 docstring 后判逻辑差）。M18 已 port 的 **#3700**（SSE resume offset O(1)：
+> `_resolve_start_offset` 由线性扫缓冲改 `_parse_event_seq` 解析事件 id `{ts}-{seq}` 内嵌的
+> per-run seq 算术定位，算出 index 仍核验 id，外来/畸形/过期回退最早——行为同旧扫）经核对
+> **与上游一致**。`base.py` 与上游 AST 级零漂移；`memory.py` 仅 import 风格（相对 vs 绝对）；
+> `async_provider.py` 是 M19 记过的有意结构选择（mini `get_app_config().stream_bridge` 直读 vs
+> 上游 `get_stream_bridge_config()` 包装）+ Redis 未实现的提示文案。无需补丁。本模块的
+> resume O(1) 设计原理见下方「重连补播」相关小节。
+
 ---
 
 ## 1. 一句话定位
@@ -89,11 +98,18 @@ SSE 协议自带重连：连接断开后，浏览器自动重连，并在请求�
 
 测试 `test_subscriber_fell_behind_resumes_from_start_offset` 锁住这个：订阅者读完一条后，洪水发布把窗口推过它的 offset，验证它从新 start_offset 恢复、丢失的不补。
 
-### 4.4 Last-Event-ID 解析（`_resolve_start_offset`）
+### 4.4 Last-Event-ID 解析（`_resolve_start_offset`，#3700 O(1)）
 
-`subscribe(last_event_id)` 时：
-- 在 `events` 里找 `last_event_id`，找到 → 从它的**下一条**起（`start_offset + index + 1`）。不重复。
-- 找不到（被淘汰 / 不存在）→ 从 `start_offset`（最早保留）起，打警告。这是「尽力补播」——保不了精确，至少不丢当前窗口的。
+`subscribe(last_event_id)` 时要算出「从缓冲的第几条开始吐」。两种解法：
+
+- **旧（线性扫，O(n)）**：`for index, entry in enumerate(events): if entry.id == last_event_id: ...`——每次重连都扫整个缓冲。
+- **现（#3700 算术，O(1)）**：事件 id 是 `{ts_ms}-{seq}`（§4.6），其中 `seq` 是**该 run 内单调递增的 per-run 序号**，恰好等于这条事件相对于 run 起点的**绝对 offset**。所以 `_parse_event_seq(last_event_id)` 直接把 id 里的 seq 抠出来，`local_index = seq - start_offset` 就定位到缓冲里的位置——不必扫。
+
+算出 `local_index` 后**仍核验** `events[local_index].id == last_event_id`：
+- id 是本 run 自己产的、且在窗口内 → 核验通过，从下一条起（`local_index + 1`），不重复。
+- 核验不符（外来 id / 畸形 id / seq 在窗口之外已被淘汰）→ 回退到 `start_offset`（最早保留），打警告。
+
+这是「尽力补播」——窗口已淘汰的精确位置保不住，至少不丢当前窗口的。核验这一步是关键：纯算术定位如果碰到一个「恰好 plausible」的外来 seq，会从错误位置开始吐；核验保证只有真本 run 的事件 id 才被当 resume 锚点。
 
 ### 4.5 END 哨兵 + 心跳哨兵
 

@@ -8,6 +8,14 @@
 最省事——本篇是它们的「组装说明书」。对应的代码是
 [runtime/lifespan.py](../backend/packages/harness/deerflow/runtime/lifespan.py)。
 
+> **集成 全维重审（2026-06-28）**：本篇对应 mini 的 [runtime/lifespan.py](../backend/packages/harness/deerflow/runtime/lifespan.py)
+> （`runtime_lifespan` + `RuntimeBundle`）。上游 deer-flow **没有对应的独立 lifespan 文件**——它的装配
+> 逻辑散在 Gateway 的 `app/` 层（FastAPI `lifespan` 里直接建 checkpointer / store / run_manager）。
+> mini 没有 Gateway，故把装配抽成框架级 `runtime_lifespan`（CLI / 测试 / 未来 Gateway 复用）——这是
+> **有意的结构差异，非漂移**。逐项核对装配顺序（engine → checkpointer/store/stream_bridge 并行 →
+> run_store/event_store/thread_store → RunManager + reconcile）与关停顺序（先 `shutdown()` drain 再关
+> checkpointer，红线 #6/#3373）：**与上游 Gateway 装配的语义一致**。本篇无需补丁。
+
 ---
 
 ## 0. mini 的整体架构

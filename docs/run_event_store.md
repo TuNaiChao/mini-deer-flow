@@ -4,6 +4,14 @@
 > 配套测试：[test/test_events.py](../test/test_events.py)
 > 本文面向「刚接触事件流 / 分页 / 并发的小白」。每个名词第一次出现都会解释。
 
+> **Phase 1 全维重审（2026-06-29）**：逐文件 diff `events/store/{base,memory,jsonl,db}.py` +
+> `events/__init__.py` vs 最新上游（剥 docstring 后判逻辑差）。补 **1 项性能对齐 #3686**——
+> `MemoryRunEventStore` 加 run 分桶投影 `_events_by_run` / `_messages_by_run`，让单次 run 维度的读
+> （`list_events` / `list_messages_by_run`）由「扫整个 thread 的事件日志」O(该 thread 的事件数)
+> 降为 O(该 run 的事件数)。详见 §4.8。`base.py` / `jsonl.py` 与上游 AST 级零漂移；`db.py` 仅变量名
+> 重命名（cosmetic）；`events/__init__.py` 的 `make_run_event_store` 工厂是 mini 本地的装配便利
+> （上游装配散在 lifespan，mini 集中在此），非漂移。
+
 ---
 
 ## 1. 一句话定位
@@ -121,9 +129,21 @@ db 后端写时从 contextvar 软读 user_id（`_user_id_from_context`），stam
 
 后台 worker 写时 contextvar 未设 → stamp `None`（不加过滤）。HTTP 请求写时鉴权中间件已设 contextvar → 自动 stamp。
 
-### 4.8 message 投影（memory 后端优化）
+### 4.8 message 投影 + run 分桶投影（memory 后端优化）
 
-memory 后端除了 `_events`（全量），还维护 `_messages`（仅 message 的投影，同 dict 对象、按 seq 排序）。这样 `list_messages` 分页用 `bisect` 做 O(log m + page)——否则每次分页都要全扫所有事件（含大量 trace）。jsonl/db 后端靠查询条件过滤，不需要这个投影。
+memory 后端维护**两组投影**，都是「同一个 dict 对象、无拷贝」，让热路径读不必每次重扫全量事件：
+
+1. **thread 级 `_messages`**：除了 `_events`（全量），还维护 `_messages`（仅 category=message 的投影，按 seq 排序）。这样 `list_messages` 分页用 `bisect` 做 O(log m + page)——否则每次分页都要全扫所有事件（含大量 trace）。jsonl/db 后端靠查询条件过滤，不需要这个投影。
+
+2. **run 级 `_events_by_run` / `_messages_by_run`**（**#3686**）：thread 级投影只优化了「取整个 thread 的消息」。但前端还有两个**按单次 run** 读的端点——`list_events(thread_id, run_id)` 和 `list_messages_by_run(thread_id, run_id)`：一个 thread 可能累积**成百上千个 run**的事件，但这两个端点每次只关心**其中一个 run**。没有 run 分桶投影时，它们每次都要 `for e in self._events[thread_id]: if e["run_id"] == run_id` 扫一遍整个 thread 的事件日志——O(该 thread 的总事件数)，而该 run 可能只握着寥寥几条。
+
+   `#3686` 的修法：在 `_put_one` 往 `_events` / `_messages` append 的同时，也往 `_events_by_run[thread_id][run_id]` / `_messages_by_run[thread_id][run_id]` append（**同一个 dict 对象**，不拷贝）。于是：
+   - `list_events` → 直接取 `_events_by_run[thread_id].get(run_id, [])`，只触碰该 run 的事件；
+   - `list_messages_by_run` → 在 `_messages_by_run[thread_id][run_id]`（按 seq 排序）上用 `bisect` 定位游标窗口，O(log m_run + page)。
+
+   这是 thread 级 `_messages` 投影在 **run 维度**的对应物。`delete_by_run` / `delete_by_thread` 都同步从两个投影里清掉对应条目（保持 lockstep）。
+
+   > **为什么语义没变**：投影里存的是**原始 dict 对象本身**（不是拷贝），所以「按 run 过滤后再切片」和「先分桶再切片」产出完全一样的列表。这份等价性由一个 **brute-force 等价性测试**钉死（`test_events.py::TestRunEventStoreByRunIndex`）：它跑一组两个 run 交错的 trace（让每个 run 的 message seq 不连续，逼 bisect 处理间隙），然后对所有 `(run, limit, before_seq, after_seq)` 组合，断言索引实现 == 「全 thread 扫」参考实现的输出。优化再也不能悄悄偏离旧语义。
 
 ### 4.9 jsonl 单进程限制
 

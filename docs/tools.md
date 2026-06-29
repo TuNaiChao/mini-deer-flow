@@ -1,5 +1,12 @@
 # 22. tools.md — 工具系统（9 内置工具 + 五类来源 + 去重 + 条件加载）
 
+> **M15 全维重审（2026-06-27）**：15 文件逐个 diff 最新上游——确认 #1803（name 去重）/ #24（soft-load）/
+> tool_search 延迟装配 fail-closed / host-bash 过滤 / view_image vision 门控 **mini 均已含**（差异几乎全是中英
+> docstring）。补 **2 项对齐**：① `present_files` 移植上游重写（单文件 → **多文件** + 路径归一化 + **穿越校验**
+> + `ToolMessage` 反馈）+ 新增 `Paths.resolve_virtual_path`；② `sync.py` 修正 `functools.partial` 调用（旧版
+> `inner=coro.func` 丢绑定参数，改为直接 `coro(*args)`）。**#2676/#3665 task_tool 用户上下文**（`user_role`/
+> `oauth_provider`/`oauth_id`）属 Gateway auth、设计上不 port（同 M11 结论）。详见 [todo.md](todo.md) §3.1-B。
+
 > **一句话定位**：本模块是 agent「能做什么」的总装车间——把来自**五个来源**的工具（配置定义 / 内置 /
 > MCP / ACP / community）汇总、去重、按条件绑定，喂给 LangGraph agent。`get_available_tools()` 是
 > 所有工具的统一入口，被 lead agent factory（M17）调用。
@@ -43,7 +50,7 @@ config acp_agents   ──soft-load acp──→       ACP 工具
 
 | 工具 | 作用 | 绑定条件 | 依赖 |
 |------|------|----------|------|
-| `present_files` | 把 `/mnt/user-data/outputs` 下的文件展示给用户 | **始终** | — |
+| `present_files` | 把 `/mnt/user-data/outputs` 下的文件（**多文件**，路径经归一化 + 穿越校验）展示给用户 | **始终** | config/paths |
 | `ask_clarification` | 请求用户澄清（被 ClarificationMiddleware 中断） | **始终** | — |
 | `view_image` | 读图片成 base64 注入状态（vision 模型看图） | `supports_vision=True` | models |
 | `task` | 委派任务给子代理（后台执行 + 5s 轮询 + SSE） | `subagent_enabled=True` | subagents（M11） |
@@ -200,7 +207,7 @@ tools/
 ├── skill_manage_tool.py         # skill_manage（agent 自管理技能，仅 skill_evolution.enabled）
 └── builtins/
     ├── __init__.py              # 导出 9 工具
-    ├── present_file_tool.py     # present_files（始终）
+    ├── present_file_tool.py     # present_files（始终；M15 多文件 + 路径归一化 + 穿越校验）
     ├── clarification_tool.py    # ask_clarification（始终，占位；真正中断 ClarificationMiddleware）
     ├── view_image_tool.py       # view_image（仅 supports_vision；路径白名单+魔数+20MB）
     ├── task_tool.py             # task（仅 subagent_enabled；后台执行+轮询+SSE+token 缓存）
@@ -209,6 +216,36 @@ tools/
     ├── update_agent_tool.py     # update_agent（仅 agent_name 非 bootstrap；M17 绑）
     └── invoke_acp_agent_tool.py # invoke_acp_agent（soft-load acp；per-thread 工作区 + MCP servers 透传）
 ```
+
+### 逐文件：为什么这么拆
+
+- **`tools.py`** — 装配车间本体（`get_available_tools`）。**为什么单独**：装配逻辑（五来源汇总 + 去重 +
+  host-bash + 条件 + MCP tag）是独立于「单个工具实现」的编排关注点，单独成文件便于在加新来源时只改这一处。
+- **`mcp_metadata.py`** — MCP 工具的来源标记（`tag_mcp_tool` / `is_mcp_tool` + `MCP_TOOL_METADATA_KEY` 常量）。
+  **为什么单独**：标记 key 是 `tools.py`（打标）、`tool_search`（识别延迟）、agent factory 共享的**单一真相源**，
+  独立成模块避免三处各定义一份常量造成漂移。
+- **`sync.py`** — 异步工具的同步包装（`make_sync_tool_wrapper` + `_get_runnable_config_param`）。**为什么单独**：
+  同步/异步桥接是与工具语义无关的**横切机制**（被 `tools.py`、`mcp/tools.py`、`skill_manage_tool.py` 三处复用），
+  单独成文件便于在 LangChain 升级时只改这一处。
+- **`types.py`** — `Runtime = ToolRuntime[dict[str, Any], ThreadState]` 类型别名。**为什么单独**：所有需要
+  `runtime` 注入的工具都 import 它；用具体类型（而非无界 TypeVar）避免 LangChain `model_dump()` 时的
+  PydanticSerializationUnexpectedValue 警告。
+- **`skill_manage_tool.py`** — `skill_manage` 工具（仅 `skill_evolution.enabled`）。**为什么单独**：它是最大的
+  单工具（create/patch/edit/delete/write_file/remove_file + 安全扫描 + per-skill 锁），独立成文件避免 `builtins/`
+  里与短工具混在一起难维护。
+- **`builtins/__init__.py`** — 9 内置工具的聚合导出。**为什么单独**：定义外部 import 面，并集中各工具的条件
+  绑定顺序。
+- **`builtins/present_file_tool.py`** — `present_files`（M15 重写：多文件 + `_normalize_presented_filepath`
+  + `_get_thread_id` 三级回退）。**为什么单独**：路径归一化 + 穿越校验逻辑自成一域，且依赖 `Paths.resolve_virtual_path`。
+- **`builtins/tool_search.py`** — `tool_search` 工具 + `DeferredToolCatalog`（不可变目录，纯搜索）+
+  `assemble_deferred_tools`（fail-closed 装配）+ prompt 段渲染。**为什么单独**：延迟装配是一套独立机制
+  （catalog / setup / fail-closed / hash-scoped promote），单独成文件便于在 agent factory 与 subagent 两处复用。
+- **`builtins/task_tool.py`** — `task` 工具（后台执行 + 轮询 + SSE + 延迟清理）。**为什么单独**：子代理委派是
+  最复杂的工具（线程池提交 + 5s 轮询 + 状态盖戳 + token 回灌），独立成文件；详见 [subagents.md](subagents.md)。
+- **`builtins/view_image_tool.py`** / **`setup_agent_tool.py`** / **`update_agent_tool.py`** /
+  **`invoke_acp_agent_tool.py`** / **`clarification_tool.py.py`** — 各自一个独立工具。
+  **为什么单独**：每个工具有独立的绑定条件 + 依赖（vision / bootstrap / agent_name / acp / 中断），
+  一工具一文件便于单独测试与按条件挂载。
 
 ---
 
@@ -292,6 +329,33 @@ lead agent factory（M17）按 `runtime.context` 动态绑定，不走 `get_avai
 ACP 依赖 `agent-client-protocol` 包，多数部署不装。soft-load（模块顶层不 import，函数内 try/except）
 让工具能构造（描述列出配置的 agent），真正调用才检测；缺包返可操作安装提示。其它工具不受影响。
 
+### `present_files` 多文件 + 路径归一化（M15 对齐上游）
+
+旧版 `present_files` 只收**单文件**、仅做 `startswith("/mnt/user-data/outputs")` 前缀检查——会被
+`/mnt/user-data/outputs/../../etc/passwd` 这类路径骗过。M15 对齐上游重写：
+
+1. **多文件**：签名改为 `filepaths: list[str]`，一次展示多个相关文件（`merge_artifacts` reducer 去重合并）。
+2. **路径归一化**（`_normalize_presented_filepath`）：每条路径先解析到**物理宿主路径**，再强制落在当前
+   线程的 `thread_data.outputs_path` 之下，最后回写规范虚拟路径 `/mnt/user-data/outputs/<相对>`。接受两种
+   输入——虚拟沙箱路径（agent 视角）或宿主侧绝对路径。
+3. **穿越校验**：虚拟路径经新加的 [`Paths.resolve_virtual_path`](../backend/packages/harness/deerflow/config/paths.py)
+   解析，该方法用 `actual.relative_to(base)` 挡 `..` 穿越、用段边界匹配挡 `mnt/user-dataX` 前缀混淆。
+4. **失败不抛**：路径不合法时返回 `ToolMessage` 报错（不中断 run），成功也回一条 `ToolMessage`——与
+   `view_image` / `tool_search` 的反馈风格一致。`tool_call_id` 经 `InjectedToolCallId` 注入。
+
+> `resolve_virtual_path(thread_id, virtual_path, *, user_id)` 是 M15 在 `Paths` 上新增的路径原语——把
+> 沙箱虚拟路径翻译成宿主物理路径（含穿越校验）。与上游同名方法的差异：mini 的 `thread_user_data_dir`
+> 把 `user_id` 放首位且必传（上游 `sandbox_user_data_dir` 是 `user_id=None` 可选），故本方法 `user_id`
+> 亦为必传 keyword。
+
+### `sync.py`：partial 调用对齐（M15）
+
+`make_sync_tool_wrapper` 把异步工具协程包成同步函数。旧版有句 `inner = coro.func if
+isinstance(coro, functools.partial) else coro` 再调 `inner(*args)`——若 `coro` 是 `functools.partial`，
+取 `.func` 调用会**丢掉 partial 已绑定的参数**（潜在 bug）。M15 改为直接 `coro(*args, **kwargs)`：
+partial 的 `__call__` 会正确合并已绑定参数 + 本次参数（对齐上游）。当前调用方虽不传 partial（都是裸
+协程 / 方法），此修正是消除潜在 bug + 对齐上游的清理。
+
 ---
 
 ## 与其它模块的关系
@@ -349,6 +413,15 @@ A：正常。它们由 lead_agent factory（M17）按运行时上下文绑定：
 
 **Q：view_image 为什么有时有有时没有？**
 A：仅 `supports_vision=True` 的模型才绑。换非 vision 模型时 view_image 自动消失（条件加载）。
+
+**Q：present_files 报 "Only files in /mnt/user-data/outputs can be presented"？**
+A：M15 起 `present_files` 收**路径列表**（`filepaths=[...]`，不再是单个 `filepath`），且每条路径会归一化 +
+校验落在当前线程的 `outputs` 目录之下。把文件先写到 `/mnt/user-data/outputs/`（沙箱内视角）再展示；
+传 `/mnt/user-data/outputs/../../etc/passwd` 这类穿越路径或非 outputs 文件会被拒（返回错误 ToolMessage，不中断 run）。
+
+**Q：present_files 收虚拟路径还是宿主路径？**
+A：都行。`_normalize_presented_filepath` 同时接受沙箱虚拟路径（`/mnt/user-data/outputs/x.md`）和宿主侧
+绝对路径，都解析到物理路径、校验在 `outputs` 下、回写成规范虚拟路径写进 artifacts。
 
 **Q：invoke_acp_agent 调用报 "not installed"？**
 A：`agent-client-protocol` 包没装。`pip install agent-client-protocol`。ACP 是可选能力，不装不影响其它工具。

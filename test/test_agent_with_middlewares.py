@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from deerflow.agents import create_deerflow_agent
 from deerflow.agents import factory as factory_module
+from deerflow.agents.features import RuntimeFeatures
 from deerflow.agents.middlewares import build_middlewares
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
+from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
 from deerflow.config import AppConfig
+from deerflow.config.token_budget_config import TokenBudgetConfig
 
 
 def test_create_deerflow_agent_accepts_real_middleware_chain(monkeypatch):
@@ -48,3 +51,41 @@ def test_create_deerflow_agent_default_features_chain_endsWith_clarification(mon
     create_deerflow_agent(model=object())
 
     assert isinstance(captured["middleware"][-1], ClarificationMiddleware)
+
+
+def test_features_token_budget_true_inserts_middleware_before_clarification(monkeypatch):
+    """SDK 路径 RuntimeFeatures(token_budget=True) → TokenBudgetMiddleware 进链且在 Clarification 之前。
+
+    对齐 lead 路径（M16 步骤 #23）——SDK ``create_deerflow_agent`` 也支持 token_budget feature
+    （M17 全维重审补的半挂：此前 features.py 缺字段、factory.py 缺步骤 [13]）。
+    """
+    captured = {}
+    monkeypatch.setattr(factory_module, "create_agent", lambda **k: captured.update(k) or "g")
+
+    create_deerflow_agent(model=object(), features=RuntimeFeatures(token_budget=True))
+
+    names = [type(m).__name__ for m in captured["middleware"]]
+    assert "TokenBudgetMiddleware" in names
+    assert names.index("TokenBudgetMiddleware") < names.index("ClarificationMiddleware")
+
+
+def test_features_token_budget_default_false_omits_middleware(monkeypatch):
+    """默认 token_budget=False → 链里没有 TokenBudgetMiddleware（不误装）。"""
+    captured = {}
+    monkeypatch.setattr(factory_module, "create_agent", lambda **k: captured.update(k) or "g")
+
+    create_deerflow_agent(model=object(), features=RuntimeFeatures())
+
+    names = [type(m).__name__ for m in captured["middleware"]]
+    assert "TokenBudgetMiddleware" not in names
+
+
+def test_features_token_budget_custom_instance_used(monkeypatch):
+    """token_budget 传自定义 AgentMiddleware 实例 → 直接用，不构内置默认。"""
+    captured = {}
+    monkeypatch.setattr(factory_module, "create_agent", lambda **k: captured.update(k) or "g")
+
+    custom = TokenBudgetMiddleware.from_config(TokenBudgetConfig())
+    create_deerflow_agent(model=object(), features=RuntimeFeatures(token_budget=custom))
+
+    assert custom in captured["middleware"]
