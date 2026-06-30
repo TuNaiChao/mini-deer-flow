@@ -289,21 +289,126 @@ def _coerce_confidence(value: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, confidence))
 
 
-def format_memory_for_injection(memory_data: dict[str, Any], max_tokens: int = 2000, *, use_tiktoken: bool = True) -> str:
+def _format_fact_line(fact: dict[str, Any]) -> str | None:
+    """构造单条格式化 fact 行；无效 fact 返回 ``None``。
+
+    抽成共享 helper，让 guaranteed 注入路径与常规注入路径产出完全一致的行格式。
+    """
+    content_value = fact.get("content")
+    if not isinstance(content_value, str):
+        return None
+    content = content_value.strip()
+    if not content:
+        return None
+    category = str(fact.get("category", "context")).strip() or "context"
+    confidence = _coerce_confidence(fact.get("confidence"), default=0.0)
+    source_error = fact.get("sourceError")
+    if category == "correction" and isinstance(source_error, str) and source_error.strip():
+        return f"- [{category} | {confidence:.2f}] {content} (avoid: {source_error.strip()})"
+    return f"- [{category} | {confidence:.2f}] {content}"
+
+
+def _select_fact_lines(
+    ranked_facts: list[dict[str, Any]],
+    *,
+    token_budget: int,
+    use_tiktoken: bool,
+) -> tuple[list[str], int]:
+    """在「仅行」token 预算内贪心选格式化 fact 行。
+
+    本函数故意**与 header 无关**：只算 fact 行本身（含行间 ``\\n`` 分隔符）。调用方负责
+    在调用前为 ``"Facts:\\n"`` header 与任何跨段 ``"\\n\\n"`` 分隔符预留 token，把剩余容量
+    作为 *token_budget* 传入。
+
+    在第一条会超预算的 fact 处停下，严格保留调用方的预排序（通常按置信度降序）：更短、
+    更低秩的 fact 绝不会溜到一个被跳过的更高秩 fact 前面。
+
+    Returns:
+        ``(selected_lines, consumed_tokens)``——*consumed_tokens* 是返回行的精确 token 成本
+        （含行间 ``\\n``，但不含前导 header）。
+    """
+    lines: list[str] = []
+    consumed = 0
+    for fact in ranked_facts:
+        formatted = _format_fact_line(fact)
+        if formatted is None:
+            continue
+        line_text = ("\n" + formatted) if lines else formatted
+        line_tokens = _count_tokens(line_text, use_tiktoken=use_tiktoken)
+        if consumed + line_tokens > token_budget:
+            break
+        lines.append(formatted)
+        consumed += line_tokens
+    return lines, consumed
+
+
+def _fallback_format_facts(
+    valid_facts: list[dict[str, Any]],
+    *,
+    preceding_section_cost: int,
+    max_tokens: int,
+    use_tiktoken: bool,
+) -> tuple[str, list[str]] | tuple[None, None]:
+    """主路径抛异常时用的「仅按置信度排序」回退。
+
+    返回 ``(section_text, fact_lines)``：``section_text`` 是格式化好的 ``"Facts:\\n..."`` 段
+    （不含前导跨段分隔符——那归调用方），``fact_lines`` 是组成 facts 块的各行。无 fact 存活时
+    两者都为 ``None``。
+
+    单独返回行让调用方能在结构感知截断里追踪它们，使回退 fact 享受与主路径 fact 相同的
+    「受保护后缀」待遇。
+
+    *valid_facts* 是主路径已建好的、过滤好的 fact 列表（回退不重做校验）；
+    *preceding_section_cost* 是 user-context / history 段已耗 token（用来推剩余预算）。
+    """
+    ranked = sorted(valid_facts, key=lambda f: _coerce_confidence(f.get("confidence"), default=0.0), reverse=True)
+
+    header = "Facts:\n"
+    overhead = _count_tokens(header, use_tiktoken=use_tiktoken)
+    line_budget = max_tokens - preceding_section_cost - overhead
+    if line_budget <= 0:
+        return None, None
+
+    lines, _ = _select_fact_lines(ranked, token_budget=line_budget, use_tiktoken=use_tiktoken)
+    if not lines:
+        return None, None
+    return header + "\n".join(lines), lines
+
+
+def format_memory_for_injection(
+    memory_data: dict[str, Any],
+    max_tokens: int = 2000,
+    *,
+    use_tiktoken: bool = True,
+    guaranteed_categories: list[str] | None = None,
+    guaranteed_token_budget: int = 500,
+) -> str:
     """把记忆数据格式化成系统提示注入串。
 
-    按 token 预算（tiktoken 精确计 / char 估算）截断：先放 user/history 段，facts 按置信度
-    降序逐条加直到预算耗尽。超预算时按 token/字符比例截断尾部加 ``...``。
+    按 token 预算（tiktoken 精确计 / char 估算）截断：先放 user/history 段，facts 按 guaranteed
+    → 常规两阶段选（#3592）。超预算时用**结构感知**截断——Facts 块作为受保护后缀，只截前面的段。
 
     Args:
         memory_data: 记忆数据字典。
         max_tokens: 最大 token 数。
         use_tiktoken: ``False`` 时全用无网络字符估算（见 ``memory.token_counting``）。
+        guaranteed_categories: 无论常规预算多紧都必须注入的 fact 类别。这些 fact 从独立的
+            *guaranteed_token_budget* 分配。``None`` / 空时所有 fact 竞争同一预算（旧行为）。
+        guaranteed_token_budget: guaranteed 段的 token 上限。常见情况下 guaranteed 行在
+            *max_tokens* 内挤占常规行（总输出 ≤ max_tokens）；仅当 guaranteed 行单独顶过
+            *max_tokens* 时预算才叠加——此时安全截断上限抬到 ``max_tokens + guaranteed_actual_usage``
+            以保护它们。*guaranteed_categories* 为 ``None`` / 空时忽略。
     """
     if not memory_data:
         return ""
 
-    sections = []
+    # 显式拒裸字符串：迭代 ``str`` 会产出单字符 frozenset，静默关掉 guarantee 且无告警。
+    # config 层调用方走 Pydantic（强制 ``list[str]``），这里只守公共 helper 入口。
+    if isinstance(guaranteed_categories, str):
+        raise TypeError("guaranteed_categories must be an iterable of strings, not a bare str")
+    effective_guaranteed: frozenset[str] = frozenset(c.strip() for c in guaranteed_categories if isinstance(c, str) and c.strip()) if guaranteed_categories else frozenset()
+
+    sections: list[str] = []
 
     # 格式化 user context
     user_data = memory_data.get("user", {})
@@ -345,64 +450,147 @@ def format_memory_for_injection(memory_data: dict[str, Any], max_tokens: int = 2
         if history_sections:
             sections.append("History:\n" + "\n".join(f"- {s}" for s in history_sections))
 
-    # 格式化 facts（按置信度降序；token 预算允许范围内尽量多放）
+    # ── Facts（#3592 guaranteed 注入）────────────────────────────────────────
+    #
+    # • 最多发一个 ``"Facts:\\n"`` header。
+    # • guaranteed 类别 fact 先从独立的 *guaranteed_token_budget* 选出、放在 Facts 块最前，
+    #   故不会被常规 fact 挤掉。常见情况总输出仍落在 max_tokens 内（guaranteed 行挤占常规行）；
+    #   仅当 guaranteed 行单独顶过 max_tokens 时预算才叠加，安全截断上限相应抬高。
+    # • 常规 fact 只从 *max_tokens* 取。
+    # • 所有 token 计数（header / 分隔符 / 行）都在调用方做；``_select_fact_lines`` 与 header 无关。
+    # • 主路径抛任何异常时，``_fallback_format_facts`` 做一遍仅按置信度排序的回退。
     facts_data = memory_data.get("facts", [])
+    guaranteed_line_tokens = 0  # 后面用来算有效截断上限
+    # 在 try/if 外初始化 facts 块标记，让底部结构感知截断无论有没有 facts、走主路径还是回退，
+    # 都能安全引用（无 facts 时 all_fact_lines 为空、facts_block 为 ""）。
+    facts_header = "Facts:\n"
+    all_fact_lines: list[str] = []
     if isinstance(facts_data, list) and facts_data:
-        ranked_facts = sorted(
-            (f for f in facts_data if isinstance(f, dict) and isinstance(f.get("content"), str) and f.get("content").strip()),
-            key=lambda fact: _coerce_confidence(fact.get("confidence"), default=0.0),
-            reverse=True,
-        )
+        # 进 try 前先过滤好 valid facts，让 except 路径直接把同一列表喂给回退、不重做校验。
+        valid_facts = [f for f in facts_data if isinstance(f, dict) and isinstance(f.get("content"), str) and f.get("content", "").strip()]
 
-        # 已有段落的 token 数算一次，之后逐条增量计入避免全串重算。
+        # 已有段的 token 成本（user context / history）。
         base_text = "\n\n".join(sections)
         base_tokens = _count_tokens(base_text, use_tiktoken=use_tiktoken) if base_text else 0
-        # 计入已有段与 facts 段之间的分隔符。
-        facts_header = "Facts:\n"
-        separator_tokens = _count_tokens("\n\n" + facts_header, use_tiktoken=use_tiktoken) if base_text else _count_tokens(facts_header, use_tiktoken=use_tiktoken)
-        running_tokens = base_tokens + separator_tokens
 
-        fact_lines: list[str] = []
-        for fact in ranked_facts:
-            content_value = fact.get("content")
-            if not isinstance(content_value, str):
-                continue
-            content = content_value.strip()
-            if not content:
-                continue
-            category = str(fact.get("category", "context")).strip() or "context"
-            confidence = _coerce_confidence(fact.get("confidence"), default=0.0)
-            source_error = fact.get("sourceError")
-            if category == "correction" and isinstance(source_error, str) and source_error.strip():
-                line = f"- [{category} | {confidence:.2f}] {content} (avoid: {source_error.strip()})"
+        try:
+            # 用**原始** category 字段（不 ``or "context"`` 默认），免得无类别的 legacy fact
+            # 被静默提升进「operator 配了 guaranteed_categories=["context"]」的 guaranteed 池。
+            # 缺类别 fact 一律落常规路径。
+            def _confidence_key(fact: dict[str, Any]) -> float:
+                return _coerce_confidence(fact.get("confidence"), default=0.0)
+
+            if effective_guaranteed:
+
+                def _category_match(fact: dict[str, Any]) -> bool:
+                    raw = fact.get("category")
+                    if not isinstance(raw, str):
+                        return False
+                    cat = raw.strip()
+                    return bool(cat) and cat in effective_guaranteed
+
+                guaranteed = sorted(
+                    [f for f in valid_facts if _category_match(f)],
+                    key=_confidence_key,
+                    reverse=True,
+                )
+                regular = sorted(
+                    [f for f in valid_facts if not _category_match(f)],
+                    key=_confidence_key,
+                    reverse=True,
+                )
             else:
-                line = f"- [{category} | {confidence:.2f}] {content}"
+                guaranteed = []
+                regular = sorted(valid_facts, key=_confidence_key, reverse=True)
 
-            # 每多一行前面加一个换行（首行除外）。
-            line_text = ("\n" + line) if fact_lines else line
-            line_tokens = _count_tokens(line_text, use_tiktoken=use_tiktoken)
+            # ── 阶段 1：选 guaranteed 行 ──────────────────────────────────
+            header_cost = _count_tokens(facts_header, use_tiktoken=use_tiktoken)
 
-            if running_tokens + line_tokens <= max_tokens:
-                fact_lines.append(line)
-                running_tokens += line_tokens
-            else:
-                break
+            guaranteed_lines: list[str] = []
+            if guaranteed:
+                guaranteed_lines, guaranteed_line_tokens = _select_fact_lines(
+                    guaranteed,
+                    token_budget=guaranteed_token_budget,
+                    use_tiktoken=use_tiktoken,
+                )
 
-        if fact_lines:
-            sections.append("Facts:\n" + "\n".join(fact_lines))
+            # ── 阶段 2：选常规行 ──────────────────────────────────────────
+            # 常规 fact 竞争 *max_tokens*（主预算）。减去已计入的：
+            #   base 段 + 跨段分隔符 + header + guaranteed 行 + 两组之间的 ``\n``（两组都有时）。
+            regular_lines: list[str] = []
+            if regular:
+                inter_group_newline_tokens = _count_tokens("\n", use_tiktoken=use_tiktoken) if guaranteed_lines else 0
+                used_before_regular = base_tokens + header_cost + guaranteed_line_tokens + inter_group_newline_tokens
+                regular_line_budget = max_tokens - used_before_regular
+                if regular_line_budget > 0:
+                    regular_lines, _ = _select_fact_lines(
+                        regular,
+                        token_budget=regular_line_budget,
+                        use_tiktoken=use_tiktoken,
+                    )
+
+            # ── 发一个 "Facts:" 段 ────────────────────────────────────────
+            # 不嵌前导跨段分隔符；最终 ``"\n\n".join(sections)`` 是段间间距的唯一真相，
+            # 防止以前的双 ``\n\n`` bug。
+            all_fact_lines = guaranteed_lines + regular_lines
+            if all_fact_lines:
+                section_text = facts_header + "\n".join(all_fact_lines)
+                sections.append(section_text)
+
+        except Exception:
+            # ── 回退：仅按置信度排序、单一预算 ────────────────────────────
+            # 分区 / guaranteed 路径的任何意外错误都不能让记忆注入整个失败。回退到原始的
+            # 单遍置信度排序。复用预过滤的 ``valid_facts``，不在热回退路径上重做校验。
+            logger.warning(
+                "Memory injection: guaranteed-category path failed, falling back to confidence-only ranking",
+                exc_info=True,
+            )
+            fallback, fallback_lines = _fallback_format_facts(
+                valid_facts,
+                preceding_section_cost=base_tokens,
+                max_tokens=max_tokens,
+                use_tiktoken=use_tiktoken,
+            )
+            if fallback:
+                sections.append(fallback)
+                # 把回退的行暴露给 ``all_fact_lines``，让下面的结构感知截断也把回退 fact 当
+                # 受保护后缀。否则一个大 user-context 前缀可能经原始前缀截断静默裁掉回退 fact。
+                all_fact_lines = fallback_lines
 
     if not sections:
         return ""
 
     result = "\n\n".join(sections)
 
-    # 用 tiktoken 精确计数（或 use_tiktoken=False 时的字符估算）。
     token_count = _count_tokens(result, use_tiktoken=use_tiktoken)
-    if token_count > max_tokens:
-        # 截断到预算内。按 token 比例估算要删的字符数。
-        char_per_token = len(result) / token_count
-        target_chars = int(max_tokens * char_per_token * 0.95)  # 95% 留余量
-        result = result[:target_chars] + "\n..."
+    effective_limit = max_tokens + guaranteed_line_tokens
+    if token_count > effective_limit:
+        # 结构感知截断：``Facts:\n...`` 块当作**受保护后缀**，guaranteed 类别 fact——本 PR
+        # 就是为保住它们——绝不能被溢出时的前缀截断静默丢弃。只有前面的（user-context / history）
+        # 段可截；若它们单独超出「为 Facts 块预留后剩余的预算」，从尾部裁。*guaranteed_line_tokens*
+        # 为 0（未配 guaranteed 或无 fact 存活）时，等式退化为对 ``max_tokens`` 的原始前缀截断，
+        # 向后兼容。
+        facts_block = (facts_header + "\n".join(all_fact_lines)) if all_fact_lines else ""
+        facts_block_tokens = _count_tokens(facts_block, use_tiktoken=use_tiktoken)
+        separator_tokens = _count_tokens("\n\n", use_tiktoken=use_tiktoken)
+        budget_for_non_facts = max(
+            0,
+            effective_limit - facts_block_tokens - (separator_tokens if facts_block else 0),
+        )
+
+        # 从 *sections*（去掉尾部的 Facts 块）构建前面的（非 facts）部分。
+        preceding_sections = sections[:-1] if all_fact_lines else sections
+        preceding = "\n\n".join(preceding_sections)
+
+        if preceding:
+            preceding_tokens = _count_tokens(preceding, use_tiktoken=use_tiktoken)
+            if preceding_tokens > budget_for_non_facts:
+                char_per_token = len(preceding) / max(preceding_tokens, 1)
+                target_chars = int(budget_for_non_facts * char_per_token * 0.95)
+                preceding = preceding[:target_chars].rstrip() + "\n..."
+            result = (preceding + "\n\n" + facts_block) if facts_block else preceding
+        else:
+            result = facts_block
 
     return result
 

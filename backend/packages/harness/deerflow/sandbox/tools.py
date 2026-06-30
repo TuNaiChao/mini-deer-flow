@@ -149,6 +149,59 @@ def _resolve_skills_path(path: str) -> str:
     return _join_path_preserving_style(skills_host, relative)
 
 
+def _get_custom_mounts() -> list:
+    """读 ``config.sandbox.mounts`` 的自定义卷挂载（成功后缓存）。
+
+    host_path 不存在的条目被滤掉（与 ``LocalSandboxProvider._setup_path_mappings`` 一致——
+    不存在的源目录挂不进去）。配置加载失败返空列表**不缓存**，让后续调用能在配置就绪后重试。
+    """
+    cached = getattr(_get_custom_mounts, "_cached", None)
+    if cached is not None:
+        return cached
+    try:
+        from pathlib import Path
+
+        config = get_app_config()
+        mounts = []
+        sandbox_config = getattr(config, "sandbox", None)
+        raw_mounts = getattr(sandbox_config, "mounts", None) if sandbox_config else None
+        if raw_mounts:
+            mounts = [m for m in raw_mounts if Path(m.host_path).exists()]
+        _get_custom_mounts._cached = mounts  # type: ignore[attr-defined]
+        return mounts
+    except Exception:
+        return []
+
+
+def _is_custom_mount_path(path: str) -> bool:
+    """path 是否落在某个自定义挂载的 container_path 下。"""
+    for mount in _get_custom_mounts():
+        if path == mount.container_path or path.startswith(f"{mount.container_path}/"):
+            return True
+    return False
+
+
+def _get_custom_mount_for_path(path: str):
+    """匹配 path 的挂载配置（最长前缀优先）。无匹配返回 None。"""
+    best = None
+    for mount in _get_custom_mounts():
+        if path == mount.container_path or path.startswith(f"{mount.container_path}/"):
+            if best is None or len(mount.container_path) > len(best.container_path):
+                best = mount
+    return best
+
+
+def _resolve_custom_mount_path(path: str) -> str:
+    """把自定义挂载的 container_path 翻成宿主路径。无匹配 raise。"""
+    mount = _get_custom_mount_for_path(path)
+    if mount is None:
+        raise FileNotFoundError(f"Path is not under a custom mount: {path}")
+    if path == mount.container_path:
+        return mount.host_path
+    relative = path[len(mount.container_path) :].lstrip("/")
+    return _join_path_preserving_style(mount.host_path, relative)
+
+
 # ---------------------------------------------------------------------------
 # 路径拼接 / 风格保持
 # ---------------------------------------------------------------------------
@@ -325,6 +378,7 @@ def validate_local_tool_path(path: str, thread_data: ThreadDataState | None, *, 
     允许的虚拟路径族：
       - ``/mnt/user-data/*`` —— 总是允许（读 + 写）。
       - ``/mnt/skills/*``    —— 仅 read_only 时允许。
+      - 自定义卷挂载（``sandbox.mounts``）的 container_path —— 遵循各挂载的 read_only。
 
     Args:
         path: 虚拟路径。
@@ -344,6 +398,13 @@ def validate_local_tool_path(path: str, thread_data: ThreadDataState | None, *, 
     if _is_skills_path(path):
         if not read_only:
             raise PermissionError(f"Write access to skills path is not allowed: {path}")
+        return
+
+    # 自定义卷挂载：遵循各挂载的 read_only 设置（operator 配的可写挂载允许写）。
+    custom_mount = _get_custom_mount_for_path(path)
+    if custom_mount is not None:
+        if not read_only and getattr(custom_mount, "read_only", False):
+            raise PermissionError(f"Write access to read-only custom mount is not allowed: {path}")
         return
 
     if path.startswith(f"{VIRTUAL_PATH_PREFIX}/"):
@@ -380,10 +441,12 @@ def resolve_and_validate_user_data_path(path: str, thread_data: ThreadDataState)
 
 
 def _resolve_local_read_path(path: str, thread_data: ThreadDataState) -> str:
-    """读路径统一解析：skills 优先，否则 user-data。"""
+    """读路径统一解析：skills 优先，其次自定义挂载，否则 user-data。"""
     validate_local_tool_path(path, thread_data, read_only=True)
     if _is_skills_path(path):
         return _resolve_skills_path(path)
+    if _is_custom_mount_path(path):
+        return _resolve_custom_mount_path(path)
     return _resolve_and_validate_user_data_path(path, thread_data)
 
 

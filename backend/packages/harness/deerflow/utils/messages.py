@@ -36,6 +36,47 @@ def message_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def message_to_text(message: Any, *, text_attribute_fallback: bool = False) -> str:
+    """从整条消息（``BaseMessage`` 或 dict 形态）抽取展示文本。
+
+    先从属性（``BaseMessage``）或 mapping 键（``run_events`` 行是 dict）取 ``content``，
+    再遍历混合的 ``content`` 形态：纯字符串；字符串 / ``{"text": ...}`` / 嵌套
+    ``{"content": ...}`` 块的列表（**无分隔符**拼接）；或带 ``text``/``content`` 键的 mapping。
+    传 ``text_attribute_fallback=True`` 时，content 抽不出就回退到 ``message.text``
+    （对齐旧 ``RunJournal._message_text``）。
+
+    与 :func:`message_content_to_text`（吃原始 ``content``、列表块用换行拼）不同——本函数
+    保留无分隔符拼接与更宽的形态处理，是多个调用点各自重写的「整条消息→文本」逻辑的合并。
+    """
+    content = message.get("content") if isinstance(message, Mapping) else getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                else:
+                    nested = block.get("content")
+                    if isinstance(nested, str):
+                        parts.append(nested)
+        return "".join(parts)
+    if isinstance(content, Mapping):
+        for key in ("text", "content"):
+            value = content.get(key)
+            if isinstance(value, str):
+                return value
+    if text_attribute_fallback:
+        text = getattr(message, "text", None)
+        if isinstance(text, str):
+            return text
+    return ""
+
+
 def get_original_user_content_text(content: Any, additional_kwargs: Mapping[str, Any] | None) -> str:
     """优先返回中间件介入前的原始用户文本，否则返回 content 抽取的文本。
 

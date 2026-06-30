@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +76,12 @@ def _fallback_extract(html: str) -> tuple[str, str]:
 class Article:
     """从 HTML 提取出的文章（标题 + 正文 HTML/文本）。对齐 deer Article。"""
 
-    def __init__(self, title: str, html_content: str) -> None:
+    url: str = ""
+
+    def __init__(self, title: str, html_content: str, *, url: str = "") -> None:
         self.title = title
         self.html_content = html_content
+        self.url = url
 
     def to_markdown(self, including_title: bool = True) -> str:
         """转成 markdown。``markdownify`` 可用时把 HTML 转成 markdown；否则直接用正文文本。
@@ -101,6 +106,36 @@ class Article:
 
         return markdown
 
+    def to_message(self) -> list[dict]:
+        """把文章转成多模态 content 块列表（文本 + 图片 URL 交替）。
+
+        对齐 deer ``Article.to_message``：把 ``to_markdown()`` 的输出按 markdown 图片语法
+        （``![alt](url)``）切开——奇数段是图片 URL（用 ``urljoin`` 拼成绝对 URL，发 ``image_url``
+        块），偶数段是文本（发 ``text`` 块）。这样支持视觉的模型能直接看到文章里的图片，
+        而不是只看到 markdown 图片文本。空内容回退 ``[{"type": "text", "text": "No content available"}]``。
+        """
+        image_pattern = r"!\[.*?\]\((.*?)\)"
+
+        markdown = self.to_markdown()
+        if not markdown or not markdown.strip():
+            return [{"type": "text", "text": "No content available"}]
+
+        content: list[dict[str, str]] = []
+        parts = re.split(image_pattern, markdown)
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                # 图片段：相对 URL 用文章自身 URL 拼成绝对。
+                image_url = urljoin(self.url, part.strip())
+                content.append({"type": "image_url", "image_url": {"url": image_url}})
+            else:
+                text_part = part.strip()
+                if text_part:
+                    content.append({"type": "text", "text": text_part})
+
+        if not content:
+            content = [{"type": "text", "text": "No content available"}]
+        return content
+
 
 class ReadabilityExtractor:
     """把 HTML 提取成 ``Article``。
@@ -118,7 +153,26 @@ class ReadabilityExtractor:
             logger.debug("readabilipy not installed; using pure-python fallback extractor")
             title, text = _fallback_extract(html)
             return Article(title=title, html_content=text)
-        except Exception as exc:  # noqa: BLE001 — readabilipy 内部可能抛子进程错误
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            # readabilipy 装了，但 Mozilla Readability.js（经 Node 子进程）失败/缺失——
+            # 回退到 readabilipy 的纯 Python 模式（use_readability=False），质量仍好于本模块的
+            # regex 兜底。再失败才落 _fallback_extract。对齐 deer。
+            stderr = getattr(exc, "stderr", None)
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            stderr_info = f"; stderr={stderr.strip()}" if isinstance(stderr, str) and stderr.strip() else ""
+            logger.warning(
+                "Readability.js extraction failed with %s%s; falling back to pure-Python extraction",
+                type(exc).__name__,
+                stderr_info,
+                exc_info=True,
+            )
+            try:
+                article = simple_json_from_html_string(html, use_readability=False)
+            except Exception:  # noqa: BLE001 — 纯 Python 模式也炸，落 regex 兜底
+                title, text = _fallback_extract(html)
+                return Article(title=title, html_content=text)
+        except Exception as exc:  # noqa: BLE001 — readabilipy 其它内部错误
             stderr = getattr(exc, "stderr", None)
             if isinstance(stderr, bytes):
                 stderr = stderr.decode(errors="replace")
@@ -129,8 +183,6 @@ class ReadabilityExtractor:
                 stderr_info,
                 exc_info=True,
             )
-            # deer 这里回退到 use_readability=False（仍用 readabilipy）；mini 直接走纯 Python 兜底
-            # （readabilipy 本身就缺，二次回退无意义）。
             title, text = _fallback_extract(html)
             return Article(title=title, html_content=text)
 

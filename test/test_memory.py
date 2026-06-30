@@ -407,6 +407,102 @@ class TestFormatMemoryForInjection:
         assert "Personal: kept" in out
 
 
+# ===========================================================================
+# #3592：guaranteed 注入（correction 等 high-value fact 在 token 紧张时保底）
+# ===========================================================================
+
+
+class TestGuaranteedInjection:
+    """#3592：guaranteed_categories 的 fact 从独立预算分配、放 Facts 块最前，绝不被常规 fact 挤掉。"""
+
+    def test_guaranteed_correction_survives_tight_budget(self):
+        """常规预算放不下任何常规 fact 时，correction 仍注入（独立预算）。"""
+        mem = create_empty_memory()
+        # 一条 correction + 一堆高置信常规 fact
+        mem["facts"].append({"content": "use the async path always", "category": "correction", "confidence": 0.5})
+        for i in range(10):
+            mem["facts"].append({"content": f"regular fact {i} " * 20, "category": "context", "confidence": 0.99})
+        out = format_memory_for_injection(
+            mem,
+            max_tokens=80,  # 很紧——常规 fact 几乎放不下
+            use_tiktoken=False,
+            guaranteed_categories=["correction"],
+            guaranteed_token_budget=500,
+        )
+        # correction 存活
+        assert "use the async path always" in out
+        facts_section = out.split("Facts:\n", 1)[1] if "Facts:\n" in out else ""
+        # correction 在 Facts 块**最前**
+        assert facts_section.startswith("- [correction")
+
+    def test_guaranteed_none_falls_back_to_single_budget(self):
+        """guaranteed_categories=None → 所有 fact 竞争同一预算（旧行为，向后兼容）。"""
+        mem = create_empty_memory()
+        mem["facts"].append({"content": "correction fact", "category": "correction", "confidence": 0.3})
+        mem["facts"].append({"content": "regular fact", "category": "context", "confidence": 0.9})
+        out = format_memory_for_injection(mem, use_tiktoken=False, guaranteed_categories=None)
+        # 无 guaranteed 分区 → 按置信度排序，regular 在前
+        facts_section = out.split("Facts:\n", 1)[1]
+        assert facts_section.startswith("- [context")  # 高置信的 regular 在前
+
+    def test_bare_string_guaranteed_categories_raises(self):
+        """裸字符串 guaranteed_categories 显式 raise（否则迭代出单字符 frozenset 静默关掉 guarantee）。"""
+        mem = create_empty_memory()
+        mem["facts"].append({"content": "x", "category": "correction", "confidence": 0.9})
+        with pytest.raises(TypeError, match="iterable of strings"):
+            format_memory_for_injection(mem, use_tiktoken=False, guaranteed_categories="correction")  # type: ignore[arg-type]
+
+    def test_select_fact_lines_strict_break_on_overflow(self):
+        """``_select_fact_lines`` 严格 break-on-overflow：更短的低置信 fact 绝不溜到被跳过的高置信 fact 前。"""
+        from deerflow.agents.memory.prompt import _select_fact_lines
+
+        # 按调用方给的顺序（高置信在前）；第二条超预算被跳过；第三条（更短、更低置信）不能溜进去
+        ranked = [
+            {"content": "short", "category": "context", "confidence": 0.99},
+            {"content": "x" * 200, "category": "context", "confidence": 0.9},  # 超 budget
+            {"content": "tiny", "category": "context", "confidence": 0.1},  # 短，但严格 break 不该进
+        ]
+        lines, _ = _select_fact_lines(ranked, token_budget=50, use_tiktoken=False)
+        # 第一条进，第二条超 budget 触发 break，第三条不进
+        assert len(lines) == 1
+        assert "short" in lines[0]
+        assert "tiny" not in (lines[0] if lines else "")
+
+    def test_category_less_fact_not_promoted_to_guaranteed(self):
+        """缺 category 字段的 fact 不被静默提升进 guaranteed 池（即使 operator 配了 context 为 guaranteed）。"""
+        mem = create_empty_memory()
+        mem["facts"].append({"content": "no category here", "confidence": 0.9})  # 无 category
+        out = format_memory_for_injection(mem, use_tiktoken=False, guaranteed_categories=["context"], guaranteed_token_budget=500)
+        facts_section = out.split("Facts:\n", 1)[1]
+        # 缺 category → 走常规路径（格式化时默认 "context"，但分区时不算 guaranteed）
+        # 它仍在输出里，但不是因为有 category 才进——这条主要锁「不抛错 + 正常输出」
+        assert "no category here" in facts_section
+
+    def test_fallback_on_exception(self, monkeypatch):
+        """主路径抛异常 → 回退到仅按置信度排序（不阻断注入）。"""
+        from deerflow.agents.memory import prompt as prompt_mod
+
+        mem = create_empty_memory()
+        mem["facts"].append({"content": "alpha", "category": "correction", "confidence": 0.9})
+        mem["facts"].append({"content": "beta", "category": "context", "confidence": 0.5})
+
+        # 让 _select_fact_lines 第一次（guaranteed 阶段）抛错，触发 except 回退
+        original = prompt_mod._select_fact_lines
+        calls = {"n": 0}
+
+        def _flaky(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            return original(*a, **kw)
+
+        monkeypatch.setattr(prompt_mod, "_select_fact_lines", _flaky)
+        out = format_memory_for_injection(mem, use_tiktoken=False, guaranteed_categories=["correction"], guaranteed_token_budget=500)
+        # 回退仍注入了 fact（不阻断）
+        assert "Facts:" in out
+        assert "alpha" in out
+
+
 class TestFormatConversationForUpdate:
     def test_strips_upload_blocks(self):
         msgs = [_human("<uploaded_files>[{'name':'a.pdf'}]</uploaded_files>\nreview this")]

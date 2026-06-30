@@ -70,8 +70,9 @@ def home_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture(autouse=True)
 def _reset_sandbox_state():
     """每个测试后重置 provider 单例 + skills 路径缓存，防跨测试污染。"""
-    # 清 skills 路径缓存（tools.py 的 _get_skills_container_path / _get_skills_host_path）。
-    for fn in (tools_module._get_skills_container_path, tools_module._get_skills_host_path):
+    # 清 skills 路径缓存（tools.py 的 _get_skills_container_path / _get_skills_host_path）
+    # + custom mounts 缓存（_get_custom_mounts）。
+    for fn in (tools_module._get_skills_container_path, tools_module._get_skills_host_path, tools_module._get_custom_mounts):
         if hasattr(fn, "_cached"):
             del fn._cached  # type: ignore[attr-defined]
 
@@ -83,7 +84,7 @@ def _reset_sandbox_state():
         reset_sandbox_provider()
     except Exception:
         pass
-    for fn in (tools_module._get_skills_container_path, tools_module._get_skills_host_path):
+    for fn in (tools_module._get_skills_container_path, tools_module._get_skills_host_path, tools_module._get_custom_mounts):
         if hasattr(fn, "_cached"):
             del fn._cached  # type: ignore[attr-defined]
 
@@ -1037,3 +1038,148 @@ def test_uses_local_sandbox_provider_recognizes_module_path(monkeypatch: pytest.
     fake_cfg = SimpleNamespace(sandbox=SimpleNamespace(use="deerflow.sandbox.local.local_sandbox_provider:LocalSandboxProvider"))
     monkeypatch.setattr(security_module, "get_app_config", lambda: fake_cfg)
     assert security_module.uses_local_sandbox_provider() is True
+
+
+# ===========================================================================
+# custom volume mounts（config.sandbox.mounts）—— provider 映射 + tools 解析/校验
+# ===========================================================================
+
+
+def _patch_custom_mounts(monkeypatch, mounts):
+    """把 ``tools_module.get_app_config`` 替成返带 ``sandbox.mounts`` 的假配置。"""
+    fake_sandbox = SimpleNamespace(mounts=mounts, use="deerflow.sandbox.local.local_sandbox_provider:LocalSandboxProvider")
+    fake_skills = SimpleNamespace(container_path="/mnt/skills", get_skills_path=lambda: Path("/nonexistent-skills"))
+    fake_cfg = SimpleNamespace(sandbox=fake_sandbox, skills=fake_skills)
+    monkeypatch.setattr(tools_module, "get_app_config", lambda: fake_cfg)
+    # 清缓存让新配置生效
+    if hasattr(tools_module._get_custom_mounts, "_cached"):
+        del tools_module._get_custom_mounts._cached
+
+
+class TestCustomMounts:
+    """``config.sandbox.mounts`` 的自定义卷挂载：provider 建 PathMapping + tools 解析/校验。"""
+
+    def test_get_custom_mounts_filters_nonexistent_host(self, monkeypatch, tmp_path):
+        existing = tmp_path / "data"
+        existing.mkdir()
+        _patch_custom_mounts(
+            monkeypatch,
+            [
+                SimpleNamespace(host_path=str(existing), container_path="/data/shared", read_only=False),
+                SimpleNamespace(host_path=str(tmp_path / "missing"), container_path="/data/missing", read_only=False),
+            ],
+        )
+        mounts = tools_module._get_custom_mounts()
+        containers = [m.container_path for m in mounts]
+        assert "/data/shared" in containers
+        assert "/data/missing" not in containers  # 不存在的 host_path 被滤掉
+
+    def test_is_custom_mount_path_longest_prefix(self, monkeypatch, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        _patch_custom_mounts(
+            monkeypatch,
+            [SimpleNamespace(host_path=str(d), container_path="/data/shared", read_only=False)],
+        )
+        assert tools_module._is_custom_mount_path("/data/shared") is True
+        assert tools_module._is_custom_mount_path("/data/shared/sub/f.txt") is True
+        assert tools_module._is_custom_mount_path("/data/other") is False
+        assert tools_module._is_custom_mount_path("/mnt/user-data/workspace/x") is False
+
+    def test_resolve_custom_mount_path(self, monkeypatch, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        _patch_custom_mounts(
+            monkeypatch,
+            [SimpleNamespace(host_path=str(d), container_path="/data/shared", read_only=False)],
+        )
+        # container 根 → host 根
+        assert Path(tools_module._resolve_custom_mount_path("/data/shared")) == d
+        # 子路径翻译
+        assert tools_module._resolve_custom_mount_path("/data/shared/a/b.txt") == str(d / "a" / "b.txt").replace("/", d.anchor) or str(d / "a" / "b.txt")
+
+    def test_resolve_custom_mount_path_no_match_raises(self, monkeypatch, tmp_path):
+        _patch_custom_mounts(monkeypatch, [])
+        with pytest.raises(FileNotFoundError):
+            tools_module._resolve_custom_mount_path("/data/whatever")
+
+    def test_validate_allows_custom_mount_read(self, monkeypatch, tmp_path):
+        """custom-mount 路径读校验放行（validate_local_tool_path 不 raise）。"""
+        d = tmp_path / "shared"
+        d.mkdir()
+        _patch_custom_mounts(monkeypatch, [SimpleNamespace(host_path=str(d), container_path="/data/shared", read_only=False)])
+        td = {"workspace_path": str(tmp_path), "uploads_path": str(tmp_path), "outputs_path": str(tmp_path)}
+        # 不抛即放行
+        tools_module.validate_local_tool_path("/data/shared/f.txt", td, read_only=True)
+
+    def test_validate_rejects_write_to_readonly_mount(self, monkeypatch, tmp_path):
+        """read_only=True 的 custom-mount 写被拒（PermissionError）。"""
+        d = tmp_path / "readonly"
+        d.mkdir()
+        _patch_custom_mounts(monkeypatch, [SimpleNamespace(host_path=str(d), container_path="/data/ro", read_only=True)])
+        td = {"workspace_path": str(tmp_path), "uploads_path": str(tmp_path), "outputs_path": str(tmp_path)}
+        with pytest.raises(PermissionError):
+            tools_module.validate_local_tool_path("/data/ro/x.txt", td, read_only=False)
+
+    def test_validate_allows_write_to_writable_mount(self, monkeypatch, tmp_path):
+        """read_only=False 的 custom-mount 允许写。"""
+        d = tmp_path / "writable"
+        d.mkdir()
+        _patch_custom_mounts(monkeypatch, [SimpleNamespace(host_path=str(d), container_path="/data/rw", read_only=False)])
+        td = {"workspace_path": str(tmp_path), "uploads_path": str(tmp_path), "outputs_path": str(tmp_path)}
+        tools_module.validate_local_tool_path("/data/rw/x.txt", td, read_only=False)  # 不抛
+
+    def test_resolve_local_read_path_custom_mount(self, monkeypatch, tmp_path):
+        """``_resolve_local_read_path`` 把 custom-mount 虚拟路径解析到 host。"""
+        d = tmp_path / "shared"
+        d.mkdir()
+        (d / "f.txt").write_text("hi")
+        _patch_custom_mounts(monkeypatch, [SimpleNamespace(host_path=str(d), container_path="/data/shared", read_only=False)])
+        td = {"workspace_path": str(tmp_path), "uploads_path": str(tmp_path), "outputs_path": str(tmp_path)}
+        resolved = tools_module._resolve_local_read_path("/data/shared/f.txt", td)
+        assert Path(resolved).read_text() == "hi"
+
+
+class TestLocalSandboxProviderCustomMounts:
+    """``LocalSandboxProvider._setup_path_mappings`` 把 ``sandbox.mounts`` 转成 PathMapping。"""
+
+    def test_setup_includes_existing_absolute_mounts(self, monkeypatch, tmp_path):
+        from deerflow.sandbox.local import local_sandbox_provider as provider_mod
+
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        fake_sandbox = SimpleNamespace(
+            mounts=[SimpleNamespace(host_path=str(shared), container_path="/data/shared", read_only=True)],
+            use="deerflow.sandbox.local.local_sandbox_provider:LocalSandboxProvider",
+        )
+        fake_skills = SimpleNamespace(container_path="/mnt/skills", get_skills_path=lambda: Path("/nonexistent-skills"))
+        monkeypatch.setattr(provider_mod, "get_app_config", lambda: SimpleNamespace(sandbox=fake_sandbox, skills=fake_skills))
+
+        # 实例化时 __init__ 调 _setup_path_mappings 建 _path_mappings。
+        provider = LocalSandboxProvider()
+        custom = [m for m in provider._path_mappings if m.container_path == "/data/shared"]
+        assert len(custom) == 1
+        assert custom[0].local_path == str(shared)
+        assert custom[0].read_only is True
+
+    def test_setup_skips_relative_and_nonexistent_host(self, monkeypatch, tmp_path):
+        from deerflow.sandbox.local import local_sandbox_provider as provider_mod
+
+        existing = tmp_path / "data"
+        existing.mkdir()
+        fake_sandbox = SimpleNamespace(
+            mounts=[
+                SimpleNamespace(host_path=str(existing), container_path="/data/ok", read_only=False),
+                SimpleNamespace(host_path="relative/path", container_path="/data/relative", read_only=False),  # 相对 → 跳过
+                SimpleNamespace(host_path=str(tmp_path / "missing"), container_path="/data/missing", read_only=False),  # 不存在 → 跳过
+            ],
+            use="deerflow.sandbox.local.local_sandbox_provider:LocalSandboxProvider",
+        )
+        fake_skills = SimpleNamespace(container_path="/mnt/skills", get_skills_path=lambda: Path("/nonexistent-skills"))
+        monkeypatch.setattr(provider_mod, "get_app_config", lambda: SimpleNamespace(sandbox=fake_sandbox, skills=fake_skills))
+
+        provider = LocalSandboxProvider()
+        containers = [m.container_path for m in provider._path_mappings]
+        assert "/data/ok" in containers
+        assert "/data/relative" not in containers
+        assert "/data/missing" not in containers

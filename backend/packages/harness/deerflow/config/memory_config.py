@@ -58,6 +58,21 @@ class MemoryConfig(BaseModel):
         default="tiktoken",
         description="记忆注入预算的 token 计数策略。'tiktoken' 精确但首次使用时可能从公共网络端点下载 BPE 数据，在网络受限环境可能长时间阻塞（见 issue #3402/#3429）；'char' 用无网络的 CJK 感知字符估算，从不触碰 tiktoken。",
     )
+    guaranteed_categories: list[str] = Field(
+        default_factory=lambda: ["correction"],
+        description=("无论常规 token 预算多紧都必须注入的 fact 类别。这些 fact 从一个独立预留预算（``guaranteed_token_budget``）分配，确保「用户纠正」等高价值 fact 在 token 紧张时绝不被静默丢弃（#3592）。"),
+    )
+    guaranteed_token_budget: int = Field(
+        default=500,
+        ge=50,
+        le=2000,
+        description=(
+            "guaranteed 类别 fact 的 token 上限。guaranteed fact 先从这个预算选出、放在 Facts 块"
+            "最前面，故不会被常规 fact 挤掉。常见情况下总输出仍落在 ``max_injection_tokens`` 内"
+            "（guaranteed 行挤占常规行）；仅当 guaranteed 行单独就把输出顶过 ``max_injection_tokens``"
+            "时预算才真正叠加——此时安全截断上限相应抬高。"
+        ),
+    )
 
 
 def get_memory_config() -> MemoryConfig:

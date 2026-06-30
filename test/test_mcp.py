@@ -24,6 +24,7 @@ import asyncio
 import json
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1312,3 +1313,233 @@ class TestGetAvailableToolsIntegration:
         names = [t.name for t in tools]
         assert "present_files" in names
         assert "ask_clarification" in names
+
+
+# ===========================================================================
+# #3597：stdio MCP 产物文件的虚拟路径翻译（host → /mnt/user-data/...）
+# ===========================================================================
+
+
+@pytest.fixture()
+def stdio_workspace(tmp_path, monkeypatch):
+    """建一棵真实的线程 user-data 树（DEER_FLOW_HOME 指向 tmp），返回 (paths, thread_id, user_id)。"""
+    monkeypatch.setenv("DEER_FLOW_HOME", str(tmp_path))
+    from deerflow.config.paths import get_paths
+
+    paths = get_paths()
+    thread_id = "t-mcp"
+    user_id = "u-mcp"
+    paths.ensure_thread_dirs(thread_id, user_id=user_id)
+    return paths, thread_id, user_id
+
+
+class TestLocalPathFromUri:
+    def test_file_uri(self):
+        from deerflow.mcp.tools import _local_path_from_uri
+
+        assert _local_path_from_uri("file:///tmp/x.txt") == Path("/tmp/x.txt")
+
+    def test_bare_absolute_path(self):
+        from deerflow.mcp.tools import _local_path_from_uri
+
+        assert _local_path_from_uri("/tmp/x.txt") == Path("/tmp/x.txt")
+
+    def test_remote_uri_returns_none(self):
+        from deerflow.mcp.tools import _local_path_from_uri
+
+        assert _local_path_from_uri("https://example.com/a.png") is None
+        assert _local_path_from_uri("data:image/png;base64,xxx") is None
+
+    def test_relative_needs_base_dir(self):
+        from deerflow.mcp.tools import _local_path_from_uri
+
+        assert _local_path_from_uri("rel/x.txt") is None
+        assert _local_path_from_uri("rel/x.txt", base_dir=Path("/root")) == Path("/root/rel/x.txt")
+
+
+class TestLocalUriToVirtualPath:
+    def test_inside_user_data_tree_maps_to_virtual(self, stdio_workspace):
+        from deerflow.mcp.tools import _local_uri_to_virtual_path
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "screenshot.png"
+        f.write_bytes(b"png")
+        virtual = _local_uri_to_virtual_path(str(f), thread_id=thread_id, user_id=user_id)
+        assert virtual == "/mnt/user-data/workspace/screenshot.png"
+
+    def test_outside_user_data_tree_returns_none(self, stdio_workspace, tmp_path):
+        """#3597 安全：树外路径（如 /etc/passwd）不映射——原样保留，不会被服务出去。"""
+        from deerflow.mcp.tools import _local_uri_to_virtual_path
+
+        _, thread_id, user_id = stdio_workspace
+        outside = tmp_path / "outside.txt"
+        outside.write_text("x")
+        assert _local_uri_to_virtual_path(str(outside), thread_id=thread_id, user_id=user_id) is None
+
+    def test_nonexistent_file_returns_none(self, stdio_workspace):
+        from deerflow.mcp.tools import _local_uri_to_virtual_path
+
+        paths, thread_id, user_id = stdio_workspace
+        missing = paths.sandbox_work_dir(thread_id, user_id=user_id) / "nope.png"
+        assert _local_uri_to_virtual_path(str(missing), thread_id=thread_id, user_id=user_id) is None
+
+    def test_relative_resolves_against_source_base_dir(self, stdio_workspace):
+        from deerflow.mcp.tools import _local_uri_to_virtual_path
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "rel.txt"
+        f.write_text("x")
+        virtual = _local_uri_to_virtual_path("rel.txt", thread_id=thread_id, user_id=user_id, source_base_dir=work_dir)
+        assert virtual == "/mnt/user-data/workspace/rel.txt"
+
+
+class TestSnapshotAndDiff:
+    def test_changed_files_detects_new(self, stdio_workspace):
+        from deerflow.mcp.tools import _changed_workspace_files, _snapshot_workspace_files
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        before = _snapshot_workspace_files(work_dir)
+        # 新建一个文件
+        (work_dir / "new.txt").write_text("x")
+        changed = _changed_workspace_files(work_dir, before)
+        names = {p.name for p in changed}
+        assert "new.txt" in names
+
+
+class TestRewriteLocalPathsInText:
+    def test_rewrites_tree_internal_path(self, stdio_workspace):
+        from deerflow.mcp.tools import _rewrite_local_paths_in_text
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "page.yml"
+        f.write_text("x")
+        text = f"Saved to {f}"
+        out = _rewrite_local_paths_in_text(text, thread_id=thread_id, user_id=user_id)
+        assert "/mnt/user-data/workspace/page.yml" in out
+
+    def test_leaves_outside_tree_untouched(self, stdio_workspace, tmp_path):
+        from deerflow.mcp.tools import _rewrite_local_paths_in_text
+
+        _, thread_id, user_id = stdio_workspace
+        outside = tmp_path / "secret.txt"
+        outside.write_text("x")
+        text = f"see {outside}"
+        out = _rewrite_local_paths_in_text(text, thread_id=thread_id, user_id=user_id)
+        # 树外路径原样保留
+        assert str(outside) in out
+        assert "/mnt/user-data" not in out
+
+
+class TestRewriteUniqueBareFilenames:
+    def test_unique_match_rewritten(self, stdio_workspace):
+        from deerflow.mcp.tools import _rewrite_unique_bare_filenames
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "page-2026.yml"
+        f.write_text("x")
+        text = "Saved as page-2026.yml"
+        out = _rewrite_unique_bare_filenames(text, changed_files=[f], thread_id=thread_id, user_id=user_id)
+        assert "/mnt/user-data/workspace/page-2026.yml" in out
+
+    def test_no_candidates_leaves_untouched(self, stdio_workspace):
+        from deerflow.mcp.tools import _rewrite_unique_bare_filenames
+
+        _, thread_id, user_id = stdio_workspace
+        text = "Saved as page-2026.yml"
+        out = _rewrite_unique_bare_filenames(text, changed_files=[], thread_id=thread_id, user_id=user_id)
+        assert out == text
+
+
+class TestConvertCallToolResultRewrite:
+    """``_convert_call_tool_result`` 在给全 thread_id+user_id 时把 ResourceLink URI + 文本翻成虚拟路径。"""
+
+    def _install_real_fake_mcp_types(self, monkeypatch):
+        """注入「真类」fake ``mcp.types``——isinstance 要真类，MagicMock 不行。"""
+        fake_mcp = types.ModuleType("mcp")
+        fake_types = types.ModuleType("mcp.types")
+
+        class _TextContent:
+            def __init__(self, text):
+                self.text = text
+
+        class _ResourceLink:
+            def __init__(self, uri, mimeType=None):
+                self.uri = uri
+                self.mimeType = mimeType
+
+        class _CallToolResult:
+            def __init__(self, content, isError=False, structuredContent=None):
+                self.content = content
+                self.isError = isError
+                self.structuredContent = structuredContent
+
+        fake_types.TextContent = _TextContent
+        fake_types.ResourceLink = _ResourceLink
+        fake_types.CallToolResult = _CallToolResult
+        fake_types.ImageContent = type("ImageContent", (), {})
+        fake_types.EmbeddedResource = type("EmbeddedResource", (), {})
+        fake_types.TextResourceContents = type("TextResourceContents", (), {})
+        fake_types.BlobResourceContents = type("BlobResourceContents", (), {})
+        fake_mcp.types = fake_types
+        monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
+        monkeypatch.setitem(sys.modules, "mcp.types", fake_types)
+        return fake_types
+
+    def test_resource_link_uri_rewritten(self, stdio_workspace, monkeypatch):
+        fake_types = self._install_real_fake_mcp_types(monkeypatch)
+        from deerflow.mcp.tools import _convert_call_tool_result
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "out.png"
+        f.write_bytes(b"png")
+        result = fake_types.CallToolResult(content=[fake_types.ResourceLink(uri=f.as_uri(), mimeType="image/png")])
+        lc_content, _ = _convert_call_tool_result(result, thread_id=thread_id, user_id=user_id)
+        # image block 的 url 被翻成虚拟路径
+        assert any(block.get("url") == "/mnt/user-data/workspace/out.png" for block in lc_content if isinstance(block, dict))
+
+    def test_resource_link_outside_tree_left_untouched(self, stdio_workspace, tmp_path, monkeypatch):
+        fake_types = self._install_real_fake_mcp_types(monkeypatch)
+        from deerflow.mcp.tools import _convert_call_tool_result
+
+        _, thread_id, user_id = stdio_workspace
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"png")
+        result = fake_types.CallToolResult(content=[fake_types.ResourceLink(uri=outside.as_uri(), mimeType="image/png")])
+        lc_content, _ = _convert_call_tool_result(result, thread_id=thread_id, user_id=user_id)
+        # 树外 URI 原样保留
+        assert any(str(outside.as_uri()) in str(block.get("url", "")) for block in lc_content if isinstance(block, dict))
+
+    def test_text_content_path_rewritten(self, stdio_workspace, monkeypatch):
+        fake_types = self._install_real_fake_mcp_types(monkeypatch)
+        from deerflow.mcp.tools import _convert_call_tool_result
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "report.md"
+        f.write_text("x")
+        result = fake_types.CallToolResult(content=[fake_types.TextContent(text=f"see {f}")])
+        lc_content, _ = _convert_call_tool_result(result, thread_id=thread_id, user_id=user_id)
+        text_blocks = [b["text"] for b in lc_content if isinstance(b, dict) and b.get("type") == "text"]
+        assert any("/mnt/user-data/workspace/report.md" in t for t in text_blocks)
+
+    def test_no_thread_id_skips_rewrite(self, stdio_workspace, monkeypatch):
+        """没给 thread_id（如 SSE/HTTP 调用）→ 不重写，原样转换。"""
+        fake_types = self._install_real_fake_mcp_types(monkeypatch)
+        from deerflow.mcp.tools import _convert_call_tool_result
+
+        paths, thread_id, user_id = stdio_workspace
+        work_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+        f = work_dir / "keep.md"
+        f.write_text("x")
+        result = fake_types.CallToolResult(content=[fake_types.TextContent(text=f"see {f}")])
+        lc_content, _ = _convert_call_tool_result(result)  # 不传 thread_id/user_id
+        text_blocks = [b["text"] for b in lc_content if isinstance(b, dict) and b.get("type") == "text"]
+        # 原样保留宿主路径
+        assert any(str(f) in t for t in text_blocks)
+        assert not any("/mnt/user-data" in t for t in text_blocks)

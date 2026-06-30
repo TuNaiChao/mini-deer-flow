@@ -11,17 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.config import get_config
 
 from deerflow.config.extensions_config import ExtensionsConfig
+from deerflow.config.paths import VIRTUAL_PATH_PREFIX, get_paths
 from deerflow.mcp.client import build_servers_config
 from deerflow.mcp.oauth import build_oauth_tool_interceptor, get_initial_oauth_headers
 from deerflow.mcp.session_pool import get_session_pool
 from deerflow.reflection import resolve_variable
+from deerflow.runtime.user_context import resolve_runtime_user_id
 from deerflow.tools.sync import make_sync_tool_wrapper
 from deerflow.tools.types import Runtime
 
@@ -46,7 +51,250 @@ def _extract_thread_id(runtime: Runtime | None) -> str:
         return "default"
 
 
-def _convert_call_tool_result(call_tool_result: Any) -> Any:
+# ---------------------------------------------------------------------------
+# #3597：stdio MCP 产物文件的虚拟路径翻译（host → /mnt/user-data/...）
+#
+# stdio MCP 服务器（如 Playwright）把文件写到宿主路径，沙箱/artifact API 只认
+# ``/mnt/user-data`` 下的虚拟路径。**先把 stdio 子进程的 cwd / TMPDIR 钉在该线程的
+# user-data 树里**（见 ``_make_session_pool_tool``），让产物落在可服务的目录；再在结果里把
+# 这些宿主路径**确定性映射**回虚拟前缀（``_local_uri_to_virtual_path``）。**不拷贝文件**——
+# cwd 已钉好，文件本来就在该在的地方。
+#
+# 安全：只在文件确实落在**本线程 user-data 树内**时才映射（``relative_to(user_data_root)``）。
+# 树外路径（如 ``/etc/passwd``）原样保留、不映射——agent 看不到它，也不会被服务出去。
+# ---------------------------------------------------------------------------
+
+#: stdio 子进程的私有 tmp 子目录（钉在 user-data 树内，让默认走 OS tmp 的工具也写进来）。
+_MCP_TMP_SUBDIR = ".mcp/tmp"
+#: 在自由文本里抓「可能是本地路径」的 token（保守——抓到的再交给 _local_uri_to_virtual_path 验）。
+_LOCAL_PATH_IN_TEXT_RE = re.compile(r"(?:file://)?/[^\s'\"<>|*?]+|(?:\.{0,2}/|[\w.-]+/)[^\s'\"<>|*?]+")
+#: 路径尾部的标点 / 标记（不属于路径本身，重写时剥掉再粘回）。
+_TEXT_PATH_TRAILING_CHARS = ".,;:!?)]}>\"'`"
+#: 工作区文件快照：``{path: (mtime_ns, size)}``。
+_FILE_SNAPSHOT = dict[Path, tuple[int, int]]
+
+
+def _local_path_from_uri(uri: str, *, base_dir: Path | None = None) -> Path | None:
+    """uri 指向本地文件时返回绝对 ``Path``，否则 ``None``。
+
+    接受裸路径与 ``file://`` URI。远程 URI（``http``/``https``/``data``…）返 ``None``，让调用方
+    原样保留。相对路径仅当给了 *base_dir* 时才解析。
+    """
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme == "file":
+        raw = unquote(parsed.path)
+    elif parsed.scheme == "":
+        raw = uri
+    else:
+        return None
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        if base_dir is None:
+            return None
+        path = base_dir / path
+    return path
+
+
+def _local_uri_to_virtual_path(
+    uri: str,
+    *,
+    thread_id: str,
+    user_id: str,
+    source_base_dir: Path | None = None,
+) -> str | None:
+    """把本地文件引用翻成 ``/mnt/user-data/...`` 虚拟路径（纯确定性映射，不拷贝）。
+
+    stdio MCP 服务器的 cwd / tmp 钉在线程的 user-data 树内，所以产物已经在沙箱/artifact API
+    能服务的位置——只差其它 DeerFlow 部件寻址它用的虚拟前缀。本函数就做这个 host→virtual 映射。
+
+    URI 是远程 / 解析不了 / 指向**本线程 user-data 树外** / 不是已存在文件时返 ``None``（调用方
+    原样保留引用）。相对引用相对 *source_base_dir*（服务器 cwd）解析。
+    """
+    src = _local_path_from_uri(uri, base_dir=source_base_dir)
+    if src is None:
+        return None
+    try:
+        real = src.resolve()
+    except OSError:
+        return None
+    if not real.is_file():
+        return None
+    try:
+        # mini paths：thread_user_data_dir(user_id, thread_id)（注意 user_id 在前，与上游关键字序不同）。
+        user_data_root = get_paths().thread_user_data_dir(user_id, thread_id).resolve()
+    except OSError:
+        return None
+    try:
+        relative = real.relative_to(user_data_root)
+    except ValueError:
+        # 文件在本线程 user-data 挂载之外——表达不成虚拟路径，原样保留。
+        logger.debug("MCP path rewrite skipped outside user-data tree: %s", real)
+        return None
+    virtual_path = f"{VIRTUAL_PATH_PREFIX}/{relative.as_posix()}"
+    logger.debug("MCP path rewrite: %s -> %s", real, virtual_path)
+    return virtual_path
+
+
+def _snapshot_workspace_files(root: Path) -> _FILE_SNAPSHOT:
+    """root 下常规文件的轻量快照（``{path: (mtime_ns, size)}``）。"""
+    snapshot: _FILE_SNAPSHOT = {}
+    if not root.exists():
+        return snapshot
+    try:
+        for path in root.rglob("*"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file():
+                snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return snapshot
+    return snapshot
+
+
+def _changed_workspace_files(root: Path, before: _FILE_SNAPSHOT) -> list[Path]:
+    """返回 *before* 之后新建 / 改动的文件。"""
+    after = _snapshot_workspace_files(root)
+    return [path for path, signature in after.items() if before.get(path) != signature]
+
+
+def _prepare_stdio_workspace(paths: Any, *, thread_id: str, user_id: str) -> tuple[Path, Path, _FILE_SNAPSHOT]:
+    """为一次钉定的 stdio MCP 子进程调用准备线程工作区。
+
+    把同步文件系统活（建目录、备 tmp、调前快照）捆在一起，让调用方用 ``asyncio.to_thread``
+    卸到事件循环外。返回工作区 cwd、钉定的 tmp 目录、调前文件快照。
+    """
+    paths.ensure_thread_dirs(thread_id, user_id=user_id)
+    source_base_dir = paths.sandbox_work_dir(thread_id, user_id=user_id)
+    tmp_dir = source_base_dir / _MCP_TMP_SUBDIR
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir.chmod(0o700)
+    except OSError:
+        logger.warning("Failed to prepare MCP temp dir: %s", tmp_dir, exc_info=True)
+    before_files = _snapshot_workspace_files(source_base_dir)
+    return source_base_dir, tmp_dir, before_files
+
+
+def _result_has_text_content(call_tool_result: Any) -> bool:
+    """MCP 结果是否带任何文本内容（决定调后要不要做 bare-filename 关联重扫）。"""
+    from mcp.types import EmbeddedResource, TextContent, TextResourceContents
+
+    content = getattr(call_tool_result, "content", None)
+    if not content:
+        return False
+    for item in content:
+        if isinstance(item, TextContent):
+            return True
+        if isinstance(item, EmbeddedResource) and isinstance(item.resource, TextResourceContents):
+            return True
+    return False
+
+
+def _rewrite_unique_bare_filenames(
+    text: str,
+    *,
+    changed_files: Iterable[Path],
+    thread_id: str,
+    user_id: str,
+    source_base_dir: Path | None = None,
+) -> str:
+    """仅当本次调用产出了**唯一匹配**的裸文件名时才重写它。
+
+    像 ``Saved as page-2026.yml`` 这种回复结构上不是路径。唯一安全的解读是把文件名与
+    **本次工具调用**新建 / 改的文件关联，仅当 basename 在本线程 user-data 树内映射到**恰好一个**
+    文件时才重写。
+    """
+    candidates: dict[str, list[str]] = {}
+    for path in changed_files:
+        virtual_path = _local_uri_to_virtual_path(
+            str(path),
+            thread_id=thread_id,
+            user_id=user_id,
+            source_base_dir=source_base_dir,
+        )
+        if virtual_path is None:
+            continue
+        candidates.setdefault(path.name, []).append(virtual_path)
+
+    unique = {name: vpaths[0] for name, vpaths in candidates.items() if len(set(vpaths)) == 1}
+    if not unique:
+        if candidates:
+            logger.debug("MCP bare filename rewrite skipped: no unique candidate in %s", sorted(candidates))
+        else:
+            logger.debug("MCP bare filename rewrite skipped: no snapshot candidates")
+        return text
+
+    rewritten = text
+    for name in sorted(unique, key=len, reverse=True):
+        # 不在更长的路径 / 单词内重写。允许句末句号，但不允许 ``.bak`` 或另一段路径。
+        pattern = re.compile(rf"(?<![\w./-]){re.escape(name)}(?!(?:[\w/-]|\.[\w]))")
+        rewritten_text, count = pattern.subn(unique[name], rewritten)
+        if count:
+            logger.debug("MCP bare filename rewrite: %s -> %s", name, unique[name])
+        rewritten = rewritten_text
+    return rewritten
+
+
+def _rewrite_local_paths_in_text(
+    text: str,
+    *,
+    thread_id: str,
+    user_id: str,
+    source_base_dir: Path | None = None,
+    changed_files: Iterable[Path] | None = None,
+) -> str:
+    """自由文本里本地文件引用的 best-effort 重写。
+
+    有些 MCP 服务器（如 Playwright 的 ``browser_take_screenshot``）把保存的文件仅作为自由文本
+    报出（``saved it as temp/page-2026.png``）而非 ``ResourceLink``。自由文本不是可靠协议，故本函数
+    刻意保守：每个候选 token 交给 ``_local_uri_to_virtual_path``，**只有**解析成本线程 user-data 树内
+    已存在文件时才重写。不是真路径 / 指向别处的 token 原样保留——过度匹配也无害。
+    """
+    translated_by_source: dict[str, str | None] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        # 路径可能结束一句（``saved as temp/a.png.``）：剥尾标点、重写后再粘回。
+        stripped = token.rstrip(_TEXT_PATH_TRAILING_CHARS)
+        trailing = token[len(stripped) :]
+        if stripped not in translated_by_source:
+            translated_by_source[stripped] = _local_uri_to_virtual_path(
+                stripped,
+                thread_id=thread_id,
+                user_id=user_id,
+                source_base_dir=source_base_dir,
+            )
+        rewritten = translated_by_source[stripped]
+        if rewritten is None:
+            return token
+        return f"{rewritten}{trailing}"
+
+    rewritten = _LOCAL_PATH_IN_TEXT_RE.sub(_replace, text)
+    if changed_files is None:
+        return rewritten
+    return _rewrite_unique_bare_filenames(
+        rewritten,
+        changed_files=changed_files,
+        thread_id=thread_id,
+        user_id=user_id,
+        source_base_dir=source_base_dir,
+    )
+
+
+def _convert_call_tool_result(
+    call_tool_result: Any,
+    *,
+    thread_id: str | None = None,
+    user_id: str | None = None,
+    source_base_dir: Path | None = None,
+    changed_files: list[Path] | None = None,
+) -> Any:
     """把 MCP ``CallToolResult`` 转成 LangChain ``content_and_artifact`` 格式。
 
     复刻 adapter 的转换逻辑，不依赖私有 ``langchain_mcp_adapters.tools._convert_call_tool_result``。
@@ -82,22 +330,53 @@ def _convert_call_tool_result(call_tool_result: Any) -> Any:
         pass
 
     # 把 MCP content block 转成 LangChain content block。
+    # #3597：stdio 调用给全了 thread_id + user_id 时，把结果里的本地文件引用（ResourceLink URI +
+    # 文本里的路径 / 裸文件名）确定性映射成 ``/mnt/user-data/...`` 虚拟路径（仅树内文件）。
+    rewrite = thread_id is not None and user_id is not None
     lc_content = []
     for item in call_tool_result.content:
         if isinstance(item, TextContent):
-            lc_content.append(create_text_block(text=item.text))
+            text = item.text
+            if rewrite:
+                text = _rewrite_local_paths_in_text(
+                    text,
+                    thread_id=thread_id,  # type: ignore[arg-type]
+                    user_id=user_id,  # type: ignore[arg-type]
+                    source_base_dir=source_base_dir,
+                    changed_files=changed_files,
+                )
+            lc_content.append(create_text_block(text=text))
         elif isinstance(item, ImageContent):
             lc_content.append(create_image_block(base64=item.data, mime_type=item.mimeType))
         elif isinstance(item, ResourceLink):
             mime = item.mimeType or None
+            uri = str(item.uri)
+            if rewrite:
+                virtual = _local_uri_to_virtual_path(
+                    uri,
+                    thread_id=thread_id,  # type: ignore[arg-type]
+                    user_id=user_id,  # type: ignore[arg-type]
+                    source_base_dir=source_base_dir,
+                )
+                if virtual is not None:
+                    uri = virtual
             if mime and mime.startswith("image/"):
-                lc_content.append(create_image_block(url=str(item.uri), mime_type=mime))
+                lc_content.append(create_image_block(url=uri, mime_type=mime))
             else:
-                lc_content.append(create_file_block(url=str(item.uri), mime_type=mime))
+                lc_content.append(create_file_block(url=uri, mime_type=mime))
         elif isinstance(item, EmbeddedResource):
             res = item.resource
             if isinstance(res, TextResourceContents):
-                lc_content.append(create_text_block(text=res.text))
+                text = res.text
+                if rewrite:
+                    text = _rewrite_local_paths_in_text(
+                        text,
+                        thread_id=thread_id,  # type: ignore[arg-type]
+                        user_id=user_id,  # type: ignore[arg-type]
+                        source_base_dir=source_base_dir,
+                        changed_files=changed_files,
+                    )
+                lc_content.append(create_text_block(text=text))
             elif isinstance(res, BlobResourceContents):
                 mime = res.mimeType or None
                 if mime and mime.startswith("image/"):
@@ -145,7 +424,32 @@ def _make_session_pool_tool(
         **arguments: Any,
     ) -> Any:
         thread_id = _extract_thread_id(runtime)
-        session = await pool.get_session(server_name, thread_id, connection)
+        user_id = resolve_runtime_user_id(runtime)
+        # #3597：stdio 子进程的 cwd / TMPDIR 钉在该线程 user-data 树里，产物落在沙箱/artifact
+        # API 能服务的位置；调前快照工作区，调后 diff 出新建文件供结果重写。SSE/HTTP 无本地 cwd
+        # 可钉，跳过这些文件系统活。
+        session_connection = dict(connection)
+        is_stdio = session_connection.get("transport", "stdio") == "stdio"
+        source_base_dir: Path | None = None
+        process_cwd: Path | None = None
+        before_files: _FILE_SNAPSHOT | None = None
+        if is_stdio:
+            paths = get_paths()
+            # 把同步文件系统准备（建目录 / tmp / 调前快照）捆一起卸到事件循环外——快照要走整棵工作区。
+            source_base_dir, tmp_dir, before_files = await asyncio.to_thread(_prepare_stdio_workspace, paths, thread_id=thread_id, user_id=user_id)
+            # stdio MCP 服务器按进程 cwd 解析相对产物链接。把 cwd 钉在线程 user-data 树内，让
+            # Playwright 等工具的产物落在沙箱/artifact API 能服务的位置、其引用能翻成虚拟路径。
+            configured_cwd = session_connection.get("cwd", str(source_base_dir))
+            session_connection["cwd"] = str(configured_cwd)
+            process_cwd = Path(configured_cwd)
+            # 把子进程 tmp 钉到同一棵树。默认走 OS tmp 的工具（Node os.tmpdir() / Python tempfile / 多数 CLI）
+            # 于是写进 user-data 而非不可达的宿主路径。合并而非覆盖 operator 给的 env。
+            session_env = dict(session_connection.get("env") or {})
+            session_env.setdefault("TMPDIR", str(tmp_dir))
+            session_env.setdefault("TMP", str(tmp_dir))
+            session_env.setdefault("TEMP", str(tmp_dir))
+            session_connection["env"] = session_env
+        session = await pool.get_session(server_name, thread_id, session_connection)
 
         if tool_interceptors:
             from langchain_mcp_adapters.interceptors import MCPToolCallRequest
@@ -179,7 +483,19 @@ def _make_session_pool_tool(
         else:
             call_tool_result = await session.call_tool(original_name, arguments)
 
-        return _convert_call_tool_result(call_tool_result)
+        # 调后 diff 只为给文本里的裸文件名做关联，所以结果无文本内容时跳过第二次递归扫。
+        # diff 与 _convert_call_tool_result 里逐 token 的路径解析都触文件系统，卸到事件循环外。
+        changed_files: list[Path] | None = None
+        if is_stdio and before_files is not None and _result_has_text_content(call_tool_result):
+            changed_files = await asyncio.to_thread(_changed_workspace_files, source_base_dir, before_files)
+        return await asyncio.to_thread(
+            _convert_call_tool_result,
+            call_tool_result,
+            thread_id=thread_id if is_stdio else None,
+            user_id=user_id if is_stdio else None,
+            source_base_dir=process_cwd,
+            changed_files=changed_files,
+        )
 
     return StructuredTool(
         name=tool.name,

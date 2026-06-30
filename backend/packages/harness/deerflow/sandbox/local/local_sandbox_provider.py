@@ -68,11 +68,13 @@ class LocalSandboxProvider(SandboxProvider):
         self._lock = threading.Lock()
 
     def _setup_path_mappings(self) -> list[PathMapping]:
-        """建静态映射（skills 目录，进程级、所有线程共享）。
+        """建静态映射（skills 目录 + 自定义卷挂载，进程级、所有线程共享）。
 
         per-thread 的 ``/mnt/user-data/...`` 映射在 ``acquire`` 里追加（依赖 thread_id +
-        user_id）。本仓库暂未实现自定义卷挂载（``sandbox.mounts``）与 ACP workspace，
-        只保留 skills（M14 用）；二者可在 M10b / M15 落地后补。
+        user_id）。自定义卷挂载（``sandbox.mounts``）在此处理：operator 配的额外目录
+        按各自的 ``container_path`` 暴露给 agent（如 ``/data/shared``）。host_path 必须绝对
+        且存在，否则跳过（与 AIO bind-mount 一致——不存在的源目录挂不进去）。ACP workspace
+        由 ``invoke_acp_agent_tool`` 自己建 per-thread 目录、不在此处。
         """
         mappings: list[PathMapping] = []
         try:
@@ -84,6 +86,33 @@ class LocalSandboxProvider(SandboxProvider):
         except Exception as e:
             # 配置加载失败不致命：skills 不可用，沙箱仍能跑 user-data。
             logger.warning("Could not setup skills path mapping: %s", e, exc_info=True)
+
+        # 自定义卷挂载（sandbox.mounts）。host_path 必须绝对且存在。
+        try:
+            from pathlib import Path
+
+            config = get_app_config()
+            sandbox_config = getattr(config, "sandbox", None)
+            mounts = getattr(sandbox_config, "mounts", None) if sandbox_config else None
+            if mounts:
+                for mount in mounts:
+                    host_path = Path(mount.host_path)
+                    if not host_path.is_absolute():
+                        logger.warning("Mount host_path must be absolute, skipping: %s -> %s", mount.host_path, mount.container_path)
+                        continue
+                    if not host_path.exists():
+                        logger.warning("Mount host_path does not exist, skipping: %s -> %s", mount.host_path, mount.container_path)
+                        continue
+                    mappings.append(
+                        PathMapping(
+                            container_path=mount.container_path,
+                            local_path=str(host_path),
+                            read_only=bool(getattr(mount, "read_only", False)),
+                        )
+                    )
+        except Exception as e:
+            # 自定义挂载配置加载失败不致命。
+            logger.warning("Could not setup custom volume mounts: %s", e, exc_info=True)
         return mappings
 
     @staticmethod

@@ -351,6 +351,56 @@ class TestReadability:
         art = ReadabilityExtractor().extract_article("<html><body><p>no title here</p></body></html>")
         assert art.title == "Untitled"
 
+    def test_article_to_message_splits_text_and_images(self):
+        """#3575/M21：``to_message`` 把 markdown 切成 text + image_url 交替块。"""
+        art = Article(title="T", html_content="<p>ignored</p>", url="http://x.com/page")
+        # 直接构造 to_markdown 的输出形态（绕过 markdownify 缺包）：文本 + 图片 + 文本。
+        art.html_content = "before ![alt](img/a.png) after"
+        # to_markdown 缺 markdownify 时原样用 html_content；to_message 在其上切图片。
+        msg = Article.to_message(art)
+        types = [b["type"] for b in msg]
+        assert "image_url" in types
+        # 图片 URL 用文章 url 拼成绝对
+        img_block = next(b for b in msg if b["type"] == "image_url")
+        assert img_block["image_url"]["url"] == "http://x.com/img/a.png"
+        # 文本块都在
+        text_blocks = [b["text"] for b in msg if b["type"] == "text"]
+        assert any("before" in t for t in text_blocks)
+        assert any("after" in t for t in text_blocks)
+
+    def test_article_to_message_empty_content_fallback(self, monkeypatch):
+        """to_markdown 返空时，to_message 回退 No content available。"""
+        art = Article(title="T", html_content="<p>x</p>")
+        monkeypatch.setattr(art, "to_markdown", lambda including_title=True: "")
+        assert art.to_message() == [{"type": "text", "text": "No content available"}]
+
+    def test_article_url_attribute(self):
+        art = Article(title="T", html_content="<p>x</p>", url="http://example.com/")
+        assert art.url == "http://example.com/"
+        # 默认空
+        assert Article(title="T", html_content="<p>x</p>").url == ""
+
+    def test_extractor_subprocess_failure_retries_use_readability_false(self, monkeypatch):
+        """readabilipy 装了但 Readability.js 子进程失败 → 回退 use_readability=False（再失败落 regex）。"""
+        calls = {"n": 0}
+
+        def _flaky_simple_json(html, use_readability=True):
+            calls["n"] += 1
+            if use_readability:
+                # 模拟 Readability.js 子进程缺失（FileNotFoundError 是 builtin，非 subprocess 的）
+                raise FileNotFoundError("node not found")
+            # use_readability=False 的纯 Python 模式成功
+            return {"title": "Pure", "content": "<p>pure-python extract</p>"}
+
+        import sys
+        import types as _types
+
+        monkeypatch.setitem(sys.modules, "readabilipy", _types.SimpleNamespace(simple_json_from_html_string=_flaky_simple_json))
+        art = ReadabilityExtractor().extract_article("<html><body><p>x</p></body></html>")
+        assert calls["n"] == 2  # 先试 use_readability=True，炸后回退 use_readability=False
+        assert art.title == "Pure"
+        assert "pure-python extract" in art.html_content
+
 
 # ===========================================================================
 # Test AppConfig.get_tool_config
@@ -900,3 +950,210 @@ class TestResolvePaths:
         obj = resolve_variable(path, BaseTool)
         assert isinstance(obj, BaseTool)
         # 软加载 provider 的工具即使 SDK 缺包也 resolve 成功（缺包在调用时才报错）
+
+
+# ===========================================================================
+# Test fastcrw（Firecrawl 兼容变体，软加载）
+# ===========================================================================
+
+
+class TestFastcrw:
+    def test_search_normalizes(self, monkeypatch):
+        from deerflow.community.fastcrw import tools as fc_mod
+
+        _patch_config(monkeypatch, {"web_search": {"api_key": "k"}})
+
+        class _Result:
+            def __init__(self):
+                self.web = [types.SimpleNamespace(title="T", url="http://u", description="D")]
+
+        class _App:
+            def __init__(self, *a, **kw):
+                pass
+
+            def search(self, query, limit=5):
+                return _Result()
+
+        monkeypatch.setitem(__import__("sys").modules, "firecrawl", types.SimpleNamespace(FirecrawlApp=_App))
+        out = json.loads(fc_mod.web_search_tool.invoke({"query": "q"}))
+        assert out[0] == {"title": "T", "url": "http://u", "content": "D"}
+
+    def test_search_missing_sdk_returns_install_hint(self, monkeypatch):
+        from deerflow.community.fastcrw import tools as fc_mod
+
+        _patch_config(monkeypatch, {"web_search": {"api_key": "k"}})
+        # 让 ``from firecrawl import FirecrawlApp`` 抛 ImportError
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _block_firecrawl(name, *a, **kw):
+            if name == "firecrawl":
+                raise ImportError("no firecrawl")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _block_firecrawl)
+        out = fc_mod.web_search_tool.invoke({"query": "q"})
+        assert "firecrawl-py" in out and out.startswith("Error:")
+
+    def test_fetch_truncates_and_titles(self, monkeypatch):
+        from deerflow.community.fastcrw import tools as fc_mod
+
+        _patch_config(monkeypatch, {"web_fetch": {"api_key": "k"}})
+
+        class _Meta:
+            title = "Title"
+
+        class _Result:
+            markdown = "x" * 5000
+            metadata = _Meta()
+
+        class _App:
+            def __init__(self, *a, **kw):
+                pass
+
+            def scrape(self, url, formats=None):
+                return _Result()
+
+        monkeypatch.setitem(__import__("sys").modules, "firecrawl", types.SimpleNamespace(FirecrawlApp=_App))
+        out = fc_mod.web_fetch_tool.invoke({"url": "http://u"})
+        assert out.startswith("# Title")
+        assert len(out) < 5000  # 截到 4KB
+
+
+# ===========================================================================
+# Test groundroute（纯 httpx meta 搜索）
+# ===========================================================================
+
+
+class TestGroundroute:
+    def test_no_api_key_returns_error(self, monkeypatch):
+        from deerflow.community.groundroute import tools as gr_mod
+
+        _patch_config(monkeypatch, None)
+        monkeypatch.delenv("GROUNDROUTE_API_KEY", raising=False)
+        out = json.loads(gr_mod.web_search_tool.invoke({"query": "q"}))
+        assert "GROUNDROUTE_API_KEY" in out["error"]
+
+    def test_search_normalizes(self, monkeypatch):
+        from deerflow.community.groundroute import tools as gr_mod
+
+        _patch_config(monkeypatch, {"web_search": {"api_key": "k"}})
+        client = _FakeSyncClient(post_response=_FakeResponse(json_data={"results": [{"title": "T", "url": "http://u", "snippet": "S", "source_engine": "serper"}]}))
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        out = json.loads(gr_mod.web_search_tool.invoke({"query": "q"}))
+        assert out[0] == {"title": "T", "url": "http://u", "snippet": "S", "source_engine": "serper"}
+
+    def test_search_empty_results(self, monkeypatch):
+        from deerflow.community.groundroute import tools as gr_mod
+
+        _patch_config(monkeypatch, {"web_search": {"api_key": "k"}})
+        client = _FakeSyncClient(post_response=_FakeResponse(json_data={"results": []}))
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        out = json.loads(gr_mod.web_search_tool.invoke({"query": "q"}))
+        assert out["error"] == "No results found"
+
+    def test_fetch_returns_content(self, monkeypatch):
+        from deerflow.community.groundroute import tools as gr_mod
+
+        _patch_config(monkeypatch, {"web_fetch": {"api_key": "k"}})
+        client = _FakeSyncClient(post_response=_FakeResponse(json_data={"results": [{"title": "T", "content": "C"}]}))
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        out = gr_mod.web_fetch_tool.invoke({"url": "http://u"})
+        assert out.startswith("# T") and "C" in out
+
+
+# ===========================================================================
+# Test Serper image_search + SSRF 守卫（#3575）
+# ===========================================================================
+
+
+class TestSerperImages:
+    def test_image_search_filters_private_urls(self, monkeypatch):
+        """#3575：私有/loopback 图片 URL 被 SSRF 守卫滤掉。"""
+        from deerflow.community.serper import tools as serper_mod
+
+        _patch_config(monkeypatch, {"image_search": {"api_key": "k"}})
+        client = _FakeSyncClient(
+            post_response=_FakeResponse(
+                json_data={
+                    "images": [
+                        {"title": "safe", "imageUrl": "https://example.com/a.png", "thumbnailUrl": "https://example.com/t.png"},
+                        {"title": "private", "imageUrl": "http://127.0.0.1/x.png", "thumbnailUrl": "http://10.0.0.1/t.png"},
+                        {"title": "obfuscated", "imageUrl": "http://2130706433/x.png"},  # 127.0.0.1 的十进制
+                    ]
+                }
+            )
+        )
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        out = json.loads(serper_mod.image_search_tool.invoke({"query": "cat"}))
+        titles = [r["title"] for r in out["results"]]
+        assert titles == ["safe"]  # private + obfuscated 都被滤掉
+
+    def test_image_search_no_safe_urls(self, monkeypatch):
+        from deerflow.community.serper import tools as serper_mod
+
+        _patch_config(monkeypatch, {"image_search": {"api_key": "k"}})
+        client = _FakeSyncClient(post_response=_FakeResponse(json_data={"images": [{"imageUrl": "http://192.168.1.1/x.png"}]}))
+        monkeypatch.setattr(httpx, "Client", lambda **kw: client)
+        out = json.loads(serper_mod.image_search_tool.invoke({"query": "q"}))
+        assert out["error"] == "No safe image URLs found"
+
+    def test_image_search_no_api_key(self, monkeypatch):
+        from deerflow.community.serper import tools as serper_mod
+
+        _patch_config(monkeypatch, None)
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        out = json.loads(serper_mod.image_search_tool.invoke({"query": "q"}))
+        assert "SERPER_API_KEY" in out["error"]
+
+
+class TestSerperSSRFGuard:
+    """``_safe_public_url`` 的 SSRF 守卫单测（#3575）。"""
+
+    def test_rejects_non_http_schemes(self):
+        from deerflow.community.serper.tools import _safe_public_url as f
+
+        assert f("ftp://example.com/x") == ""
+        assert f("file:///etc/passwd") == ""
+        assert f("javascript:alert(1)") == ""
+
+    def test_rejects_localhost_and_private_ip(self):
+        from deerflow.community.serper.tools import _safe_public_url as f
+
+        assert f("http://localhost/x") == ""
+        assert f("http://localhost./x") == ""
+        assert f("http://sub.localhost/x") == ""
+        assert f("http://127.0.0.1/x") == ""
+        assert f("http://10.0.0.1/x") == ""
+        assert f("http://192.168.1.1/x") == ""
+        assert f("http://172.16.0.1/x") == ""
+
+    def test_accepts_public_urls(self):
+        from deerflow.community.serper.tools import _safe_public_url as f
+
+        assert f("https://example.com/a.png") == "https://example.com/a.png"
+        assert f("http://8.8.8.8/x") == "http://8.8.8.8/x"
+
+    def test_rejects_obfuscated_ipv4_literals(self):
+        """十进制 / 十六进制 / 八进制混淆的私有 IP 也要被识破。"""
+        from deerflow.community.serper.tools import _safe_public_url as f
+
+        assert f("http://2130706433/x") == ""  # 127.0.0.1 十进制
+        assert f("http://0x7f000001/x") == ""  # 127.0.0.1 十六进制
+        assert f("http://0177.0.0.1/x") == ""  # 127.0.0.1 八进制
+
+    def test_decode_ipv4_returns_address_for_obfuscated(self):
+        from ipaddress import ip_address
+
+        from deerflow.community.serper.tools import _decode_ipv4
+
+        assert _decode_ipv4("2130706433") == ip_address("127.0.0.1")
+        assert _decode_ipv4("0x7f000001") == ip_address("127.0.0.1")
+        assert _decode_ipv4("cafe.com") is None  # 真域名解不了
+
+    def test_non_string_returns_empty(self):
+        from deerflow.community.serper.tools import _safe_public_url as f
+
+        assert f(None) == ""
+        assert f(123) == ""
