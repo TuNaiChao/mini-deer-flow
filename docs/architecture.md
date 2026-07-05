@@ -165,7 +165,7 @@ class RuntimeBundle:
 memory 后端**全进程内**，重启全丢——开发 / 测试用。sqlite/postgres 持久化，重启存活（orphan
 recovery 处理「重启前没跑完的 run」）。
 
-## 5. 集成装配清单（对齐 ALIGNMENT_OUTLINE Part D）
+## 5. 集成装配清单
 
 | Part | 内容 | mini 落地 |
 |------|------|----------|

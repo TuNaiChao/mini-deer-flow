@@ -5,6 +5,7 @@
 （红线 #25）。需重启的基础设施字段用 ``startup-only:`` 标记（见 reload_boundary）。
 """
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -263,20 +264,47 @@ def load_config_from_yaml(config_path: Path | None = None) -> dict[str, Any]:
     return _expand_env_vars(raw)
 
 
+def _running_in_event_loop() -> bool:
+    """当前是否在运行中的 asyncio 事件循环里。
+
+    ``get_app_config`` 用它决定能否安全做文件 IO：事件循环里的同步 ``stat`` /
+    ``Path.cwd`` 会触发 blocking-IO 红线（langgraph dev 运行期的 blockbuster 检测会
+    抛 ``BlockingError``，见 §1 冒烟修复记录）。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
 def get_app_config() -> AppConfig:
     """获取应用配置单例。
 
-    首次调用时加载配置文件和环境变量。后续调用时检查文件修改时间，自动热重载。
+    首次调用时加载配置文件和环境变量。后续调用：
+
+    - **同步上下文**（启动期 / 测试 / 同步调用方）：检查 config.yaml 修改时间，
+      自动热重载；
+    - **事件循环里**（langgraph dev 运行期）：**直接返回缓存，不做 mtime stat**——
+      否则同步 ``stat`` / ``Path.cwd()`` 会触发 blocking-IO 红线。运行期热重载改由
+      显式 :func:`reload_config` 触发，或重启 dev server。
+
+    langgraph dev 的 ``make_checkpointer`` 在启动期（lifespan，非运行期）已触发首次
+    加载，故运行期进入这里时几乎总是命中缓存，走「事件循环里直接返回」分支。
 
     Returns:
         AppConfig 实例
     """
     global _app_config, _config_mtime
 
+    # 已加载且当前在事件循环里 → 直接返缓存，避免运行期同步文件 IO（blocking-IO 红线）。
+    if _app_config is not None and _running_in_event_loop():
+        return _app_config
+
     config_path = get_config_file()
     current_mtime = config_path.stat().st_mtime if config_path.exists() else None
 
-    # 检查是否需要重新加载
+    # 同步上下文下的热重载检查
     if _app_config is not None and current_mtime == _config_mtime:
         return _app_config
 

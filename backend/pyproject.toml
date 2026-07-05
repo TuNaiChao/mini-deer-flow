@@ -28,6 +28,11 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
     "langgraph-checkpoint-sqlite>=2.0",
+    # pytest 9.1.0 回归：``_pytest/compat.py`` 顶层 ``import py`` 但 METADATA 未声明
+    # ``py`` 依赖（Requires-Dist 里没有）。uv 等严格解析器只装声明依赖 → ``py`` 缺失 →
+    # ``import pytest`` 抛 ModuleNotFoundError，``make test`` 起不来。显式补 ``py`` 兜住
+    # 该回归（§1 冒烟发现）。pytest 修掉这个 undeclared import 后可移除。
+    "py>=1.11.0",
 ]
 
 [tool.uv.workspace]

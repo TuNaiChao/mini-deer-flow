@@ -16,6 +16,7 @@ mini 不使用 deer 的 ``runtime_paths`` 模块——本模块统一提供运�
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,10 +28,27 @@ from typing import Final
 # 集中定义在 config 层，sandbox/tools 与 sandbox/local 共享，避免漂移。
 VIRTUAL_PATH_PREFIX: Final[str] = "/mnt/user-data"
 
+# 进程启动期（本模块 import，同步上下文）解析一次 CWD 并缓存。``find_project_root`` /
+# ``project_root`` 在**事件循环里**用它，**不**再调 ``Path.cwd()``——langgraph dev 运行期
+# 的 blockbuster 会把事件循环里的 ``os.getcwd`` 判为 blocking IO（§1 冒烟发现：make_lead_agent
+# → 技能/配置路径解析 → ``Path.cwd`` 抛 BlockingError）。同步上下文（启动/测试/含 chdir 的
+# 用例）仍走实时 ``Path.cwd()``，保留 chdir 反应性。要改运行时根请用
+# ``DEER_FLOW_PROJECT_ROOT`` 环境变量（``project_root`` 仍实时读它）。
+_CWD: Path = Path.cwd().resolve()
+
+
+def _running_in_event_loop() -> bool:
+    """当前是否在运行中的 asyncio 事件循环里（决定路径解析能否安全调 ``Path.cwd``）。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 
 def find_project_root() -> Path:
     """查找项目根目录（backend/ 目录，含 pyproject.toml）。"""
-    current = Path.cwd()
+    current = _CWD if _running_in_event_loop() else Path.cwd()
     for parent in [current, *current.parents]:
         if (parent / "pyproject.toml").exists():
             return parent
@@ -72,7 +90,8 @@ def project_root() -> Path:
         if not root.is_dir():
             raise ValueError(f"DEER_FLOW_PROJECT_ROOT 设为 '{env_root}'，但解析路径 '{root}' 不是目录。")
         return root
-    return Path.cwd().resolve()
+    # 事件循环里用缓存 _CWD（避免 os.getcwd 阻塞）；同步上下文用实时 CWD（保留 chdir 反应性）。
+    return _CWD if _running_in_event_loop() else Path.cwd().resolve()
 
 
 def runtime_home() -> Path:

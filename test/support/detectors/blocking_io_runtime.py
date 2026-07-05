@@ -43,6 +43,9 @@ _DEFAULT_SCANNED_MODULES: tuple[str, ...] = ("deerflow",)
 # 被 patch 的同步阻塞原语：(模块对象, 属性名)。
 # 覆盖后续模块的文件 IO：open/stat/listdir/makedirs/walk 服务 jsonl/memory/skill/sqlite；
 # sleep/select 作为通用阻塞原语。socket 系列不在此列（签名复杂，文件 IO 用不到）。
+# ``os.getcwd`` 对齐 langgraph dev 运行期的 blockbuster 检测：``Path.cwd()`` 会落到
+# 它，运行期发自 deerflow 的 getcwd 同样算阻塞（§1 冒烟曾因此暴露 get_app_config
+# 在事件循环里 stat/getcwd 的违规）。
 _BLOCKING_TARGETS: tuple[tuple[object, str], ...] = (
     (builtins, "open"),
     (os, "stat"),
@@ -55,6 +58,7 @@ _BLOCKING_TARGETS: tuple[tuple[object, str], ...] = (
     (os, "mkdir"),
     (os, "makedirs"),
     (os, "walk"),
+    (os, "getcwd"),
     (time, "sleep"),
     (select, "select"),
 )

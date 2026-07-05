@@ -40,17 +40,17 @@ models:
     supports_vision: false
 
   # --- DeepSeek-R1（深度推理模型）---
-  - name: deepseek-r1
-    display_name: DeepSeek R1 (Reasoning)
-    use: langchain_deepseek:ChatDeepSeek
-    model: deepseek-reasoner
-    api_key: $DEEPSEEK_API_KEY
-    temperature: 0.7
-    max_tokens: 8192
-    timeout: 600.0
-    max_retries: 2
-    supports_thinking: true
-    supports_vision: false
+  # - name: deepseek-r1
+  #   display_name: DeepSeek R1 (Reasoning)
+  #   use: langchain_deepseek:ChatDeepSeek
+  #   model: deepseek-reasoner
+  #   api_key: $DEEPSEEK_API_KEY
+  #   temperature: 0.7
+  #   max_tokens: 8192
+  #   timeout: 600.0
+  #   max_retries: 2
+  #   supports_thinking: true
+  #   supports_vision: false
 
   # ============================================================
   # Qwen-VL 多模态模型 —— 三条接入路径，按需选择其一
@@ -134,6 +134,29 @@ models:
 # ============================================================
 sandbox:
   use: deerflow.sandbox.local:LocalSandboxProvider
+
+# ============================================================
+# 工具配置（沙箱工具）
+# ============================================================
+# 没有这一段时，agent 只有 present_files + ask_clarification 两个内置工具（纯聊天）。
+# 加上下面 7 个沙箱工具（group: sandbox）后，agent 才能执行 bash、读写文件、搜索——
+# 真正"能干活"。路径前缀 /mnt/user-data 由 LocalSandbox 翻译到按 (user, thread) 隔离的
+# 宿主目录。按需删减；更多工具（web 搜索等）见 docs/community.md。
+tools:
+  - use: deerflow.sandbox.tools:bash_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:ls_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:glob_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:grep_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:read_file_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:write_file_tool
+    group: sandbox
+  - use: deerflow.sandbox.tools:str_replace_tool
+    group: sandbox
 
 # ============================================================
 # 记忆系统

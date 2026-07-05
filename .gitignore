@@ -58,6 +58,8 @@ config.yaml
 # 运行时状态
 # ============================================================
 backend/.langgraph_api/
+backend/.deer-flow/
+.deer-flow/
 *.log
 *.pid
 *.pckl

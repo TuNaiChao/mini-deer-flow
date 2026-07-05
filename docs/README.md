@@ -1,8 +1,18 @@
 # mini-deer-flow 学习文档
 
-> mini-deer-flow 是 deer-flow 的**教学化对齐版**：用更小的代码量、更细的讲解重写 deer-flow，但**行为上全面对标、不裁剪核心功能**（v1.2 起：沙箱 / subagent / memory / tool / skill / mcp / 联网 / 上传 / 自定义 agent 全部纳入主线，见 [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) v1.2 修订日志）。这份索引按「依赖顺序」列出**已完成**模块的学习文档——从「怎么把代码跑起来」一路读到「运行时基础全部就位」。每篇都**面向小白**，每个名词第一次出现都会解释。
+> **零基础从这里开始 → [start-here.md](start-here.md)（#0）**：用一页纸讲清 LLM / agent / LangGraph / harness 是什么，并**手把手带你把 mini 在自己电脑上跑起来、发出第一条消息看到回复**。
 >
-> 按 **1 → 28** 顺序读最省事。每篇开头标题已标注它在顺序里的位置（如 `# 9. run_event_store.md — ...`），单独打开某篇也能知道它排第几。
+> 这份索引按「依赖顺序」列出全部模块的学习文档（#0–#28）。每篇都**面向小白**，每个名词第一次出现都会解释；每篇标题已标它在顺序里的位置（如 `# 9. run_event_store.md — ...`），单独打开也能知道排第几。
+>
+> **阅读策略**：先 [start-here.md](start-here.md) 跑通 → 想看全貌先扫 [architecture.md](architecture.md)（#28，当「地图」先看无妨）→ 再按 #1→#28 逐篇钻。**面试前过一遍 [doc-rewrite-todo.md](doc-rewrite-todo.md) 末尾的「面试概念地图」**。
+
+---
+
+## Phase 导论 — 零基础起点
+
+| # | 文档 | 一句话定位 |
+|---|------|-----------|
+| 0 | [start-here.md](start-here.md) | 零基础从这里开始——概念一页纸（LLM / agent / LangGraph / harness）+ 手把手把 mini 跑起来发第一条消息 + 全景图 + 第一跑坑 |
 
 ---
 
@@ -10,29 +20,29 @@
 
 | # | 文档 | 一句话定位 |
 |---|------|-----------|
-| 1 | [build.md](build.md) | 工程化基础设施——让「写完代码能跑测试、能 lint」成立（跳过它后面全卡环境） |
-| 2 | [testing-setup.md](testing-setup.md) | 测试怎么跑通（Python 3.14 site.py 踩坑 + hermetic 约定） |
-| 3 | [config.md](config.md) | 配置系统（类型化 + 热重载）——几乎所有模块都读它 |
-| 4 | [utils.md](utils.md) | 公共工具（时间归一 + 消息文本抽取） |
-| 5 | [user_context.md](user_context.md) | 用户上下文（三态 user_id）——用户隔离的基石 |
+| 1 | [build.md](build.md) | 工程化地基（依赖 / 测试 / lint / dev server + 阻塞 IO gate + harness 边界）——跳过它后面全卡环境 |
+| 2 | [testing-setup.md](testing-setup.md) | 测试怎么跑通 + 怎么写 hermetic 测试（Python 3.14 site.py 踩坑深度诊断 + 不连网/不调真实模型的约定） |
+| 3 | [config.md](config.md) | 配置系统（19 个强类型子配置 + mtime 热重载 + startup-only 边界 + `$VAR` 展开）——几乎所有模块都读它 |
+| 4 | [utils.md](utils.md) | 公共工具（时间戳归一 + 消息文本抽取 + 端口分配 + HTML 可读性提取） |
+| 5 | [user_context.md](user_context.md) | 用户上下文（ContextVar 三态 user_id，用户隔离的基石） |
 
 ## Phase 1 — 模型 + 运行时基础
 
 | # | 文档 | 一句话定位 |
 |---|------|-----------|
-| 6 | [models.md](models.md) | 模型工厂（thinking / tracing 能力门控 + stream 超时放宽） |
-| 7 | [persistence.md](persistence.md) | 应用持久化层（SQLAlchemy ORM + WAL 并发） |
-| 8 | [checkpointer.md](checkpointer.md) | 检查点工厂（委托 LangGraph Saver，不自建） |
-| 9 | [run_event_store.md](run_event_store.md) | 运行事件存储（消息 + 轨迹，seq 单调 + 路径穿越防御） |
-| 10 | [run_journal.md](run_journal.md) | RunJournal（LangChain 回调 → 事件采集 + token 核算） |
-| 11 | [stream_bridge.md](stream_bridge.md) | 流桥（SSE 生产者-消费者解耦 + 重连补播） |
-| 12 | [serialization.md](serialization.md) | 序列化与消息转换（LangChain/LangGraph → JSON 单一真相源） |
+| 6 | [models.md](models.md) | 模型工厂（配置驱动 + 反射加载；thinking 四路径关闭 / stream 超时放宽 / stream_usage 默认开 / attach_tracing 双调用方；vLLM 推理模型 VllmChatModel 保 reasoning 字段） |
+| 7 | [persistence.md](persistence.md) | 应用持久化层（SQLAlchemy ORM + WAL 三件套并发；app 表与 checkpointer 物理分离；memory no-op；三态 user_id 隔离；rowcount recovery + 幂等 put；token_usage_by_model 按真计费模型归桶；跨方言 JSON 过滤防注入） |
+| 8 | [checkpointer.md](checkpointer.md) | 检查点工厂（委托 LangGraph Saver 不自建；三级优先级 legacy>database>默认；async cm / sync 单例；sqlite 父目录保护 + 阻塞 IO 卸载 + 缺包可操作提示 + postgres 连接池 keepalive；与 persistence 共用 .db 但表分离） |
+| 9 | [run_event_store.md](run_event_store.md) | 运行事件存储（消息+轨迹+lifecycle 同接口按 category 分；seq 单调[memory计数器/jsonl每线程锁/db FOR UPDATE或advisory + UNIQUE 兜底]；双向游标分页；路径穿越防御；db trace 截断 + JSON 往返 + UUID→str stamp；memory 4 组投影） |
+| 10 | [run_journal.md](run_journal.md) | RunJournal（RunEventStore 写入侧：LangChain 回调采集 + token 核算[run_id 去重防双计 + 按 caller/模型分桶]；同步回调→异步刷盘桥接[loop.create_task + 失败回插]；不实现 on_llm_new_token；progress 注入无循环依赖） |
+| 11 | [stream_bridge.md](stream_bridge.md) | 流桥（worker↔SSE 解耦：每 run asyncio.Condition + 事件日志[非单消费 Queue，支持多消费者回放] + 有界窗口 queue_maxsize=256 淘汰最旧 + {ts_ms}-{seq} 内嵌 offset → O(1) 重连定位+id 核验 + END/心跳双哨兵[is 判等] + 心跳防代理掐断；仅内存实现，redis NotImplementedError） |
+| 12 | [serialization.md](serialization.md) | 序列化与消息转换（对象出进程的单一真相源：递归兜底链[8 档永不抛] + 剥 `__pregel_*`[保留 `__interrupt__` 给 SDK 识别中断] + Interrupt→{value,id} 规范化 + 剥 hide_from_ui 的 base64 图片块[三条件精确剥]；converters 鸭子类型 LangChain→OpenAI 线协议[arguments 转字符串/空 content 设 null]）——**🎉 Phase 1 收官** |
 
 ## Phase 2 — 沙箱 / 子代理 / 追踪
 
 | # | 文档 | 一句话定位 |
 |---|------|-----------|
-| 13 | [sandbox.md](sandbox.md) | 沙箱（虚拟路径 `/mnt/user-data` + 7 工具 + provider + 命令审计；本地模式非安全边界 → 引出 M10b AIO） |
+| 13 | [sandbox.md](sandbox.md) | 沙箱（虚拟路径 `/mnt/user-data` 翻译 + 7 工具[bash/ls/glob/grep/read_file/write_file/str_replace] + Sandbox ABC 8 方法 + provider 单例[加锁 4 位点/回调锁外/per-thread LRU 256] + 两层路径防御[belt-and-suspenders] + 反解析防泄露 + write_file 80KB 上限 + 同路径写串行化[WeakValueDictionary] + SandboxAuditMiddleware 三档[block/warn/pass+heredoc fail-closed]；本地模式非安全边界 → 引出 #14 AIO 容器隔离）——**Phase 2 开篇** |
 | 14 | [aio_sandbox.md](aio_sandbox.md) | AIO 沙箱（Docker/K8s 容器隔离 + 暖池 + 跨进程文件锁发现 + idle 回收 + 优雅关闭；soft-load `agent_sandbox`） |
 | 15 | [subagents.md](subagents.md) | 子代理（委派 + 单 scheduler pool + 持久隔离事件循环[非双池] + 5 状态契约 + 自定义/per-agent 覆盖 + token 回灌） |
 | 16 | [tracing.md](tracing.md) | 链路追踪（LangSmith/Langfuse 图根注入 + Langfuse 元数据映射 + models attach_tracing 懒导入联动；未配置零开销） |
@@ -121,9 +131,7 @@ models ──┐
 
 ## 其它文档（非教学，按需查）
 
-- [todo.md](todo.md) — **进度看板**（做到哪了 / 下次开工什么）
-- [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md) — **设计规格**（每个模块要做成什么样：文件清单 / 依赖 / 红线）
-- [spec-M4-persistence.md](spec-M4-persistence.md) — M4 persistence 详细规格
-- [legacy/](legacy/) — 旧版 / 待重写的文档归档（`tools.md` / `中间件.md` 等）
+- [todo.md](todo.md) — **项目待办 + 工作进度日志**（代码侧待做 / 下次开工看这）
+- [doc-rewrite-todo.md](doc-rewrite-todo.md) — **本文档重写计划**（28 篇模块文档逐个重写的标准 / 映射 / 进度）
 
-> 三者分工：**查进度** → [todo.md](todo.md)；**查设计规格** → [ALIGNMENT_OUTLINE.md](ALIGNMENT_OUTLINE.md)；**学某个模块** → 上面 1–22。
+> 分工：**查项目待做 / 工作进度** → [todo.md](todo.md)；**查文档重写进度** → [doc-rewrite-todo.md](doc-rewrite-todo.md)；**学某个模块** → 上面 1–28。

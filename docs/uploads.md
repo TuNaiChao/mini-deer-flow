@@ -327,6 +327,6 @@ for file in files:
 
 ---
 
-**下一篇**：[README.md](README.md) 的待写表里，M23 完成后，下一个是 [middlewares.md](legacy/中间件.md)（M16 重写）——
+**下一篇**：[README.md](README.md) 的待写表里，M23 完成后，下一个是 [middlewares.md](middlewares.md)——
 本模块的 `convert_file_to_markdown` / `list_files_in_dir` / `enrich_file_listing` 会被 `UploadsMiddleware` 调用，
 把上传清单注入对话。
