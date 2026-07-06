@@ -255,7 +255,24 @@ async with make_stream_bridge() as bridge:   # app.state.stream_bridge = bridge
 
 ---
 
-## §6 设计权衡（不变量 / 踩坑）
+## §6 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> stream_bridge 的每个选择都直击「**长任务 + 前端实时推送**的四个老大难」。读得懂这些「为什么」，你才算理解了流式推送工程（面试高频：「生产者-消费者解耦」「有界缓冲与淘汰」「重连补播（游标）」「心跳保活」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**用「事件日志 + Condition」解耦生产/消费并支持多消费者回放，用有界窗口防爆内存，用 `{ts_ms}-{seq}` 内嵌 offset 实现 O(1) 重连续播，用心跳防代理掐断**——让长任务的实时推送可靠。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **Condition + 事件日志**（非 Queue） | `Queue` 单消费，不支持多消费者 / 回放 | 多消费者各读各 offset + 可回放历史 | Queue → 多标签页 / 重连看不到、不能回放 |
+| **有界窗口 + eviction** | 长 run 累积几万条会 OOM | 每 run 最多 256 条，内存恒定 | 无界 → 长 run 撑爆内存 |
+| **Last-Event-ID O(1) 定位 + id 核验** | 重连要快速定位续播点 | `seq` 嵌 id 算术定位 O(1) + 核验 id 防误判 | 纯扫 O(n) 慢；不核验 → 外来/过期 id 从错位吐 |
+| **心跳哨兵 + END 哨兵**（`is` 判等） | 代理掐空闲连接；run 结束要停 | 心跳保活不结束循环；END 结束迭代器 | 无心跳 → 被代理掐；用值判等 → 可能撞用户 data |
+| **id = `{ts_ms}-{seq}`** | 跨重启纯 seq 会撞 | ts 弱唯一 + seq 同毫秒单调 | 纯 seq → 重启后撞旧前端 `Last-Event-ID` |
+| **ABC + 仅 memory（Redis TODO）** | 留扩展点给跨进程 Redis | ABC 定契约，未来加 Redis 不改调用方 | 没抽象 → 加 Redis 要改所有调用方 |
+
+下面 §6.1–§6.8 是逐条展开。
 
 ### 6.1 为什么用 Condition + 事件日志，而非 Queue
 
@@ -305,7 +322,7 @@ run 刚结束时，可能有客户端正在重连 / 刚订阅。`cleanup(run_id,
 
 `StreamBridge` 是抽象基类（[base.py:39](../backend/packages/harness/deerflow/runtime/stream_bridge/base.py#L39)），目前只有 `MemoryStreamBridge`。留 ABC 是为未来加 **Redis** 实现（跨进程 / 多节点共享事件流，`redis_url`）——届时多个 worker 进程能把事件推到同一个 Redis Stream，任一前端都能订阅，seq 由 Redis 全局生成保证唯一。
 
-Redis 当前 [直接 `NotImplementedError`](../backend/packages/harness/deerflow/runtime/stream_bridge/async_provider.py#L50-L51)。**memory 实现只能单进程**——多 worker 进程部署时，前端连的进程 A 看不到进程 B 跑的 run 的事件。这是 mini 作为教学版刻意保留的边界（不 port Gateway / 多节点部署）。
+Redis 当前 [直接 `NotImplementedError`](../backend/packages/harness/deerflow/runtime/stream_bridge/async_provider.py#L50-L51)。**注意：这不是 mini 独有的简化——上游 deer-flow 也是 `NotImplementedError`（"Redis stream bridge planned for Phase 2"），两边都只有内存实现**（详见 §9）。所以 memory 实现的「单进程」限制是**上游和 mini 共享的现状**：多 worker 进程部署时，前端连的进程 A 看不到进程 B 跑的 run 的事件。真正的「多节点」差异在更上层（mini 不 port Gateway / 多 worker 编排，→ [start-here.md](start-here.md) §2.2），不在这个文件。
 
 ---
 
@@ -401,7 +418,30 @@ config/stream_bridge_config ──→ async_provider.make_stream_bridge
 
 ---
 
-## §9 常见问题 / 排错
+## §9 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/stream_bridge/`，剥 docstring 后判逻辑差。结论：**stream_bridge 是上游的高度忠实移植**——文件集完全相同（4 文件）、`base.py` 逐行相同（72=72）、memory / async_provider 在几行误差内。一个值得澄清的认知：**Redis 未实现不是 mini 独有的简化——上游也是 `NotImplementedError`**。
+
+### 差异 1：忠实移植（4 文件逐个对齐）
+
+| 文件 | mini / 上游 行数 | 说明 |
+|---|---|---|
+| `base.py` | 72 / 72 | **逐行相同**（`StreamEvent` frozen dataclass + `HEARTBEAT/END` 两个哨兵 + `StreamBridge` ABC 四方法一默认） |
+| `memory.py` | 163 / 156 | `MemoryStreamBridge` 一致（`Condition` + 事件日志 + 有界窗口 + eviction + O(1) 重连定位 + id 核验 + 心跳 + 落后恢复），差几行 docstring |
+| `async_provider.py` | 53 / 55 | `make_stream_bridge` async cm 工厂一致（memory 分支 + redis `NotImplementedError`） |
+| `__init__.py` | 19 / 21 | 导出一致 |
+
+所有关键机制——`_resolve_start_offset` 的 O(1) 算术定位 + id 核验、`publish` 的 eviction + `start_offset` 递增、`subscribe` 的 A/B/C/D 四分支、`{ts_ms}-{seq}` 的 id 格式、心跳/END 双哨兵 `is` 判等——**两边逐行一致**。
+
+### 差异 2（澄清）：Redis 未实现是上游也有的 TODO，不是 mini 独有简化
+
+§6.8 已澄清：上游 `async_provider.py` **同样** `raise NotImplementedError("Redis stream bridge planned for Phase 2")`——**两边都只有 `MemoryStreamBridge`，Redis 都是规划中未实现**。所以「单进程内存桥」是上游和 mini **共享的现状**，不是 mini 砍出来的教学简化。真正的「多节点部署」差异在更上层（mini 不 port Gateway / 多 worker 编排），不在这个文件——这正是 stream_bridge 模块本身「纯 asyncio 中间件、不碰 Gateway」的体现。
+
+> **一句话总结**：mini 的 stream_bridge = 上游的**高度忠实移植**（4 文件一一对应、`base.py` 逐行相同、memory 的 Condition+事件日志+有界窗口+O(1) 重连+id 核验+心跳全一致）。**澄清一个常见误解**：Redis 未实现不是 mini 独有简化——上游也是 `NotImplementedError`（"planned for Phase 2"），两边都只有内存实现。
+
+---
+
+## §10 常见问题 / 排错
 
 **Q: 前端重连后丢了一些事件？**
 A: 断连太久，事件超过了 `queue_maxsize`（默认 256）窗口被淘汰。三选一：① 调大 `stream_bridge.queue_maxsize`；② 接受「落后时从最早保留事件续」（部分丢失，§6.3）；③ 要完全不丢，走持久化的 [#9 RunEventStore](run_event_store.md) + 离线补取。
@@ -423,7 +463,7 @@ A: 防外来 / 畸形 / 过期 id 误判续播点。纯算术（seq==offset）�
 
 ---
 
-## §10 小结
+## §11 小结
 
 StreamBridge 解决的是「长任务 + 前端实时推送」的四个老大难：**解耦**（worker 不等消费者）、**多消费者**（事件日志 + Condition，而非单消费的 Queue）、**有界防爆**（256 滑动窗口 + eviction）、**重连续播**（`{ts_ms}-{seq}` 内嵌 offset → O(1) 算术定位 + id 核验）、**心跳保活**（防代理掐断）。
 

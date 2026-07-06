@@ -207,7 +207,23 @@ def extract_article(self, html: str) -> Article:
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> utils 里每个小工具都解决一类「很多模块都要做、且容易写错」的操作。读得懂这些「为什么」，你才算理解了**底层工具该怎么设计才稳健**。每条都问自己：**它解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**把「会反复用到、且每个模块自己写一遍就会各错一遍」的小操作，收口成一份正确实现**——再用几个精心的设计选择（分支顺序 / 锁 / 软加载兜底）把常见坑堵死。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **时间统一 UTC ISO + `coerce_iso` 兼容历史** | 时间戳格式不统一（空格串/unix 数字/unix 字符串/ISO 混存），读历史数据会崩 | 写用 `now_iso` 统一；读用 `coerce_iso` 自动翻译所有形态 | 各模块自己 `str(time)` → 空格串/`True`变时间戳等隐蔽 bug 满天飞 |
+| **`coerce_iso` 分支顺序**（bool→datetime→int） | `isinstance(True,int)==True`，bool 不先拦会被当时间戳 1 → 1970 年 | 顺序故意，堵住 bool/datetime 被误判 | 顺序反了 → `True` 变 1970 年、datetime 空格串混入 |
+| **unix 串用 10 位锚点** | 全数字就转会把年份 `"2026"` 当时间戳 → 1970 年附近 | 10 位锚点安全到 2286 年 | 4 位年份被误转 → 历史数据时间全错 |
+| **`PortAllocator` 锁 + bind 0.0.0.0** | 并发分配端口会撞车；只查 loopback 会误报空闲（Docker 绑 wildcard） | 线程安全 + 镜像 Docker 绑定行为，准确探测 | 无锁→撞车；查 loopback→Docker 已占 wildcard 时误报，`docker run -p` 失败 |
+| **readability 三级软加载降级** | readabilipy（经 Node 跑 Readability.js）质量最好但重依赖 | 缺包时降级到纯 Python/regex，联网功能仍能跑 | 硬依赖 → 没装 Node/readabilipy 时联网抓取直接崩 |
+
+下面 §6.1–§6.4 是逐条展开。
 
 ### 6.1 为什么不全用 `str()` 一把梭存时间？
 
@@ -308,7 +324,42 @@ utils/readability.py ──→ community 联网 provider（jina/browserless/info
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/utils/`，剥 docstring/comment 后判逻辑差。结论：**utils 是上游的高度忠实移植**——time / messages / network 的核心函数和签名逐个一致。差异集中在两点：① **readability.py mini 反而更大**——因为 mini 给上游的「硬依赖」加了软加载 + regex 兜底层；② **mini 不 port `file_conversion.py`**（多格式文档转换）。
+
+### 差异 1：time.py / messages.py —— 忠实移植，函数级一致
+
+- **time.py**：两边都有 `now_iso` / `coerce_iso` / `_UNIX_TIMESTAMP_PATTERN`（10 位锚点），分支顺序（bool 先于 int、datetime 先于 int）一致。mini 67 行 vs 上游 75 行（差几行注释）。
+- **messages.py**：两边都是同样的 3 个函数 `message_content_to_text` / `message_to_text` / `get_original_user_content_text`，签名逐个一致。mini 91 行（中文注释更详）vs 上游 74 行。
+
+### 差异 2：network.py —— 核心 API 一致，mini 是精简版
+
+两边都有 `PortAllocator`（锁 + bind `0.0.0.0` 探测 + 保留集合）+ 进程级全局实例 + `get_free_port` / `release_port`。mini 101 行 vs 上游 139 行——**上游多 38 行**（上游 network.py 额外的网络工具，mini 未 port）。核心端口分配 API 一致。
+
+### 差异 3：readability.py —— mini 反而更大（加了软加载 + 兜底）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| 行数 | 83 | **197** |
+| 依赖引入 | `from markdownify import ...` / `from readabilipy import ...` **硬 import** | `try: from readabilipy import ... except ImportError:` **软加载** |
+| 兜底 | 无（假定依赖齐全） | 整套 regex `_fallback_extract` 兜底 + `Article.to_markdown` 软加载 markdownify |
+| 三级降级 | 无 | **Readability.js → readabilipy 纯 Python → regex**（mini 自加） |
+
+**为什么 mini 更大**：上游把 readabilipy / markdownify 当**核心依赖**（默认装，见 [build.md §9 差异 4](build.md)），所以硬 import、不需要兜底；mini 把它们设为**可选 extras + 软加载**（核心 install 精简），于是**必须**自己加一整层「缺包降级」机器——这正是 mini 197 > 上游 83 的原因。这是 mini「重依赖可选」总策略在 readability 上的具体落地。
+
+### 差异 4：file_conversion.py —— mini 不 port
+
+- **上游有** `utils/file_conversion.py`：多格式文档（PDF / PPT / Excel / Word）→ Markdown 转换，用 `pymupdf4llm`（优先）+ MarkItDown（兜底），大文件 `asyncio.to_thread` 卸载（修复 #1569）。
+- **mini 没有这个文件**——mini 的文件上传转换（→ #23）走 `UploadsConfig` + markitdown，没 port 上游的 pymupdf4llm 多格式路径。这正对应「mini 砍 pymupdf extra」（[build.md §9 差异 4](build.md)：上游有 `pymupdf` extra、mini 没有）。
+
+---
+
+> **一句话总结**：mini 的 utils = 上游的**高度忠实移植**（time/messages 函数级一致、network 核心 API 一致），差异两点：① readability mini **加厚**了软加载 + regex 兜底（因 mini 把重依赖设为可选、上游硬依赖所以不需要兜底）；② mini 不 port `file_conversion.py`（多格式文档转换）。两处差异都服务于 mini「核心精简、重依赖可选」的总定位。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: 存进去的时间读回来变成 `"None"` 字符串？**
 你是不是直接 `str(some_datetime_or_none)` 了？空值要给 `coerce_iso(None)` → `""`，而不是 `str()` 出 `"None"`。
@@ -330,7 +381,7 @@ utils/readability.py ──→ community 联网 provider（jina/browserless/info
 
 ---
 
-## 小结
+## 11. 小结
 
 utils 的精髓是「**把会反复用到、且容易写错的小操作，收口成一份正确实现**」。记四件事：
 

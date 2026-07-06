@@ -33,6 +33,7 @@
 - **LLM（大语言模型）**：就是 ChatGPT、DeepSeek 背后那个「给一段文字、它接着往下写」的程序。你可以把它想成一个**极其擅长接话的超级打字员**：你喂它一段对话，它猜下一句该说什么。
 - **token**：LLM 不是按「字」而是按「token」（大致是词或词的一截）来数文字的。1 个汉字大约 1–2 个 token。**LLM 按用了多少 token 收钱**，所以 agent 里到处在「省 token」。
 - **上下文窗口（context window）**：LLM 一次能「记住」多长的对话，比如 8K / 128K token。对话超长就得**摘要 / 裁剪**，否则塞不下——这是后面 [middlewares.md](middlewares.md) 的核心痛点。
+- **API / API key**：你电脑上**没有**那个大模型——它住在模型公司（DeepSeek / OpenAI）的服务器上。「调一次 LLM」= 你的程序**发一次网络请求**到那台服务器、把对话传过去、服务器把接的话传回来。**API key**（一串 `sk-...` 密钥）就是你的**通行证 + 计费凭证**：服务器凭它认出「这是你、该扣你账户的钱」。所以 §4 要你填 API key——没它，agent 发出去的请求会被服务器拒收（401 认证失败）。这也解释了「为什么 agent 里到处在省 token」：**每一次调 LLM 都要花钱**，token 越多越贵越慢。
 
 ### 1.2 agent = LLM + 工具 + 循环（ReAct 的雏形）
 
@@ -85,15 +86,51 @@ mini 的代码里到处是 `async def` / `await`。你只需要知道：
 
 ## 2. deer-flow 是什么，mini 又是什么
 
+### 2.1 产品全貌：deer-flow 是个「能上生产的完整 agent 产品」
+
 **deer-flow**（[bytedance/deer-flow](https://github.com/bytedance/deer-flow)）是字节开源的一个 **super agent harness**——一个能编排子代理、有记忆、能在沙箱里干活、靠可扩展「技能」驱动的通用 agent 框架。简单说：**一套「搭一个能干活的 AI 助手」的完整工程实现**。
 
-**mini-deer-flow** 是它的**教学化重写版**：
+它之所以叫「**产品**」而不只是「库」，是因为它带了一整套让 agent **能对外服务、能上生产**的东西：浏览器能访问的网页前端、对外的 REST API、用户登录鉴权、IM 渠道（飞书/钉钉之类）接入、Docker 容器化部署……这些加起来，才是「能交付给真实用户用的 AI 助手」。
 
-- **同样的核心**：用更小的代码量、更细的讲解，把 deer-flow 的 harness 层重新写一遍，**行为上对标、不裁剪核心功能**（沙箱 / 子代理 / 记忆 / 工具 / 技能 / MCP / 联网 / 上传 / 自定义 agent 全在）。
-- **故意不 port（不搬）的部分**：deer-flow 还有一层 **Gateway**（FastAPI 写的对外 Web 服务：REST API、用户认证、IM 渠道集成、Docker 部署）。mini 是**教学版，不要这层**——mini 直接用 `langgraph dev`（开发服务器）跑，或基于 [`runtime_lifespan`](architecture.md) 自己搭。所以 mini **没有**：对外 REST API、登录鉴权、IM 渠道、Docker 部署、生产级扩缩容。
-- **衍生关系**：mini 大量代码衍生自 / 移植自 deer-flow（都 MIT 协议，已保留上游版权声明，见 [../NOTICE](../NOTICE)）。mini 是学习用途，**不是** deer-flow 的替代分支，也不受 Bytedance 认可。生产用请用上游 deer-flow。
+### 2.2 mini 是什么：只取「harness 核心」的教学版
 
-> 一句话：**deer-flow 是「一个能上生产的完整 agent 产品」；mini 是「把它的核心拆开、讲给你看的教学版」——能跑、能学，但不包上生产。**
+**mini-deer-flow** 把 deer-flow 砍成「只够学习、但能真跑」的教学版。砍法是**源码级**的——不是随便删功能，而是**整块整块地不要**：
+
+**① harness 核心包：高度忠实移植，只砍 3 个顶层模块。**
+
+deer-flow 的 agent 引擎装在一个 Python 包里：`backend/packages/harness/deerflow/`。mini 的源码**就在同名同结构的目录**下（`mini-deer-flow/backend/packages/harness/deerflow/`）。两边并排一比，目录几乎一样——`agents/ config/ models/ persistence/ runtime/ sandbox/ subagents/ tools/ skills/ mcp/ ...` 全在。mini 只在**这个包的顶层**少 3 样东西：
+
+| 顶层条目 | 上游 deer-flow 有 | mini 有 | 它是干嘛的（mini 为什么不要） |
+|----------|:---:|:---:|------|
+| `client.py`（DeerFlowClient） | ✅ | ❌ | 一个**嵌入式 Python 客户端**——让你在 Python 代码里 `from deerflow.client import DeerFlowClient; client.chat(...)` 直接调 agent，不用起 Gateway 服务。mini 跑 `langgraph dev` 就能对话，用不到这个「编程式入口」。 |
+| `guardrails/`（builtin/middleware/provider） | ✅ | ❌ | **输入/输出安全过滤**（拦截有害 prompt、给回答加防护栏）。教学版聚焦「agent 怎么转起来」，安全护栏是生产化话题，先不讲。 |
+| `tui/`（app/cli/render/…） | ✅ | ❌ | **终端 UI**（在命令行里跑一个花哨的聊天界面）。mini 直接用浏览器里的 LangGraph Studio 当界面，省掉一整套终端渲染代码。 |
+
+> 这就是后面每篇文档里「**§10 实现差异（vs 上游 deer-flow 源码）**」的总源头：mini 的 harness 是上游的**忠实移植**，差异集中在「砍这 3 个顶层模块 + 各模块的零星教学简化」。每篇会精确到「剥掉注释后，这个函数 mini 和上游差几行、为什么」。
+
+**② harness 包「之外」的东西：整个 Gateway + 前端 + 部署，mini 一概不要。**
+
+上游 `backend/` 里还有个 `app/` 目录——那就是 **Gateway**：FastAPI 写的对外 Web 服务（REST API、登录鉴权、IM 渠道、多用户隔离）。再往仓库根看，上游还有 `frontend/`（网页前端）、`docker/` + `Dockerfile`（容器化部署）、`scripts/`（运维脚本）。**这些 mini 全都没有**——mini 的 `backend/` 干干净净，只有 `Makefile / langgraph.json / config.yaml / packages/` 这几样。
+
+mini 不要它们，换来的是**直接用 `langgraph dev` 跑**（开发服务器，开箱即用一个调试 UI），或基于 [`runtime_lifespan`](architecture.md) 自己搭。代价是：mini **没有**对外 REST API、登录鉴权、IM 渠道、Docker 部署、生产级扩缩容——这些是「上生产」才需要的，教学版不背。
+
+### 2.3 设计动机：为什么 mini 偏偏这么砍
+
+你可能问：**为什么不砍点别的、或者干脆全留着？** 这套砍法是有讲究的，每个选择都能讲出「为什么」：
+
+- **为什么砍 `client.py` / `tui/` 而不砍 `sandbox/` / `subagents/`？** —— 因为沙箱、子代理、记忆、工具、技能这些是 **agent 能不能干活的核心**（§1.2 讲的 ReAct 循环就靠它们）；而 `client.py`（编程式入口）和 `tui/`（终端界面）是**怎么和 agent 对话的「外壳」**。学 agent 要学内核，不是学外壳。`langgraph dev` 已经提供了外壳（浏览器 Studio），所以这两个外壳可以放心砍。
+
+- **为什么砍 `guardrails/`？** —— 安全护栏重要，但它是**叠加在 agent 之上的「生产化」一层**，依赖你对「agent 本体怎么转」已经熟。教学顺序是先把本体讲透，护栏留给进阶。所以 mini 的中间件链（→ [middlewares.md](middlewares.md)）保留了上下文工程类中间件（裁 token、防循环），砍掉的是纯安全过滤类。
+
+- **为什么砍整个 Gateway + 前端 + Docker，而不是「也教一教」？** —— 因为那一层是**另一门学问**（Web 后端 + 鉴权 + 运维），和「agent 怎么设计」是两回事。塞进来只会让小白还没见到 agent 就被 FastAPI/Docker 劝退。`langgraph dev` 一行命令就能让 agent 活过来——这是给学习者最大的礼物：**最快路径看到 agent 真的回复你**。
+
+- **为什么 harness 包要「忠实移植」而不是「重新发明」？** —— 因为 mini 的目标是「**让你读懂真实生产级 agent 的代码长什么样**」。如果重写一套自创的简化实现，你学到的就不是 deer-flow 的设计，而是一个玩具。忠实移植意味着：你在 mini 里读到的每个设计（checkpointer 怎么存、子代理怎么委派、沙箱怎么隔离），**和生产 deer-flow 是同一套**，知识可迁移。
+
+> 一句话：**deer-flow 是「一个能上生产的完整 agent 产品」；mini 是「把它的 harness 核心拆开、讲给你看的教学版」——砍掉外壳与生产化层，留住 agent 内核，能跑、能学，但不包上生产。**
+
+### 2.4 一句话法律关系
+
+mini 大量代码衍生自 / 移植自 deer-flow（都 MIT 协议，已保留上游版权声明，见 [../NOTICE](../NOTICE)）。mini 是**学习用途**，不是 deer-flow 的替代分支，也不受 Bytedance 认可。**生产用请用上游 deer-flow。**
 
 ---
 
@@ -280,7 +317,7 @@ AI 的回复（流式吐回浏览器）
    - Phase 1 模型 + 运行时（models / persistence / checkpointer / events / journal / stream_bridge / serialization）→
    - Phase 2 沙箱 / 子代理 / 追踪 → Phase 3 记忆 → Phase 4 技能 → Phase 5 MCP + 联网 + 工具 → Phase 5.5 上传 → Phase 6 中间件 → Phase 7 agent 装配 → Phase 8 运行管理 + Store + 集成
 
-**面试前**：过一遍 [doc-rewrite-todo.md](doc-rewrite-todo.md) 末尾的「**面试概念地图**」——它把 agent 面试常考点对到了 mini 哪篇讲、一句话怎么答。
+**面试前**：过一遍 [README.md](README.md) 末尾的「**面试概念地图**」——它把 agent 面试常考点对到了 mini 哪篇讲、一句话怎么答。
 
 ---
 
@@ -307,7 +344,6 @@ AI 的回复（流式吐回浏览器）
 - **想先看「整个系统怎么拼起来」** → [#28 architecture.md](architecture.md)（全景图，可先当地图扫）
 - **想找某个模块** → [README.md](README.md)（按 #1–#28 索引）
 - **想看项目待办 / 工作进度** → [todo.md](todo.md)
-- **想看这套文档本身的重写进度** → [doc-rewrite-todo.md](doc-rewrite-todo.md)
 
 ---
 

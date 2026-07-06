@@ -195,7 +195,24 @@ def serialize_channel_values(channel_values):
 
 ---
 
-## §6 设计权衡（不变量 / 踩坑）
+## §6 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> serialization + converters 的每个选择都直击「**对象出进程时要安全、保真、不爆炸**」。读得懂这些「为什么」，你才算理解了 API 序列化工程（面试高频：「对象序列化兜底」「线协议翻译」「payload 裁剪」「向后兼容」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**把「对象离开进程」这件事收口成单一真相源——递归兜底永不抛、剥脏键保安全、剥巨型 payload 防爆炸、按需翻译成 OpenAI 线协议**。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **递归兜底链（8 档永不抛）** | LangChain 对象形态多样，裸 `json.dumps` 会炸 | 任何对象都能序列化，脏数据不让响应 500 | 无兜底 → 一个畸形对象炸整个响应 |
+| **剥 `__pregel_*` 留 `__interrupt__`** | 前者是引擎账本、后者是 SDK 中断信号 | 不泄漏内部键 + 保住中断检测 | 全剥 → SDK 识别不出中断；不剥 → 泄漏实现细节 |
+| **`Interrupt` 单列第 7 档** | `__slots__` 类无 `model_dump`/`dict`/`__dict__` | 规范化成 `{value,id}`，SDK 可读 | 不单列 → 落到 `str()` 产出 `<Interrupt ...>` 无用串 |
+| **只剥 `hide_from_ui` 的 `data:` 图片** | 可见图片要展示、内部巨型 base64 要剥 | 砍 payload 不破坏消息流 | 全剥 → 用户图没了；不剥 → 响应几十 MB |
+| **两文件分工**（保真 vs 翻译） | 剥键规则与 OpenAI 翻译是两个关注点 | 各自演化不互相牵制 | 合一文件 → 改一边影响另一边 |
+| **converters 鸭子类型 `getattr`** | 不强依赖 LangChain 具体类 | 测试可用 `SimpleNamespace`、宽进严出 | `isinstance` → 受版本字段变化影响、测试要导入真类 |
+
+下面 §6.1–§6.6 是逐条展开。
 
 ### 6.1 剥 `__pregel_*` vs 保留 `__interrupt__`
 
@@ -306,7 +323,39 @@ worker 把对象**存进** RunEventStore / 推过 stream_bridge 前，会先用 
 
 ---
 
-## §9 常见问题 / 排错
+## §9 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/serialization.py` + `converters.py`，剥 docstring 后判逻辑差。结论：**serialization + converters 是上游的高度忠实移植——0 逻辑差**（仅 docstring 中英翻译）。
+
+### serialization.py —— 7 函数逐个一致
+
+两边都有同样的 7 个函数（同名、同签名、几乎同行号）：`serialize_lc_object` / `serialize_channel_values` / `strip_data_url_image_blocks` / `serialize_channel_values_for_api` / `serialize_messages_tuple` / `serialize`。关键逻辑两边逐行一致：
+
+- **8 档递归兜底链**（None→标量→dict→list/tuple→`model_dump`→`dict`→`Interrupt`→`str`/`repr`）一致；
+- **只剥 `__pregel_*`、保留 `__interrupt__`**（`if key.startswith("__pregel_")` 两边都在，[mini:70](../backend/packages/harness/deerflow/runtime/serialization.py#L70) / 上游:68）一致；
+- **`Interrupt` 软 import + 规范化成 `{value, id}`** 一致（mini docstring 还引用了 issue #3595）。
+
+mini 143 行 vs 上游 146 行——差的 3 行全是 docstring 中英翻译。
+
+### converters.py —— 4 函数逐个一致
+
+两边都有同样的 4 个函数：`langchain_to_openai_message` / `_infer_finish_reason` / `langchain_to_openai_completion` / `langchain_messages_to_openai`。关键逻辑两边一致：
+
+- **鸭子类型 `getattr`** 访问（不强依赖 LangChain 具体类）；
+- **`tool_calls.arguments` 转 JSON 字符串**、**空 content 设 `null`**、**`_ROLE_MAP`**（`human`→`user` / `ai`→`assistant` / …）一致；
+- completion 的 `usage` 从 `usage_metadata` 映射（input→`prompt_tokens` / output→`completion_tokens`）一致。
+
+mini 133 行 vs 上游 136 行——差的 3 行全是 docstring。
+
+### 为什么这两个文件如此一致
+
+serialization + converters 是**纯函数模块、零依赖**（不碰 Gateway / app / 模型 / 存储）。输入是 LangChain/LangGraph 对象，输出是纯 Python 结构。所以砍掉 Gateway 后，这两个文件**一行都不用改**——和 #5 user_context / #10 run_journal 的抽象解耦红利同理（底层定义接口、不依赖上层具体实现，换掉上层底层零改动）。
+
+> **一句话总结**：mini 的 serialization + converters = 上游的**逐行忠实移植，0 逻辑差**（serialization 7 函数 + converters 4 函数同名同序、关键逻辑逐行一致），唯一差异是 docstring 中英翻译（各差 3 行）。纯函数零依赖模块靠抽象解耦上层，砍掉 Gateway 后一行都不用改。
+
+---
+
+## §10 常见问题 / 排错
 
 **Q: 序列化后某个对象变成了字符串 `"Foo(...)"`？**
 A: 兜底链走到了第 8 档 `str(obj)`——说明它既不是标量/dict/list，也没有 `model_dump`/`dict`，更不是 `Interrupt`。检查这个对象是不是该自己实现 `model_dump`，或者是不是不该出现在序列化输入里。
@@ -331,7 +380,7 @@ A: 正常。JSON 没有 tuple 类型，第 4 档把 tuple 转成 list。这是 J
 
 ---
 
-## §10 小结
+## §11 小结
 
 serialization + converters 是「对象出进程」的**单一真相源**，一个保真、一个翻译：
 

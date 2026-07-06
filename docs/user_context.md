@@ -208,7 +208,23 @@ def resolve_user_id(value, *, method_name="repository method") -> str | None:
 
 ---
 
-## 5. 设计权衡与踩坑
+## 5. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> user_context 虽小（单文件 ~170 行），但每个选择都直击「**并发下的用户隔离**」这个后端硬骨头。读得懂这些「为什么」，你才算理解了多用户系统该怎么隔离（面试高频：「ContextVar vs thread-local」「跨线程上下文传递」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 5.0 核心设计动机（先看这张表）
+
+一句话总动机：**让「当前是哪个用户」成为请求级单一真相，业务函数不用透传 `user_id`，且在并发 / 后台线程 / 跨边界等所有场景下都不丢、不串**。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **ContextVar（task 级）** | asyncio 单线程多 task，thread-local 会让同线程多个用户请求共用一个值 | task 级天然隔离，每个请求各自一份用户 | thread-local → 同线程多用户互相覆盖、串数据 |
+| **三态 `user_id` + `AUTO` 哨兵** | 要区分「没传」/「故意传 None」/「指定值」三种意图 | 独特哨兵精确区分三态，不撞车 | 用 None 当默认 → 「没传」和「故意不隔离」分不清 |
+| **`AUTO` 无用户时 raise** | 仓库层默默回退 default，A 用户数据会错归 default | raise 暴露调用链 bug，逼你显式处理 | 默认回退 → 隐蔽数据泄漏，极难查 |
+| **`resolve_runtime_user_id` 三优先级** | contextvar 跨真正的线程会丢（§2.3） | `runtime.context` 兜底，跨边界也不丢用户 | 只靠 contextvar → 后台任务拿到 default，写错用户 |
+| **边界 `str()` 化** | `User.id` 可能是 UUID，SQLite 驱动不支持 UUID 绑 VARCHAR | 出口统一 `str()`，调用方无感 | 每个调用点自己转，漏一处存库就崩 |
+
+下面 §5.1–§5.5 是逐条展开。
 
 ### 5.1 为什么用 ContextVar 而非 thread-local？
 
@@ -240,8 +256,6 @@ def resolve_user_id(value, *, method_name="repository method") -> str | None:
 - **`get_effective_user_id()`**：拼文件路径用。路径总得有个 user_id 才能写盘，没用户时回退 `default` 让程序能继续跑（本地开发 / 测试场景）。
 
 **「严格」用在数据安全（raise 暴露泄漏），「宽容」用在可用性（default 保证不崩）**——这是有意的权衡。
-
-> 内部追溯：本文的设计约束在上游工程记录里分别编号为红线 #10（边界 str() 化防 UUID→VARCHAR）、#2615（后台线程 ContextVar 丢失 → 显式抄出）。这些编号仅作内部对照，不影响理解。
 
 ---
 
@@ -308,7 +322,32 @@ Timer(30, lambda: save(captured_uid)).start()
 
 ---
 
-## 7. 常见问题 / 排错
+## 7. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/user_context.py`，**剥 docstring 后判逻辑差**。结论：**user_context.py 是上游的逐行忠实移植——0 逻辑差**。
+
+### 逐行一致的部分（全部）
+
+所有函数 / 常量两边**逐行一致**：`CurrentUser` Protocol、`_current_user` ContextVar、`set_current_user` / `reset_current_user` / `get_current_user` / `require_current_user`、`DEFAULT_USER_ID = "default"`、`get_effective_user_id`、`resolve_runtime_user_id`（三优先级 `runtime.context["user_id"]` > contextvar > default）、`_AutoSentinel` 单例哨兵、`AUTO`、`resolve_user_id`（三态 + 边界 `str()` 化）。mini 170 行 vs 上游 195 行——**差的 25 行全是 docstring**（mini 中文 + 略短，上游英文 + 略长），代码体一字不差。
+
+### 唯一实质差异：docstring 里「谁写入 contextvar」的描述（代码本身无差）
+
+| | 上游 deer-flow docstring | mini docstring |
+|---|---|---|
+| 谁写入 contextvar | "the **gateway's auth middleware** sets after a successful authentication" | "**集成层**（未来的 lifespan / 入口）在鉴权成功后写入" |
+| 依赖方向 | "`persistence` 读；**gateway.auth** 写" | "`persistence` 读；集成层写（mini 无独立 app/gateway 层）" |
+
+### 为什么砍掉 Gateway 后这个文件一行都不用改
+
+user_context 是**纯抽象层**——它只定义 `CurrentUser` Protocol（鸭子类型，**不 import 真实 User 类**）+ 一个 ContextVar，**代码里根本不出现 `gateway` / `auth` 字样**。所以 mini 砍掉 Gateway 后，这个文件**代码零改动**，只需把 docstring 里「gateway 的 auth 中间件」改成「集成层 / lifespan」（因为 mini 的写入方是 lifespan 或入口，不是 gateway 鉴权中间件）。
+
+这正是 **Protocol 抽象（依赖倒置）** 的价值：**底层定义接口、不依赖上层具体实现，换掉上层（砍 gateway）底层零改动**。user_context 是这套设计红利最干净的例证。
+
+> **一句话总结**：user_context.py = 上游的**逐行忠实移植，0 逻辑差**（ContextVar task 级隔离 / 三态 `AUTO` 哨兵 / `resolve_runtime_user_id` 三优先级 / 边界 `str()` 化全一致）。唯一差异是 docstring 里「写入方」的描述（上游 = gateway auth 中间件 / mini = 集成层 lifespan）——因为代码靠 Protocol 抽象解耦了上层，砍掉 Gateway 后底层零改动。
+
+---
+
+## 8. 常见问题 / 排错
 
 **Q: 后台任务里 `get_effective_user_id()` 返回 `"default"`，但当前明明是 user-A？**
 你踩了 §2.3 的坑：后台任务跑在**真正的线程**（Timer / 线程池）里，contextvar 没带过去。解决办法：在**入队时**就把 user_id 显式抄出来，后台线程用抄出来的值。memory 队列（→ #18）就是这么做的。
@@ -327,7 +366,7 @@ Timer(30, lambda: save(captured_uid)).start()
 
 ---
 
-## 小结
+## 9. 小结
 
 user_context 的精髓是「**用 ContextVar 做 task 级用户隔离的单一真相源**」。记四件事：
 

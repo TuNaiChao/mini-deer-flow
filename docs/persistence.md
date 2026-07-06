@@ -248,7 +248,24 @@ await close_engine() -> None                                    # :190  dispose 
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> persistence 的每个选择都直击「**怎么把应用元数据可靠落盘，且并发 / 隔离 / 重试都不出岔**」。读得懂这些「为什么」，你才算理解了后端持久化工程（面试高频：「并发控制 WAL」「ORM 设计」「多租户隔离」「幂等与重试」「跨方言兼容」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**用 ORM 把应用元数据可靠落盘，并把并发 / 隔离 / 重试 / 跨方言的脏活用机制兜住**——让数据层在 SQLite/PostgreSQL/内存三种后端下都正确、且空配置也能启动。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **物理分库分表**（app 元数据 vs checkpointer 对话） | 两者生命周期 / 关注点不同 | schema 演进互不牵制，各管各的 | 混表 → 改一边牵动另一边，迁移噩梦 |
+| **WAL 三件套**（WAL+synch=NORMAL+busy_timeout） | SQLite 默认 rollback journal 并发极差 | 多读 + 单写不阻塞；安全且快；锁竞争等 30s | 默认模式 → 读写互阻、频发 `database is locked` |
+| **memory 是 no-op**（不建 engine） | 空配置必须能启动 | 什么都不配也能跑、CI 不依赖外部服务 | memory 也建 engine → 缺包/缺目录就起不来 |
+| **三态 user_id + UUID→str 边界** | 多租户隔离 + aiosqlite 不支持 UUID 绑 VARCHAR | 隔离越权；边界转一次不扩散到每个调用方 | 无 user_id → Bob 看到 Alice 数据；UUID 直进 → `type not supported` |
+| **rowcount `bool` 返回 + 幂等 put** | 恢复需知「行还在吗」+ 重试需安全 | rowcount 驱动 recovery；幂等让重试不主键冲突 | 返回 None → 恢复盲猜；非幂等 → 重试撞主键 |
+| **`token_usage_by_model` JSON 列** | 一个 run 可能路由多模型 | 按真计费模型分桶，能答「gpt-4o 花多少」 | 平铺列 → 只知总数，不知各模型明细 |
+
+下面 §6.1–§6.7 是逐条展开。
 
 ### 6.1 memory 模式是 no-op，不是「内存引擎」
 
@@ -383,7 +400,41 @@ database:
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/persistence/`（上游 27 个 `.py` / mini 14 个），剥 docstring 后判逻辑差。结论：**核心持久化层（10 个共享文件）是上游的忠实移植**——`base.py` 逐行相同（55=55），`engine` / `run` / `thread_meta` / `json_compat` / `run_event` 都在几行误差内（差异是 docstring 语言）。差异是 mini **砍掉 5 类上游独有的文件**，全部对应「砍 Gateway / IM / 未 port 功能 / 不要迁移工具」。
+
+### 差异 1：核心持久化层——忠实移植（10 文件逐个对齐）
+
+| 文件 | mini / 上游 行数 | 说明 |
+|---|---|---|
+| `base.py` | 55 / 55 | **逐行相同**（`Base` + `to_dict` + `@cache _column_keys`） |
+| `engine.py` | 197 / 205 | WAL 三件套 / `init`·`close`·`session_factory` 一致（差几行 docstring） |
+| `run/sql.py` | 375 / 378 | `RunRepository` 全方法一致，含 `token_usage_by_model` 分桶（上游 `migrations/0002` 加的列，两边都有） |
+| `run/model.py` | 56 / 50 | `RunRow` 字段一致 |
+| `json_compat.py` | 206 / 195 | `json_match` 跨方言过滤一致 |
+| `thread_meta/{base,memory,model,sql}.py` | 88+158+25+232 / 90+159+23+243 | `ThreadMetaStore` ABC + 内存/SQL 双实现一致 |
+| `models/run_event.py` | 42 / 35 | `RunEventRow` 建表一致 |
+
+### 差异 2：mini 砍掉的 5 类上游文件
+
+| 上游独有 | 是什么 | mini 为什么不要 |
+|---|---|---|
+| `migrations/`（env.py + helpers + versions/0001 baseline + 0002 runs_token_usage） | **Alembic 数据库迁移**（schema 演进工具） | mini **故意不引入 Alembic**（§10 FAQ）——开发期直接删 `.db` 让 `create_all` 重建；教学版不背迁移工具的复杂度 |
+| `bootstrap.py` | 启动时自动 `alembic upgrade head` 的 schema 引导 | 依赖 Alembic，一起砍 |
+| `channel_connections/`（model + sql） | IM 渠道连接（飞书/Slack/钉钉）存储 | mini 无 IM（→ [start-here.md](start-here.md) §2.2） |
+| `feedback/`（model + sql） | 用户反馈存储 | 功能未 port |
+| `user/`（model） | 真实 `User` 表 | mini 用 `CurrentUser` Protocol + `SimpleNamespace`（→ #5），不建独立 User 表（鉴权是 Gateway 层） |
+
+### 为什么核心层如此一致
+
+persistence 是**纯数据层**——它的输入（`DatabaseConfig` / `user_id` / `time`）都来自抽象的 config / user_context / utils，**不依赖 Gateway / app**。所以砍掉 Gateway 后，核心持久化层**几乎零改动**——和 #5 user_context 的 Protocol 抽象红利同理（底层定义接口、不依赖上层具体实现，换掉上层底层零改动）。mini 只是「砍掉 IM/反馈/迁移/User 这些上游产品功能，保留通用存储骨架」。
+
+> **一句话总结**：mini 的 persistence = 上游核心存储层的**忠实移植**（`base.py` 逐行相同，`engine`/`run`/`thread_meta`/`json_compat` 全在几行误差内），砍掉 5 类上游独有文件：Alembic 迁移（`migrations/` + `bootstrap.py`，mini 故意不要迁移工具）+ IM 渠道连接（`channel_connections/`）+ 用户反馈（`feedback/`）+ 真实 User 表（`user/`，mini 用 Protocol 代替）。核心层零改动，因为数据层靠抽象解耦了上层。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: `get_session_factory()` 返回 `None`？**
 A: 当前 backend 是 `memory`（默认）。memory 模式不创建 engine。要么改 `config.yaml` 的 `database.backend`，要么调用方检查 `None` 并回退内存实现（§6.1）。
@@ -410,7 +461,7 @@ A: 本期没有 Alembic（数据库迁移工具）。开发期直接删 `.db` �
 
 ---
 
-## 小结
+## 11. 小结
 
 persistence 模块的精髓是**用 ORM 把应用元数据可靠落盘，并把并发 / 隔离 / 重试的脏活收口**。记住五件事：
 

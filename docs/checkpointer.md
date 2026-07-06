@@ -178,7 +178,24 @@ postgres Saver 不用单连接，而用 `psycopg_pool.AsyncConnectionPool`，配
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> checkpointer 的每个选择都直击「**怎么把图状态快照可靠存取、且生命周期 / 配置优先级 / 运维坑都不出岔**」。读得懂这些「为什么」，你才算理解了 LangGraph 状态持久化工程（面试高频：「状态持久化怎么设计」「资源生命周期管理」「配置优先级与后向兼容」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**委托 LangGraph 内置 Saver（不自建），只在「挑哪个 Saver + 管生命周期 + 兜运维坑」这层做厚**——让图状态能跨轮恢复 / 回放 / 断点续跑，同时配置 / 资源 / 缺包 / 云连接都自动处理。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **委托 LangGraph Saver，不自建** | 自建 `BaseCheckpointSaver` 子类要管序列化/版本/并发，极复杂且跟版本走 | 只在「挑哪个+生命周期」加值，存储逻辑官方维护 | 自建 → 易错、跟 LangGraph 版本走、维护负担重 |
+| **三级优先级**（legacy > database > memory） | 后向兼容 + 显式覆盖 | 老用户独立写的 `checkpointer:` 段升级后不被悄悄改 | 无 legacy 档 → 统一 database 后老配置被静默覆盖 |
+| **async 用 cm / sync 用单例** | Saver 持连接/池资源需成对 setup/teardown；图编译要稳定引用 | async 成对清理不漏；sync 复用稳定引用 | 都单例 → async 连接不释放；都 cm → 图编译引用不稳 |
+| **sqlite 父目录保护 + `to_thread` 卸载** | 父目录不存在 → `unable to open`；`mkdir` 是阻塞 IO | 自动建目录；不卡事件循环 | 不建目录 → 首跑崩；不卸载 → 触发 blocking-IO gate |
+| **缺包软加载 + 可操作提示** | Saver 包是可选 extra | 缺包报安装命令而非晦涩 `ModuleNotFoundError` | 硬 import → 缺包报错难懂 |
+| **postgres 连接池三件套**（keepalive/check/prepare_threshold） | 云 DB/防火墙静默断连；pgbouncer 下 prepared 冲突 | keepalive 防断连；取连接验活；`prepare_threshold=0` 避冲突 | 默认 → 云上连接静默失效 / prepared statement 冲突 |
+
+下面 §6.1–§6.5 是逐条展开。
 
 ### 6.1 为什么 async 用 context manager、sync 用单例
 
@@ -284,7 +301,31 @@ checkpointer:
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/checkpointer/` + `store/_sqlite_utils.py` + configs，剥 docstring 后判逻辑差。结论：**checkpointer 是上游的高度忠实移植**——文件集完全相同（7 文件一一对应）、函数签名逐个一致（`_async_checkpointer` / `_async_checkpointer_from_database` / `make_checkpointer` / `get_checkpointer` 在两边几乎同一行）、`store/_sqlite_utils.py` 两个函数逐字节相同。唯一实质差异在**同步 `provider.py` 的配置读取方式**（§6.5）。
+
+### 差异 1：store/_sqlite_utils.py —— 逐字节相同（仅 docstring 中英）
+
+`resolve_sqlite_conn_str` / `ensure_sqlite_parent_dir` 两个函数**逻辑完全一致**（同样的 `:memory:` / `file:` 判断、同样的 `mkdir(parents=True, exist_ok=True)`）。mini 36 行 vs 上游 28 行——差的 8 行**全是 docstring**（mini 中文 + 注释；上游英文）。
+
+### 差异 2：async_provider.py —— 忠实移植（三级优先级 + postgres 连接池两边都有）
+
+`make_checkpointer(app_config)` / `_async_checkpointer` / `_async_checkpointer_from_database` 签名逐个一致；三级优先级（legacy `checkpointer:` > 统一 `database:` > 默认 `InMemorySaver`）两边都有；postgres 连接池三件套（`keepalives_idle=60` / `check_connection` / `prepare_threshold=0`）也一致。差异纯 docstring（mini 中文面向小白讲解）。
+
+### 差异 3：同步 provider.py —— 唯一实质差异：配置读取方式
+
+| | 上游 deer-flow `get_checkpointer()` | mini `get_checkpointer()` |
+|---|---|---|
+| 读配置 | `ensure_config_loaded()` → `get_checkpointer_config()`（先确保配置加载，再取 checkpointer 段） | `get_app_config().checkpointer`（直读全局配置的 checkpointer 段） |
+
+**为什么**：上游有 Gateway 层，`get_checkpointer()` 可能从 Gateway / 嵌入式客户端路径被调用，那些路径**不保证配置已加载**，所以要 `ensure_config_loaded()` 兜底。mini 走 `langgraph dev`，进 lifespan 时配置必然已加载，故直读 `get_app_config()` 更简单。**语义等价**——两边都拿到 `CheckpointerConfig`，只是 mini 无 Gateway 故省了「确保加载」那层（详见 §6.5）。
+
+> **一句话总结**：mini 的 checkpointer = 上游的**高度忠实移植**（7 文件一一对应、函数签名逐个一致、`_sqlite_utils` 逐字节相同、async 三级优先级 + postgres 连接池三件套全一致），唯一实质差异是**同步 `provider.py` 的配置读取**：上游 `ensure_config_loaded()` + `get_checkpointer_config()`（Gateway 层不保证配置已加载）、mini `get_app_config().checkpointer` 直读（langgraph dev 配置必然已加载）——语义等价，mini 因无 Gateway 更简。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: 报 `unable to open database file`？**
 A: sqlite 文件的父目录不存在。本模块的 `ensure_sqlite_parent_dir` 会自动建（§6.2）——如果你绕过了 `make_checkpointer` 直接调 `SqliteSaver.from_conn_string`，就要自己先建目录。检查 `sqlite_dir` 是否可写。
@@ -309,7 +350,7 @@ A: 不。checkpoint 存的是图状态（含消息内容），明文落盘。敏
 
 ---
 
-## 小结
+## 11. 小结
 
 checkpointer 模块的精髓是**委托而非自建，把「挑哪个 Saver + 生命周期管理」这层做厚**。记住四件事：
 

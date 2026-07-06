@@ -1,12 +1,12 @@
 # 13. sandbox.md — 沙箱（虚拟路径 + 7 工具 + provider 单例 + 命令审计）
 
-> 📝 重写于 2026-07-05 · 对照代码 commit ffc5e5d
+> 📝 重写于 2026-07-05 · 对照代码 commit ffc5e5d · **2026-07-05 复审**（更面向小白 + 加「实现差异 vs 上游 deer-flow 源码」）
 
 > **一句话定位**：沙箱是「让 agent 在受控环境里跑 bash、读写文件、搜索代码」的子系统——它把 agent 看到的**虚拟路径**（`/mnt/user-data/...`）翻译成宿主机上按 `(user_id, thread_id)` 隔离的真实目录，再交给真实 shell / 文件系统执行，并审计每条 bash 命令。**本地模式不是安全边界**，真正的容器隔离见 [#14 aio_sandbox.md](aio_sandbox.md)。
 
 > **配套代码**：[sandbox/](../backend/packages/harness/deerflow/sandbox/)（13 个文件）+ [agents/middlewares/sandbox_audit_middleware.py](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py) + [config/sandbox_config.py](../backend/packages/harness/deerflow/config/sandbox_config.py)
 > **配套测试**：[test/test_sandbox.py](../test/test_sandbox.py)（hermetic 测试套件，`DEER_FLOW_HOME` 指向 tmp_path 不碰宿主真实数据）
-> **参考**：deerflow-book [13-sandbox-abstraction.md](../deerflow-book/chapters/13-sandbox-abstraction.md)（借「虚拟路径 + Sandbox ABC + 延迟初始化」框架；mini 实现细节与 book 有差异，见 §4.5）
+> **参考**：deerflow-book [13-sandbox-abstraction.md](../deerflow-book/chapters/13-sandbox-abstraction.md)（**仅借「虚拟路径 + Sandbox ABC + 延迟初始化」的概念叙事框架**，不作差异基线）；**实现差异一律对照上游源码** `deer-flow/backend/packages/harness/deerflow/sandbox/`，见本文 §9
 > 本文面向「刚接触沙箱 / 容器隔离 / 虚拟文件系统的小白」。每个名词第一次出现都会解释。
 
 ---
@@ -26,7 +26,9 @@
 
 ## §1 为什么需要沙箱（痛点）
 
-agent 要能「写代码、跑代码、改文件」才有用。但 agent 跑的命令会**真实作用在宿主机上**——如果它执行 `rm -rf /` 或 `cat /etc/passwd`，没有隔离就会真把宿主搞坏 / 把敏感文件读走。所以需要：
+**先说清「agent 跑代码」到底意味着什么。** agent 是一段会「自己决定下一步干什么」的程序，它的一个常见动作就是「帮我跑一条 shell 命令」（比如 `python3 main.py`、`pip install xxx`、`cat result.txt`）。在 Python 里，让程序去跑一条 shell 命令，本质是**生一个子进程**（child process）去执行真实操作系统的命令——这个子进程在你的电脑上能干的事，和你在终端里敲命令能干的事**一模一样**：能建文件、删文件、读 `/etc/passwd`、联网、装包。
+
+于是问题来了：如果 agent 判断错了（幻觉），或者用户给的提示词里藏了恶意指令（prompt 注入），让它跑了一条 `rm -rf ~/Documents`——没有隔离的话，它**真的会**把你的文档删掉。所以「让 agent 能跑命令」和「不让它搞坏宿主机」是一对矛盾，沙箱就是解这对矛盾的子系统。
 
 | 痛点 | 沙箱怎么解 |
 |------|-----------|
@@ -36,13 +38,33 @@ agent 要能「写代码、跑代码、改文件」才有用。但 agent 跑的�
 | 两个工具调用并发改同一文件互相覆盖 | **同路径写串行化锁** |
 | host bash 在宿主真实执行（非安全边界） | **host bash 默认禁用**，需显式 opt-in |
 
-本文讲「本地模式」沙箱（`LocalSandbox`）；真正的容器隔离（Docker）是 **[#14 aio_sandbox.md](aio_sandbox.md)**，文末会讲为什么本地模式不够、何时该上 AIO。
+> **一句话记住**：沙箱 = 给 agent 的「操作文件 + 跑命令」能力套上「路径隔离 + 命令审计 + 并发互斥」三层护栏。本文讲「本地模式」（`LocalSandbox`）；真正的容器隔离（Docker）是 **[#14 aio_sandbox.md](aio_sandbox.md)**，文末会讲为什么本地模式不够、何时该上 AIO。
 
 ---
 
 ## §2 零基础名词（第一次出现都解释）
 
+### 2.0 最基础（计算机基础，不熟先看这）
+
+> 本篇会反复用到下面这些**计算机基础**概念。会的不用看；不熟的先认这些，否则后面处处卡。
+
+- **文件系统 / 路径**：操作系统把文件组织成一棵「目录树」，根是 `/`。**绝对路径**从根写起（`/Users/tu/app.py`），**相对路径**从当前位置写起（`./app.py`）。路径里的 `/` 分隔层级。两个特殊记号：`.` 是当前目录、`..` 是上一级目录——所以 `../etc` 意思是「从当前往上一级，再进 etc」。**这正是「路径穿越」攻击的原料**（§4.3 / §6）：用一个带 `..` 的名字让路径逃出本该待的目录。
+- **目录（directory / 文件夹）**：装文件和其它目录的容器。路径 `/a/b/c` 里 `a`/`b` 是目录、`c` 是文件（或目录）。
+- **进程（process）**：一个**正在运行的程序**。你启动一个程序，操作系统就给它一个进程（独立的内存、权限）。一个进程可以**生另一个进程**（子进程）去跑别的程序。
+- **shell / bash**：shell 是「命令解释器」——你（或程序）输入一串文本命令（`ls -l`、`rm file.txt`、`python3 main.py`），shell 解析后让操作系统执行。`bash` 是最常见的一种 shell。**类比**：shell 像传令兵，把你给的命令翻译给操作系统这个「将军」。
+- **命令（command）**：shell 里的一句指令，由「命令名 + 参数」组成（`python3 main.py` → 命令名 `python3`、参数 `main.py`）。`cd`（进目录）、`ls`（列目录）、`rm`（删）、`cat`（读文件）都是常用命令。
+- **stdout / stderr / exit code**：一条命令跑完有三样产物——① **stdout**（标准输出）：正常结果文本；② **stderr**（标准错误）：报错信息；③ **exit code**（退出码）：0 表示成功、非 0 表示失败。agent 的 bash 工具把这三样拼起来返回给 LLM。
+- **挂载（mount）**：把一个「外部存储/设备」接到文件系统树的某个位置，让那里的文件能被访问。Linux 惯例把外部存储挂在 `/mnt/` 下——这正是沙箱用 `/mnt/user-data` 作虚拟前缀的语义来源（§2.1「为什么是 /mnt/」）。
+- **上下文管理器（context manager）/ `with`**：Python 管理资源（锁、文件、连接）的写法——`with lock:` 表示「进这段代码就拿到锁、出去自动放」，不用手动记着放。沙箱里大量 `with self._lock:` 就是这意思。
+- **装饰器（decorator）/ `@tool`**：Python 给函数「加一层壳」的写法——`@tool` 加在函数上面，把它注册成一个「agent 可调用的工具」。装饰后函数照常能调，但 agent 的 LLM 也能「看到」它并决定调不调。
+
+### 2.1 本模块名词
+
 **沙箱（sandbox）**：让程序在「受控环境」里运行的机制。狭义的沙箱是操作系统级的强隔离（容器、虚拟机）；mini 的本地沙箱是**弱隔离**——靠路径翻译 + 穿越防御，不是 OS 级边界。
+
+**子进程（subprocess）/ `subprocess.run`**：Python 标准库里「启动另一个程序」的方法。`LocalSandbox.execute_command` 执行 bash，本质就是用 `subprocess.run` 生一个子进程去跑 shell。关键参数 `shell=False`：意思是「别再套一层 shell 来解释这条命令」，直接把命令当程序参数传——这能**堵掉一层 shell 注入**（见下条）。
+
+**shell 注入（shell injection）**：把不可信的字符串拼进 shell 命令时的经典漏洞。比如命令是 `grep {user_input} file`，若 `user_input = "x; rm -rf /"`，shell 会先跑 `grep x file` 再跑 `rm -rf /`——分号 `;` 被当成「下一条命令」的分隔符。`shell=False` + `shlex` 拆 token（见 §6.2）能消掉这一层注入面（但本地模式仍非安全边界，真隔离靠容器）。
 
 **虚拟路径（virtual path）**：agent **永远只看到**的路径前缀（容器视角），不感知底层物理位置。mini 的虚拟前缀是 `/mnt/user-data`（[config/paths.py](../backend/packages/harness/deerflow/config/paths.py) 的 `VIRTUAL_PATH_PREFIX`）：
 
@@ -59,7 +81,15 @@ agent 要能「写代码、跑代码、改文件」才有用。但 agent 跑的�
 
 **PathMapping（路径映射）**：一条 `PathMapping`（[local_sandbox.py:56-62](../backend/packages/harness/deerflow/sandbox/local/local_sandbox.py#L56-L62)）把「虚拟前缀 ↔ 宿主目录」对应起来，带 `read_only` 标志（skills 只读）。一个 `LocalSandbox` 持有一组映射，按**最长前缀匹配**解析（[local_sandbox.py:152-164](../backend/packages/harness/deerflow/sandbox/local/local_sandbox.py#L152-L164)）。
 
+**ABC（Abstract Base Class，抽象基类）**：只定义「有哪些方法、签名是什么」、不写实现的类——像一份岗位说明书。子类（如 `LocalSandbox`）必须把每个方法填上真实实现。`Sandbox`（[sandbox.py](../backend/packages/harness/deerflow/sandbox/sandbox.py)）就是 ABC，`LocalSandbox` 是它的实现。这样工具层只依赖 `Sandbox` 这份「说明书」，换底层（本地→Docker）时工具代码不用改。
+
 **SandboxProvider（provider = 工厂 + 生命周期管理器）**：负责 acquire（取沙箱）/ get（按 id 查）/ release（释放）。为什么不直接 `LocalSandbox()` 而要 provider？因为同一个线程的多次工具调用要**复用**同一个沙箱（否则每条命令重建目录、丢失缓存）。provider 是进程级单例，按 `thread_id` 缓存沙箱。
+
+**单例（singleton）+ 锁**：单例指「整个进程只有一个实例」。但「只有一个」在多线程下不是天然成立的——两个线程可能同时发现「还没有」然后各建一个。所以要用**锁**（`threading.Lock`，一把「同一时刻只准一个线程持有」的令牌）把「检查有没有 → 没有就建」包起来。这里的细节（回调为什么在锁外）见 §5.4。
+
+**LRU（Least Recently Used，最近最少使用）**：一种缓存满了之后的淘汰策略——丢掉「最久没被用过」的那个。像冰箱满了扔最老的剩菜。provider 给每个 thread 缓存一个沙箱，缓存有上限（默认 256），超了就按 LRU 淘汰。
+
+**`WeakValueDictionary`**：Python 的一种字典——它**不会**阻止 value 被垃圾回收。当某个 value（比如一把锁）在别处都没人引用了，它会被自动回收、字典条目自动消失。用在「同路径写串行化锁」上（§5.7）防止长跑进程里锁对象无限堆积。
 
 **反解析（reverse resolve）**：把宿主绝对路径「洗回」虚拟路径。agent 不该知道宿主目录长啥样（`/Users/tu/...` 泄露用户名）——所以命令输出、`ls` 结果、`read_file`（仅 agent 自写文件）内容里的宿主路径会被反解析。
 
@@ -77,7 +107,7 @@ sandbox/
 ├── sandbox_provider.py         # SandboxProvider ABC + 进程级单例（加锁）
 ├── security.py                 # is_host_bash_allowed / uses_local_sandbox_provider（host-bash 准入闸）
 ├── file_operation_lock.py      # get_file_operation_lock（同路径写串行化，WeakValueDictionary）
-├── search.py                   # GrepMatch + find_glob/grep_matches + 57 忽略模式 + ReDoS/二进制防御
+├── search.py                   # GrepMatch + find_glob/grep_matches + 忽略模式 + ReDoS/二进制防御
 ├── tools.py                    # 7 工具 + 路径校验 + 输出截断（1397 行）
 ├── middleware.py               # SandboxMiddleware（生命周期 + lazy_init 贴回状态）
 └── local/
@@ -152,19 +182,6 @@ SandboxError（基类，带 message + details）
 
 集中在一个模块是为了「错误类型层次有单一真相源」——工具层/中间件/provider 都从这 import，不会出现两处各定义一个 `SandboxError` 导致 `isinstance` 漏判。`SandboxFileError` 是文件类错误的公共父类，调用方可 `except SandboxFileError` 一网打尽，也可精确 catch 子类。
 
-### 4.5 与 deerflow-book 的差异（借框架非抄实现）
-
-deerflow-book §13 把沙箱讲成「5 个工具 / 5 个抽象方法 / uploads 只读」。mini 的实现有意识地扩展/调整，诚实标注：
-
-| | deerflow-book §13 | mini 实现 |
-|---|---|---|
-| 工具数 | 5（bash/ls/read_file/write_file/str_replace） | **7**（多 `glob`/`grep` 两个搜索工具） |
-| 抽象方法 | 5 | **8**（多 `download_file` 二进制读 + `glob`/`grep`） |
-| uploads 读写 | 只读 | **读写**（[local_sandbox_provider.py:129-132](../backend/packages/harness/deerflow/sandbox/local/local_sandbox_provider.py#L129-L132) 三个目录都 `read_only=False`） |
-| 第三种实现 | Local / aio-sandbox / K8s 三种 | mini 只 port **Local**；AIO（[#14](aio_sandbox.md)）soft-load；K8s 不 port |
-
-借的是「虚拟路径统一 + Sandbox ABC + 延迟初始化 + provider 单例」这套框架思想，实现细节按 mini 的需要来。
-
 ---
 
 ## §5 代码走读
@@ -238,7 +255,7 @@ get_sandbox_provider():
 
 分级策略 `_classify_command`（[:184-207](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L184-L207)）两轮：① 先对**整串原始命令**扫高危（捕获 `while true; do bash & done`、`:(){ :|:& };:` 这类跨多语句的结构性攻击，`;` 拆分会丢模式上下文）；② 再拆复合命令（`_split_compound_command` [:87-154](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L87-L154)，quote-aware）逐条分级，取最严档。
 
-**heredoc 处理**（[:172-175](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L172-L175)）：`_classify_single_command` 先对**原文**跑高危检查，再用 `shlex.split` 解析 token 复跑高危。`shlex.split` 对合法 heredoc（`python3 << 'EOF' ... EOF`）会抛 `ValueError`——旧版直接 `return 'block'`，把合法 heredoc 也挡了；现改成 `pass` 继续走中危检查。fail-closed 不变性保住（高危永远在原文阶段拦），合法用法不再误伤。
+**heredoc 处理**（[:172-175](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L172-L175)）：`_classify_single_command` 先对**原文**跑高危检查，再用 `shlex.split` 解析 token 复跑高危。`shlex.split` 对合法 heredoc（`python3 << 'EOF' ... EOF`）会抛 `ValueError`——此时若直接判 `block` 会把合法 heredoc 也挡掉，故改成 `pass` 继续走中危检查。fail-closed 不变性保住（高危永远在原文阶段拦），合法用法不误伤。
 
 输入消毒（[:289-299](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L289-L299)）：空 / 超长（>10KB）/含 NUL 直接 block（几乎必是 payload 注入）。每条 bash 调用写一条结构化 JSON 审计日志（`[SandboxAudit]`，[:246-256](../backend/packages/harness/deerflow/agents/middlewares/sandbox_audit_middleware.py#L246-L256)）。
 
@@ -249,15 +266,73 @@ get_sandbox_provider():
 ### 5.8 search.py——glob/grep 算法
 
 [search.py](../backend/packages/harness/deerflow/sandbox/search.py)。抽成独立模块让 `LocalSandbox.glob/grep` 与未来的 AIO 沙箱共用同一份过滤/截断语义（两端输出格式必须一致）。要点：
-- **57 个忽略模式**（[:32-82](../backend/packages/harness/deerflow/sandbox/search.py#L32-L82)）：.git/__pycache__/.venv/node_modules…，预拆成精确名 frozenset（O(1) 查）+ 通配符编译正则（一次 match），优化 `os.walk` 热路径（[:91-93](../backend/packages/harness/deerflow/sandbox/search.py#L91-L93)）。
+- **忽略模式**（[:32-82](../backend/packages/harness/deerflow/sandbox/search.py#L32-L82)）：.git/__pycache__/.venv/node_modules…，预拆成精确名 frozenset（O(1) 查）+ 通配符编译正则（一次 match），优化 `os.walk` 热路径（[:91-93](../backend/packages/harness/deerflow/sandbox/search.py#L91-L93)）。
 - **二进制检测**：grep 跳过含 NUL 字节的文件（[:143-149](../backend/packages/harness/deerflow/sandbox/search.py#L143-L149) `is_binary_file`）。
 - **防 ReDoS**：grep 跳过过长的行（`line_summary_length * 10`，[:249](../backend/packages/harness/deerflow/sandbox/search.py#L249)），避免在压缩/无换行文件上被正则回溯拖死。
 - **符号链接**：grep/list_dir 都校验 resolve 后仍在 root 内，防 symlink 逃出搜索根（search.py [:267-270](../backend/packages/harness/deerflow/sandbox/search.py#L267-L270)、list_dir.py [:56-65](../backend/packages/harness/deerflow/sandbox/local/list_dir.py#L56-L65)）。
 - **上限截断**：`max_results` 防一次搜几万条撑爆上下文，超限返回 `truncated=True`。
 
+### 5.9 数据流：agent 调一次 `bash` 端到端怎么走完
+
+拿一个具体场景把上面串起来——agent 决定跑 `python3 /mnt/user-data/workspace/main.py`：
+
+```
+agent 发 tool_call: bash(description="跑主程序看输出", command="python3 /mnt/user-data/workspace/main.py")
+   │
+   ① SandboxAuditMiddleware.wrap_tool_call  ← 先过审计
+        _classify_command("python3 /mnt/...")  → 'pass'（安全）
+   │
+   ② bash_tool(runtime, description, command)  [tools.py:989]
+        ensure_sandbox_initialized(runtime)    ← 首次懒 acquire（SandboxMiddleware 贴回 sandbox_id）
+   │
+   ③ LocalSandbox.execute_command(command)     [local_sandbox.py:287]
+        _resolve_paths_in_command → 把 /mnt/user-data/workspace/main.py
+                                     翻译成 …/users/{uid}/threads/{tid}/user-data/workspace/main.py
+        subprocess.run(shell=False, timeout=600) → 真在宿主跑
+   │
+   ④ 输出处理
+        _reverse_resolve_paths_in_output → 把输出里出现的宿主绝对路径洗回 /mnt/...
+        _truncate_bash_output → 超 20000 字符中间截断（保留首尾）
+   │
+   ⑤ 返回 ToolMessage 给 agent（agent 看到的全是 /mnt/ 虚拟路径，看不到宿主布局）
+```
+
+**三个关键点**：① 审计在执行**之前**（高危直接 block，不进 ③）；② 路径翻译在 subprocess **之前**（agent 给的是虚拟路径，subprocess 拿到的是宿主路径）；③ 反解析 + 截断在 subprocess **之后**（输出回 agent 前洗掉宿主信息、控制长度）。这条链上的每一步出问题都有兜底：审计挡高危、翻译后校验穿越、输出截断防爆上下文。
+
 ---
 
-## §6 设计权衡（不变量 / 踩坑）
+## §6 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+### 6.0 核心设计动机（先看这五个「为什么」）
+
+沙箱这一整套设计，背后是几个关键决策。逐个讲清「**为什么选它 / 作用 / 好处 / 不这么设计会怎样**」——理解了这五个，整篇的机制就串起来了：
+
+**① 为什么用「虚拟路径」而不是让 agent 看到真实路径？**
+- **作用**：agent 永远只看到 `/mnt/user-data/...`，沙箱内部翻译成 `users/{uid}/threads/{tid}/...` 真实目录。
+- **好处（三重）**：① **agent 代码与底层解耦**——底层是本地进程还是 Docker 容器，agent 都写 `/mnt/user-data/...` 一套，切换只改 config；② **不泄露宿主信息**——agent 看不到 `/Users/tu/...` 这种宿主布局，输出也反解析洗掉，不暴露用户名/目录结构；③ **LLM 语义锚点**——`/mnt/` 这个 LLM 训练数据里的「外部挂载存储」惯例，让 agent 把它当真实持久存储认真对待（§2.1）。
+- **不这么设计会怎样**：直接暴露 `.../users/alice/threads/.../app.py`——agent 学到宿主用户名/目录（泄露），换底层（本地→Docker）agent 代码要重写，LLM 也可能因陌生路径而不当真、随手覆盖。
+
+**② 为什么用 Sandbox ABC + provider 单例 + per-thread LRU，而不是每次 `new LocalSandbox()`？**
+- **作用**：一个进程只有一个 provider 单例，按 `thread_id` 缓存沙箱（上限 256，LRU 淘汰），同线程多次工具调用复用同一沙箱。
+- **好处**：① **复用省开销**——不每条命令重建目录；② **跨轮缓存存活**——`_agent_written_paths`（哪些文件是 agent 自己写的，决定 `read_file` 要不要反解析）跨轮保留；③ **多线程安全**——单例加锁防双重初始化。
+- **不这么设计会怎样**：每次工具调用新建沙箱——每条命令重建目录（慢 + 浪费）、`_agent_written_paths` 每次清零（`read_file` 反解析失效，agent 在自己写的文件里看到宿主路径）、并发线程各建各的（状态不一致）。
+
+**③ 为什么命令审计分 block / warn / pass 三档，而不是一刀切？**
+- **作用**：高危（`rm -rf /`、`curl url | bash`）直接 block 不执行；中危（`pip install`、`sudo`）照跑附警告；安全放行。
+- **好处**：**平衡安全与可用**——挡掉真正危险的，又不过度限制（`pip install` 是合法开发操作，block 了 agent 就没法干活）。
+- **不这么设计会怎样**：全 block → agent 连装依赖都不行，没实用价值；全放行 → 一条 `rm -rf /` 或 fork 炸弹（`:(){ :|:& };:`）搞挂宿主。
+
+**④ 为什么反复强调「本地模式不是安全边界」，却还要做路径防御 + 审计？**
+- **作用**：诚实定性——本地沙箱靠虚拟路径翻译 + 穿越防御 + 命令审计，是 best-effort 的「护栏」而非 OS 级隔离。真隔离靠 [#14 AIO 容器](aio_sandbox.md)。
+- **好处**：① **正确预期**——不会让人误以为本地沙箱能跑 untrusted 代码；② **defense-in-depth 仍值得**——挡住绝大多数「agent 幻觉导致的误操作」（不是恶意攻击，是 agent 判断错），这种是日常最高频的风险。
+- **不这么设计会怎样**：把本地沙箱当安全边界 → 用户敢跑 untrusted 代码 → 一次路径穿越或漏拦的 `..` 就逃逸，宿主被搞坏。
+
+**⑤ 为什么工具层 + provider 层两层都做路径校验（belt-and-suspenders）？**
+- **作用**：provider 层 `_resolve_path` 翻译后查是否逃出挂载根；工具层 `validate_local_tool_path` 再校验一遍 `..` / 越界绝对路径。
+- **好处**：**纵深防御**——即便某一层有 bug，另一层兜底。安全代码的基本原则是「假设另一层会出错」。
+- **不这么设计会怎样**：只靠一层——一旦那层有边界 bug（某个边角 `..` 没覆盖到），就直接穿过去了。
+
+---
 
 ### 6.1 「本地模式不是安全边界」是头号不变量
 
@@ -378,7 +453,41 @@ sandbox ◄── tools (7 工具经 Runtime 读 state 里的 sandbox/thread_dat
 
 ---
 
-## §9 常见问题 / 排错
+## §9 实现差异（vs 上游 deer-flow 源码）
+
+> 对照基线 = `deer-flow/backend/packages/harness/deerflow/sandbox/`（与 mini 同布局、同文件清单）。已**剥掉 docstring/comment 后**判逻辑差，避免把中英文档字符串误当成漂移。结论：**mini 的 sandbox 几乎是上游的忠实子集**——同样 7 工具、同样 8 个 ABC 方法、同样 24 条忽略模式、同样 6 个异常子类；真正的差异全在「砍掉 mini 不 port 的子系统对接 + 简化几处内部机制」。
+
+### 9.1 一致的部分（先放心）
+
+| 维度 | 上游 | mini |
+|---|---|---|
+| 工具面 | bash/ls/glob/grep/read_file/write_file/str_replace | **完全相同 7 个** |
+| `Sandbox` ABC 方法数 | 8 | **相同 8 个** |
+| `exceptions.py` 异常层次 | `SandboxError` + 6 子类 | **相同** |
+| `search.py` 忽略模式 | 24 条 | **相同 24 条** |
+| `security.py` host-bash 闸 | `is_host_bash_allowed` | **相同** |
+
+### 9.2 mini 砍掉的（上游有、mini 无）——都是「mini 不 port 的子系统对接」
+
+| 上游能力 | 上游代码 | mini | 为什么 |
+|---|---|---|---|
+| **ACP workspace**（agent 间共享工作区） | `tools.py` [`_is_acp_workspace_path`](../../deer-flow/backend/packages/harness/deerflow/sandbox/tools.py) / `_get_acp_workspace_host_path` / `_resolve_acp_workspace_path` | **无** | mini 不 port ACP（Agent Client Protocol），整套工作区共享路径解析随之去掉 |
+| **MCP allowed-paths 注入** | `tools.py` `_get_mcp_allowed_paths()` | **无** | 上游把 MCP 允许路径注入 sandbox 的 bash 路径校验；mini 的 MCP 不做这层注入 |
+| **bash 校验穿 `allowed_paths`** | `_validate_local_bash_shell_tokens(cmd, allowed_paths)`（上游 [`tools.py`](../../deer-flow/backend/packages/harness/deerflow/sandbox/tools.py)）/ `_is_allowed_local_bash_absolute_path(path, allowed_paths, *, ...)` | `_validate_local_bash_shell_tokens(cmd)`（mini [tools.py:628](../backend/packages/harness/deerflow/sandbox/tools.py#L628)）/ `_is_allowed_local_bash_absolute_path(path, *, allow_system_paths)`（[tools.py:565](../backend/packages/harness/deerflow/sandbox/tools.py#L565)） | 上游把 per-thread 允许路径列表（custom mounts + MCP + ACP 路径）穿进 bash 校验；mini 砍掉这三个注入源后，校验只剩 `allow_system_paths` 一个 flag，更简单 |
+| **max_results 按工具名查** | `_resolve_max_results(name, requested, *, default, upper_bound)` | `_resolve_max_results(requested, *, default, upper_bound)`（mini [tools.py:465](../backend/packages/harness/deerflow/sandbox/tools.py#L465)） | 上游可为每个搜索工具单独配上限（按 name 查 config）；mini 用单一 default，不为每个工具单独配 |
+
+### 9.3 mini 简化 / 调整的内部机制
+
+- **provider 的 user 隔离位置不同**：上游 `LocalSandboxProvider.acquire(thread_id, *, user_id)` 把 `user_id` **显式穿进** provider，沙箱按 `(thread_id, user_id)` 建（`_thread_key`/`_sandbox_id_for_thread` 等 helper）；mini `acquire(thread_id)`（[local_sandbox_provider.py:135](../backend/packages/harness/deerflow/sandbox/local/local_sandbox_provider.py#L135)）只在 provider 层取 `thread_id`，`user_id` 下沉到**路径层**（建目录时从 `user_context` 取，见 [#5](user_context.md)）。隔离效果一致，mini 把 user 感知收拢到路径层、provider 不感知 user。
+- **mini 新增的小工具**：`_sandbox_output_max_chars`（输出上限配置 helper）、`_resolve_custom_mount_path`（自定义挂载显式解析）、`ensure_thread_dirs`（线程目录创建）——上游用别的 helper 名/内联实现，功能等价。
+
+### 9.4 一句话总结这个差异
+
+mini sandbox 的设计原则是「**核心照搬、对接全砍**」：7 工具、ABC、异常、忽略模式、审计三档这些**核心**与上游一致；差异全部来自「mini 不 port ACP / 不把 MCP 注入 sandbox / 不为每工具单配上限 / user 隔离下沉路径层」——都是**教学简化**，不是真分叉。所以读完 mini 这篇，迁到上游 sandbox 主要是「多一层 ACP/MCP 路径注入 + user_id 显式穿参」，核心心智模型不变。
+
+---
+
+## §10 常见问题 / 排错
 
 **Q：agent 说 `Host bash execution is disabled`，但我想要它能跑命令？**
 A：`is_host_bash_allowed()` 返回 False。本地模式默认禁用（不是安全边界）。两个选择：① 仅在完全可信本地环境设 `sandbox.allow_host_bash: true`；② 用 [#14 AIO 沙箱](aio_sandbox.md)（容器隔离，host bash 自动放行）。
@@ -406,7 +515,7 @@ A：不会。`shlex.split` 对 heredoc 抛 `ValueError` 时不再 block，而是
 
 ---
 
-## §10 小结
+## §11 小结
 
 沙箱子系统给 agent 「操作文件系统 + 跑命令」的能力，靠四件事立住：
 
@@ -419,6 +528,8 @@ A：不会。`shlex.split` 对 heredoc 抛 `ValueError` 时不再 block，而是
 - **本地不是安全边界**——靠路径翻译 + 穿越防御 + 审计，真隔离上容器。
 - **虚拟路径进、宿主路径出、反解析洗回**——agent 永远看不到宿主布局。
 - **provider 单例加锁、回调锁外**——多线程安全又不自死锁。
+
+**与上游的关系**（§9）：核心（7 工具 / ABC / 异常 / 审计）与上游 deer-flow 一致，差异全是「砍掉 mini 不 port 的 ACP/MCP 对接 + 简化几处内部机制」的教学简化。
 
 读完这篇，[#14 aio_sandbox.md](aio_sandbox.md) 讲「为什么本地不够、Docker 容器怎么补上真正的隔离」就顺了。
 

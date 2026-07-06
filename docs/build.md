@@ -21,6 +21,20 @@
 
 > 不熟悉 Python 工程化工具的话，先读这一节，再往下看。每条都用大白话讲。
 
+### 1.0 最基础（计算机基础，不熟先看这）
+
+在讲「测试 / lint / venv」之前，先确保下面这几个**最底层的词**你有印象。这是整篇的地基的地基：
+
+- **程序 / 进程**：你写的一段代码存在硬盘上叫**程序**（一堆文件）；双击或用命令把它**跑起来**，它在内存里活着、占着 CPU 跑，叫**进程**。一个程序可以同时跑多个进程（开两个浏览器窗口）。
+- **依赖（dependency）**：你写的代码几乎不可能从零造轮子——你要用别人写好的包（比如 `langgraph` 帮你拼 agent 图、`sqlalchemy` 帮你操作数据库）。这些「别人写好、你拿来用」的包就是**依赖**。「装依赖」= 把这些包下载到你电脑上、让你的代码能 `import` 它们。
+- **版本（version）**：每个包有版本号（`langgraph 1.1` vs `1.0`）。不同版本 API 可能不一样——`1.1` 有的函数 `1.0` 没有。**锁版本**就是写明「我要 1.1 及以上」，防止哪天装到旧版本、API 缺失、代码崩。→ §6 extras 表里那些 `>=X.Y` 就是版本下限。
+- **环境变量（environment variable）**：操作系统层面的「全局便签」，程序跑起来时能读到。形如 `KEY=value`。本篇反复出现的 `PYTHONPATH=packages/harness` 就是一个环境变量——它告诉 Python「找模块时，也去这个目录找」。`make dev` 里你填的 API key 也是靠环境变量（`.env` 文件）传进程序。
+- **PATH / 模块查找路径**：Python 执行 `import deerflow` 时，会去一组目录里挨个找 `deerflow` 这个包——这组目录就是「模块查找路径」。`PYTHONPATH` 环境变量能往这组目录里**临时加新目录**（本篇 §8.1 的 `PYTHONPATH=packages/harness` 就干这个）。
+- **命令行 / 终端 / CLI**：那个黑底白字、靠敲命令操作的窗口。`make test` 就是在终端里敲的命令。CLI = Command-Line Interface（命令行界面），和「点鼠标的图形界面」相对。
+- **命令的返回值（exit code）**：每条命令跑完会给操作系统一个数字：`0` = 成功，非 0 = 失败。CI 里就是靠这个数字判断「测试过没过」「lint 过没过」。
+
+> 这层是兜底。下面 §1.1 起的名词（test / lint / ruff / Makefile / venv / uv / extras）都是建立在它们之上的。
+
 ### 测试（test）是什么
 
 写完一段代码，怎么确认它「对」？最原始的办法是手动跑一遍、看输出。**测试**就是把「手动验证」写成一小段代码，交给机器自动跑。比如你写了个加法函数 `add(a, b)`，就配一条测试 `assert add(1, 2) == 3`。以后每次改代码，跑一遍全部测试，立刻知道有没有把原本好的功能改坏。
@@ -348,7 +362,7 @@ make format           # 自动修格式
 
 | 字段 | 值 | 含义 |
 |------|----|------|
-| `line-length` | `240` | 一行最多 240 字符（比常见 80/120 宽，因为对齐上游风格） |
+| `line-length` | `240` | 一行最多 240 字符（比常见 80/120 宽，与 deer-flow 主仓一致） |
 | `target-version` | `py312` | 按 Python 3.12 语法检查 |
 | `[lint] select` | `["E","F","I"]` | E=pycodestyle 错误、F=pyflakes（未用变量等）、I=isort（import 排序） |
 | `[format] quote-style` | `double` | 统一双引号 |
@@ -384,9 +398,24 @@ models / persistence / runtime（Phase 1）…… 一直到 runs / 集成（Phas
 
 ---
 
-## 8. 设计权衡与踩坑
+## 8. 设计动机分析（为什么这么设计 / 作用 / 好处）
 
-### 8.1 editable `.pth` 不稳 → 用 `PYTHONPATH` + conftest 双重兜底
+> 本篇没有 agent 业务逻辑，全是工程地基的「**约定**」。但每个约定都不是随便定的——下面把最关键的几个「为什么」展开讲。理解这些「为什么」，你才算看懂了一个**生产级 Python 项目工程化**长什么样（agent / 后端工程面试的高频考点）。读这一节时，每条都问自己三句：**它解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 8.0 核心设计动机（先看这张表，再往下看展开）
+
+一句话概括本篇所有设计的**总动机**：**把「口头约定」变成「机器会查的事实」**——让一个多人协作、跨平台、跨 Python 版本的项目，**不靠人的自觉也能跑起来、也能发现问题**。mini 的工程地基就是围绕这个总动机，做了四个关键选择：
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **extras + 软加载**（重依赖设为可选） | postgres/mcp/tiktoken 这类重依赖不是人人需要；强制全装既慢又容易因某个包装不上而全盘崩 | 核心 install 精简；**少一个包也不崩**（回退内存实现 + 打印「装哪个包就行」） | 全塞核心依赖 → 装一下几百 MB，任一包装失败整个项目起不来 |
+| **blocking-IO gate**（运行时哨兵） | async 服务里「在事件循环里做同步阻塞 IO」是**最难查的隐性 bug**——本地能跑、上线偶发卡死 | 把「这条 IO 必须用 `asyncio.to_thread` 卸载」变成**一条会失败的测试**，越界当场被抓 | 靠人肉 code review 守 → 总有人忘；问题只在生产高负载时偶发，极难复现 |
+| **harness 边界测试**（AST 扫 import） | 「可发布的框架包不得反向依赖应用层」是架构铁律，但靠口头讲会随时间腐蚀 | 用一个 AST 扫描测试把「`packages/harness/` 里不许 `import app.*`」钉死，越界立刻变红 | 架构慢慢腐蚀：今天一个 `from app import xxx`，明天框架包就离不开 app 层，无法独立发布 |
+| **配置集中在项目根**（`ruff.toml`/`pytest.ini`） | ruff/pytest 是「从文件位置向上找配置」；test/ 在 backend/ 外，配置若留在 backend/ 会两套规则 | 一份配置同时管 `backend/` + `test/`，**单一真相源** | 两边行宽/规则不一致，lint 过不过取决于文件放哪，团队互相踩 |
+
+> 这张表是本篇的「**为什么**」总览。下面 §8.1–§8.7 是逐条展开（含具体踩坑）。最后 §9 是「这套地基和上游 deer-flow 源码差在哪」。
+
+### 8.1 环境兼容：editable `.pth` 不稳 → 用 `PYTHONPATH` + conftest 双重兜底
 
 Python 3.14 + uv 创建的 venv，会给 site-packages 下的 `.pth` 文件加 macOS `hidden` flag，而 Python 3.14 的 `site.py` 会**跳过 hidden `.pth`**——导致 editable 安装的 `deerflow-harness` 失效，`import deerflow` 报 `ModuleNotFoundError`。而且 `uv run` 重新 sync 后 `.pth` 还会回退到不可用态。
 
@@ -418,11 +447,72 @@ gate 的 `scanned_modules=("deerflow",)` 意味着**只有调用栈经过 deerfl
 
 `_reset_singletons_between_tests` 和 `_auto_user_context` 都用 `try/except ImportError`。原因：本篇是 Phase 0，被它们保护的模块（skills / mcp / user_context）要到后面 Phase 才落地。硬 import 会让本篇自己的测试跑不起来。软加载 = 模块落地后自动生效，不落地就静默跳过。
 
-> 内部追溯：本篇的设计约束在上游 deer-flow 的工程记录里分别编号为红线 #24（缺包软加载 + 可操作提示）、#25（空配置可起步）、#26（langgraph 下限）、#28（边界 / gate 的强制化）。这些编号仅作内部对照，不影响理解。
+---
+
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/` 与 mini 的同名文件（Makefile / pyproject.toml × 2 / conftest / gate / boundary），剥 docstring/comment 后判逻辑差。结论：**工程地基是上游的忠实移植 + 几处刻意教学简化**。最大的差异不在「功能」，而在「mini 用什么跑起来」——mini 没有 Gateway（→ [start-here.md](start-here.md) §2.2），所以 dev/test 命令、依赖组织、gate 实现都围绕这点重排。
+
+### 差异 1：`make dev` 跑的是完全不同的东西（最大差异）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| `make dev` | `uvicorn app.gateway.app:app --reload` —— 起的是 **Gateway**（FastAPI 对外服务） | `uv run langgraph dev` —— 起的是 **langgraph 开发服务器** |
+| 额外 target | `gateway` / `detect-blocking-io` / `migrate-rev`（alembic 数据库迁移） | 无 |
+| 编码兜底 | 带 `PYTHONIOENCODING=utf-8 PYTHONUTF8=1`（Windows/CJK） | 省 |
+
+**为什么**：上游是产品，开发就得起 Gateway + 跑数据库迁移；mini 是教学版，砍了 Gateway，用 `langgraph dev` 一行起 agent + 浏览器界面，学习曲线最低。
+
+### 差异 2：`make test` + 配置位置（mini 把 test/ 搬出 backend/）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| 测试目录 | `backend/tests/`（在 backend 内） | 项目根 `test/`（在 backend 外） |
+| `make test` | `pytest tests/` | `pytest ../test` |
+| `PYTHONPATH` | `.`（backend 为根） | `packages/harness` |
+| ruff/pytest 配置 | 内联在 `backend/pyproject.toml`（`[tool.pytest.ini_options]`） | 项目根独立 `ruff.toml` + `pytest.ini` |
+
+**为什么**：mini 把 test/ 移到项目根，是为了让 `ruff.toml`/`pytest.ini` 站在 backend/ 和 test/ 的**共同祖先**上，一份配置覆盖两边（§8.0/§8.2 的「单一真相源」）。上游 test/ 在 backend 内，配置自然内联在 backend/pyproject.toml。
+
+### 差异 3：blocking-IO gate —— mini 手搓，上游用 `blockbuster` 库（典型教学简化）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| `blocking_io_runtime.py` | **44 行**，是 `blockbuster` 第三方库的薄封装（`from blockbuster import BlockBuster`） | **131 行**，**零第三方依赖、从零手搓** |
+| 扫描模块 | `("app", "deerflow")` | `("deerflow",)`（无 app） |
+| 静态扫描器 | 有（`detect_blocking_io_static.py` + `scan_changed_blocking_io.py` + CI） | **无**（只有运行时 gate） |
+
+**为什么**：这是最典型的「教学简化」。上游依赖成熟的 `blockbuster` 库（生产级、覆盖全），但「库内部怎么实现」是黑盒；mini **手搓一份纯 Python 实现**（`_BLOCKING_TARGETS` 14 个原语 + `_make_guard` 哨兵 + `_caller_in_scope` 爬栈），你能逐行读懂「async 阻塞检测到底怎么做到的」——这正是 §4.2 把它列为「最值得读的代码」的原因。代价：mini 没有上游的静态扫描器（只守运行时）。**好消息**：`detect_blocking_io_strict()` / `BlockingError` / conftest hookwrapper 的**接口和用法两边完全一致**，知识可迁移到上游。
+
+### 差异 4：harness extras —— mini 把上游的「核心依赖」降级成「可选 extras」
+
+| 包 | 上游（harness **核心**依赖，默认装） | mini（**extras**，可选 + 软加载） |
+|---|---|---|
+| `langgraph-checkpoint-sqlite` / `aiosqlite` | 核心 | `sqlite` / `aiosqlite` extra |
+| `langchain-mcp-adapters` | 核心 | `mcp` extra |
+| `tiktoken` | 核心 | `tiktoken` extra |
+| `markitdown`（文件上传转换） | 核心（`markitdown[all,xlsx]`） | `uploads` extra |
+| `agent-sandbox`（AIO 容器沙箱） | 核心 | `aio_sandbox` extra |
+
+反向：上游独有、mini 没有的 extras = `tui`（终端 UI）/ `groundroute` / `ollama`（本地模型）/ `pymupdf`（PDF 解析）—— 对应 mini 砍掉的 `tui/` 等模块。
+
+**为什么**：mini 把这些**重依赖**全部降级成 extras + 软加载，是为了**让「软加载」这个工程模式在 mini 里处处可见、处处可教**（§8.7）。上游默认全装（生产便利，假定你就要 sqlite/mcp/tiktoken）；mini 默认不装（核心 install 精简，缺包回退内存实现 + 打印安装提示）。两边 `try/except ImportError` 的软加载**写法一致**。
+
+### 差异 5：根 pyproject —— 上游是「带 Gateway 的应用」，mini 是「裸 workspace 根」
+
+上游根 `[project] name = "deer-flow"` v2.1.0，dependencies 塞满 **Gateway 栈**（`fastapi`/`uvicorn`/`sse-starlette` + 飞书 `lark-oapi`/Slack/Telegram/企业微信/钉钉等 IM SDK + `bcrypt`/`pyjwt` 鉴权 + `langgraph-sdk`）。mini 根 pyproject **没有任何应用依赖**——只是 `[tool.uv.workspace] members = ["packages/harness"]` + dev 组（pytest/ruff）。这是 mini 砍掉整层 Gateway 的直接体现。
+
+### 差异 6：harness 边界测试 —— 两边都有，但 mini 的是「占位护栏」
+
+两边都有 `test_harness_boundary.py`，都 AST 扫描 `packages/harness/deerflow/` 禁止 `import app.*`。差异：上游**真有 `app/` 目录**，所以这个测试**现役抓违规**；mini **没有 `app/`**（不 port Gateway），所以测试**当前恒通过**，是**未来护栏**（一旦引入 app 层越界，立刻变红，§4.5）。逻辑等价（mini 的 `module.startswith(prefix + ".")` 判断更显式，避免误伤 `apple` 这类同名前缀）。
 
 ---
 
-## 9. 常见问题 / 排错
+> **一句话总结**：mini 的工程地基 = 上游的**忠实移植**（Makefile 6 target / uv workspace / extras / 软加载 / harness 边界测试 / gate 接口全一致），差异集中在「**mini 没有 Gateway**」这个根因上——`make dev` 换 `langgraph dev`、test/ 搬出 backend、gate 手搓免依赖、重依赖降级成 extras。每一处都服务于「教学版」定位：**最少依赖、最易读懂、最快跑起来**。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: `make test` 报 `ModuleNotFoundError: No module named 'deerflow'`？**
 A: 正常不会遇到——Makefile 自带 `PYTHONPATH=packages/harness`、conftest 也补了 `sys.path`，双重兜底。若仍遇到，根因多半是 venv 本身坏了（Python 3.14 + uv 的 hidden `.pth` 问题，§8.1），或 venv 在 iCloud 同步目录被清掉了——把 venv 挪到 `~/.venvs/mini-deer-flow` 重装。

@@ -265,7 +265,24 @@ def get_model_config(self, name: str | None) -> ModelConfig | None:
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> config 模块的每个选择都不是随便定的。读得懂这些「为什么」，你才算理解了「一个生产级配置系统」该怎么设计（面试高频：「配置系统怎么设计」「强类型 vs 弱类型」「热重载边界」）。每条都问自己：**它解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**让「配置」从「散落、易错、重启才能改」的 dict，升级成「强类型、有默认、有空配置兜底、运行期可热重载」的系统**——把人容易犯的错（拼字段名、忘默认值、改完忘重启）都用机制兜住。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **强类型子配置**（pydantic model） | dict 配置拼错字段名静默返回 None，bug 极难找 | 拼错立刻 `AttributeError`；默认值集中在子配置里；IDE 补全；加载时类型校验 | 用 dict → 拼错静默失败、默认值散落各处、类型错了运行时才崩（§1.1） |
+| **空配置必须能启动**（`database` 默认 `memory`） | 不想让用户被某个必填字段卡在「起不来」 | 开箱即跑、CI 不依赖外部数据库、新人 0 配置上手 | 任一字段必填 → 空 config.yaml 起不来，开发/CI/新人全被卡 |
+| **热重载靠 mtime**（文件改了自动重载） | 改个配置就要重启进程太重 | 运行期字段改完存盘即生效，下一条消息就用新值 | 每次改配置都要重启 → 开发体验差、长对话被打断 |
+| **startup-only 边界**（6 字段改了要重启） | 引擎/单例启动时捕获，运行期改了不会真重建——不如诚实标出来 | 用 `reload_boundary.py` 登记 + `startup-only:` 前缀，明确告诉用户「这几个改了要重启」 | 不标边界 → 用户以为改了生效、实际没生效，难排查 |
+| **事件循环 carve-out**（缓存命中跳过 stat） | async 服务里 mtime stat 是同步阻塞 IO，会触发 blocking-IO gate | 已加载且在事件循环里时直接返缓存，不卡循环（§5.1） | 每次都 stat → 触发 gate / 卡事件循环，运行期假死 |
+| **name 索引**（`_build_name_indexes` 预建 dict） | get_model/tool_config 在热路径，线性扫表是纯浪费 | O(1) 查表，reload 时自动刷新（§6.3） | 朴素线性扫 → 一次对话几十次重复扫表，累积浪费 |
+
+下面 §6.1–§6.6 是逐条展开。
 
 ### 6.1 为什么 `database` 默认 `memory`？
 
@@ -309,8 +326,6 @@ config.yaml 里 `models: [...]` / `tools: [...]` 是**列表**，每项有 `name
 ### 6.6 热重载靠 mtime，但有边界
 
 `get_app_config()`（同步上下文下）每次调用比较 `config.yaml` 的 mtime 和缓存值，**变了就重新加载**。这让配置读数与 yaml 编辑保持一致，无需手动重启。但 `startup-only` 字段（§4.4）即便重载了也不会真正生效（引擎 / 单例已建好），需进程重启——这就是「热重载边界」。
-
-> 内部追溯：本文的设计约束在上游工程记录里分别编号为红线 #25（空配置可启动）、#2615（事件循环 blocking-IO carve-out）、#3688（name 索引优化）。这些编号仅作内部对照，不影响理解。
 
 ---
 
@@ -398,7 +413,58 @@ config 是**最底层、无依赖**的一层（仅 pydantic + yaml + 标准库�
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/config/`，剥 docstring/comment 后判逻辑差。结论：**配置系统的骨架是上游的忠实移植**（`AppConfig` 根 + pydantic 子配置 + `reload_boundary` 热重载边界 + `paths` 路径 API 思路一致），差异集中在三处：① **砍掉 Gateway/IM/auth/ACP/guardrails 相关的配置文件 + AppConfig 字段**；② **`tools`/`tool_groups` 在 mini 里仍是松散 dict，上游已升级成强类型 `ToolConfig`**；③ **tracing/extensions 的组织方式不同**。
+
+### 差异 1：config/ 目录——mini 砍掉 6 类配置文件
+
+| 类型 | 上游有、mini 砍了 | 为什么砍 |
+|---|---|---|
+| Gateway 层 | `agents_api_config.py`（自定义 agent 的 REST API 配置） | mini 不 port Gateway（→ [start-here.md](start-here.md) §2.2） |
+| 鉴权 | `auth_config.py`（本地 + OIDC SSO） | Gateway/鉴权层 |
+| IM 渠道 | `channel_connections_config.py`（飞书/Slack/钉钉…连接） | mini 无 IM |
+| ACP | `acp_config.py`（ACP workspace agent 配置） | mini 砍 ACP（同 sandbox，→ #13） |
+| 安全 | `guardrails_config.py` | mini 砍整个 `guardrails/` 模块 |
+| 其它 | `suggestions_config.py`（追问建议）、`tracing_config.py`（pydantic 模型，见差异 4） | 功能未 port / 组织不同 |
+
+> 反向：mini **多一个** `circuit_breaker_config.py`（LLM 调用熔断）。上游 AppConfig 也有 `circuit_breaker` 字段，只是没拆成独立文件——功能两边都有，文件组织略不同。
+
+### 差异 2：AppConfig 字段——mini 25 个 / 上游 29 个
+
+- **mini 砍掉的字段**（对应差异 1 的文件）：`extensions`、`agents_api`、`acp_agents`、`guardrails`、`suggestions`、`channel_connections`、`auth`。
+- **mini 多出的字段**：`config_version`（版本检查）、`uploads`（文件上传）、`tracing`（追踪，dict 形式）。
+- 子配置**对象**数：mini **19 个**（与本文 §4.2 一致；models/tools/tool_groups 是列表，config_version/log_level/tracing 是标量，不计入「子配置对象」）。
+
+### 差异 3：`tools` / `tool_groups` 的类型化程度（mini 更松散）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| `tools` | `list[ToolConfig]`（强类型 pydantic，有 `tool_config.py`） | `list[dict[str, Any]]`（**松散 dict**） |
+| `tool_groups` | `list[ToolGroupConfig]`（强类型） | `list[dict[str, Any]]`（松散 dict） |
+
+mini 这里**没有**把工具配置升级成强类型 pydantic——是刻意保留的简化（工具配置项多变，先用 dict 灵活）。代价：少一份类型校验 / IDE 补全（正是 §1.1「dict 的坑」在 tools 上的残留）。`_tools_by_name` name 索引（§6.3）两边都有。
+
+### 差异 4：tracing / extensions 的组织方式不同
+
+- `tracing`：mini 是 AppConfig 上的一个 `dict[str, Any]` 字段（环境变量驱动，→ #16）；上游是独立的 `tracing_config.py` pydantic 模型。
+- `extensions`（MCP + 技能启用）：上游是 AppConfig 字段（`ExtensionsConfig`）；mini **不在 AppConfig 里**，而是独立加载的 dataclass（→ #20）。
+
+### 差异 5：paths.py——mini 把上游两个模块合并成一个
+
+上游路径 API 分两个文件：`runtime_paths.py`（41 行，4 个基础函数 `project_root`/`runtime_home`/`resolve_path`/`existing_project_file`，给「独立用 harness」的场景）+ `paths.py`（405 行，完整 `Paths` 类）。**mini 把两者合并成一个 `paths.py`（330 行）**——既有那 4 个基础函数，也有 `Paths` 类。所以本文 §4.5 说「mini 用 paths.py 替代 runtime_paths」准确：mini 不再单独有 runtime_paths，它的内容并进了 paths.py。mini 的 paths.py 比上游精简（砍 ACP workspace / host_sandbox / user_id sanitize 等路径方法，同 #17 发现）。
+
+### 差异 6：reload_boundary.py——函数级一致，登记字段更少
+
+两边都有 `reload_boundary.py`，**函数级一致**（`STARTUP_ONLY_PREFIX` / `STARTUP_ONLY_FIELDS` dict / `is_startup_only` / `format_field_description`，后者对未登记字段同样 `raise KeyError` 防笔误，§6.4）。差异：mini 登记 **6 个** startup-only 字段（§4.4），上游登记更多——因为上游多出 `agents_api` / `acp` / `guardrails` 等基础设施字段，各自也要重启。
+
+---
+
+> **一句话总结**：mini 的配置系统 = 上游的**忠实移植**（AppConfig 根 + pydantic 子配置 + reload_boundary + paths 思路全一致），差异全由「mini 没有 Gateway/IM/auth/ACP/guardrails」这个根因派生——砍 6 类配置文件 + 对应字段；外加两处 mini 自己的选择：`tools`/`tool_groups` 暂留松散 dict（灵活换类型安全）、tracing/extensions 组织方式不同。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: 改了 `config.yaml` 但没生效？**
 分两种：① **运行期可变字段**（memory / title / models…）：下一条消息自动生效（mtime 热重载）。确认你改的是 `get_config_file()` 实际读取的那个文件（项目根 `config.yaml`，不是 backend 下的）。② **startup-only 字段**（database / checkpointer / sandbox / run_events / stream_bridge / log_level）：必须**重启进程**——它们在启动时被捕获成对象。看字段描述是否带 `startup-only:` 前缀（§4.4）。
@@ -417,7 +483,7 @@ config 是**最底层、无依赖**的一层（仅 pydantic + yaml + 标准库�
 
 ---
 
-## 小结
+## 11. 小结
 
 config 的精髓是「**把配置从散落的 dict 升级成带类型、带默认、带边界的强类型系统**」。记四件事：
 

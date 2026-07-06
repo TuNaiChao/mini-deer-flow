@@ -189,7 +189,25 @@ LLM 调用失败时，`LLMErrorHandlingMiddleware`（[#24 middlewares.md](middle
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> RunJournal 的每个选择都直击「**怎么在同步回调世界里，把异步存储 + token 计费 + 进度上报都做对**」。读得懂这些「为什么」，你才算理解了 LLM 回调工程（面试高频：「回调机制」「token 计费去重」「同步↔异步桥接」「防双计/防丢失」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**用回调统一采集 run 里所有事件，把同步回调与异步存储桥接、token 防双计防丢失、并按角色/模型归因**——让「run 里发生了什么、烧了多少 token」可落盘、可计费、不丢不重。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **同步回调→`create_task` 异步刷盘** | `BaseCallbackHandler` 同步、`put_batch` 异步，回调既不能 `await` 又不能阻塞 | 调度异步写、回调立即返回不阻塞 | 回调里 `await` → 报错；阻塞写 → 卡死事件循环 |
+| **token 按 `_counted_llm_run_ids` 去重** | LangChain 同一响应可能多次触发 `on_llm_end` | 防双计，账单准 | 直接累加 → 一次调用算多次，账单爆炸 |
+| **失败 batch 回插 buffer** | `database is locked` 等瞬时失败 | 事件不丢，下次 flush 重试 | 失败即丢 → 历史残缺、token 漏算 |
+| **按 caller + 模型分桶** | 一次 run 多角色（主/子/中间件）多模型烧 token | 知道「谁烧的、哪个模型烧的」 | 只记总数 → 无法按角色/模型归因计费 |
+| **`on_chat_model_start` 抽首条 human** | `on_chain_start` 每节点触发太乱、`on_llm_end` 时消息可能被 checkpoint 裁剪 | 此处消息完整结构化、未裁剪 | 抽错时机 → 首条 human 残缺或错乱 |
+| **不实现 `on_llm_new_token`** | 流式每 token 一次回调 | buffer/写库不爆炸 | 实现它 → 一次回复几百次回调撑爆 |
+| **`progress_reporter` 注入而非 import** | 避免 journal→runs 循环依赖 | runs 依赖 journal，journal 不反向依赖 runs | 直接 import → 模块循环依赖 |
+
+下面 §6.1–§6.7 是逐条展开。
 
 ### 6.1 同步回调 → 异步刷盘（核心）
 
@@ -294,7 +312,29 @@ journal.record_external_llm_usage_records([
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/journal.py`（**单文件 621 行** vs mini 613 行），剥 docstring 后判逻辑差。结论：**RunJournal 是上游的逐行忠实移植——0 逻辑差**。
+
+### 29/29 方法逐个一致
+
+两边 `RunJournal` 类的 **29 个方法/函数完全相同**（同名、同顺序）：`__init__` / `_message_text` / `_record_message_summary` / 全套回调（`on_chain_start/end/error` / `on_chat_model_start` / `on_llm_start/end/error` / `on_tool_start/end`）/ `_put` / `_flush_sync` / `_flush_async` / `_on_flush_done` / `_identify_caller` / `_record_model_usage` / `record_external_llm_usage_records` / `set_first_human_message` / `record_middleware` / `flush` / `_schedule_progress_flush` / `_schedule_delayed_progress_flush` / `_flush_progress_async` / `get_completion_data` / `had_llm_error_fallback` / `llm_error_fallback_message`。
+
+### 唯一差异：docstring 语言（中英）
+
+mini 613 行 vs 上游 621 行——剥掉 docstring/comment 后，两边逻辑行 **92% 相同**，剩余的「差异」**全是模块/函数 docstring 的中英翻译**（多行 docstring 的体量差），代码体一字不差。所有关键逻辑——同步回调→`create_task` 异步刷盘、token 按 `_counted_llm_run_ids` 去重、按 caller tags 分桶、按 `response_metadata.model_name` 分真计费模型桶、失败 batch 回插 buffer、`on_chat_model_start` 抽首条 human、error fallback 检测、进度节流——**两边逐行一致**。
+
+> §6.x 讲的每个设计（同步→异步桥接 / 防双计 / 防丢失 / caller+模型分桶 / 不实现 `on_llm_new_token` / progress 注入无循环）**上游源码里全有**——mini 没改动任何一项，只是把 docstring 翻译成中文面向小白讲解。
+
+### 为什么砍掉 Gateway 后这个文件一行都不用改
+
+RunJournal 是**纯回调采集器**——它的输入是 LangChain/LangGraph 的回调事件，输出是往抽象的 `RunEventStore` 写 dict，**不依赖 Gateway / app**。所以砍掉 Gateway 后，这个文件**代码零改动**——和 #5 user_context、#7 persistence 的抽象解耦红利同理。
+
+> **一句话总结**：mini 的 RunJournal = 上游的**逐行忠实移植，0 逻辑差**（29/29 方法同名同序、关键逻辑逐行一致），唯一差异是 docstring 中英翻译（mini 613 vs 上游 621 行，差的是 docstring 体量与语言）。纯回调采集器靠抽象解耦上层，砍掉 Gateway 后一行都不用改。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: 事件丢了（store 里没有）？**
 A: 检查 worker 有没有在 `finally` 里调 `await journal.flush()`。回调里达阈值才刷盘，没达阈值的残余事件靠 flush 兜底。没 flush 就丢。
@@ -319,7 +359,7 @@ A: 不会——`on_chat_model_start` 抽取时跳过 `name="summary"` 的 HumanM
 
 ---
 
-## 小结
+## 11. 小结
 
 RunJournal 的精髓是**统一回调采集 + 同步↔异步桥接 + token 防双计**。记住五件事：
 

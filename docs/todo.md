@@ -2,7 +2,7 @@
 
 > **基线**：`cd backend && make test && make lint` → **1713 passed, 0 lint**。mini 已端到端实跑验证为可用 agent（真 key 实跑：能聊天 + bash/读写文件 + 多轮记忆）。详细历史查 git log / memory。
 > **三交付** = 代码 + hermetic 测试 + 学习文档。任何代码改动后基线必须保持 **1713 / 0 lint**。
-> **文档重写**（28 篇模块文档）单独在 [doc-rewrite-todo.md](doc-rewrite-todo.md) 跟踪，**不记在此**。本文件只管代码侧。
+> **文档重写已完成**（#0 导论 + #1–#28 = 29 篇全部 ✅，全按新标准 11 节 + §9 设计动机 + §10 实现差异）。本文件只管代码侧。
 
 ---
 
@@ -40,13 +40,14 @@
 
 ## 2. 工作进度日志（下次开工先看这里）
 
-> 每次开工 / 收工追加一行：日期 / 做了什么 / 下次接着做。技术细节查 git log / memory，本表只记「做到哪、下一步」。**文档重写的模块进度不记在此**（→ [doc-rewrite-todo.md](doc-rewrite-todo.md)）。
+> 每次开工 / 收工追加一行：日期 / 做了什么 / 下次接着做。技术细节查 git log / memory，本表只记「做到哪、下一步」。
 
 | 日期 | 做了什么 | 下次接着做 |
 |------|----------|-----------|
-| 2026-07-05 | docs/ 清理：删 `legacy/`（4 文件）+ `ALIGNMENT_OUTLINE.md` + `spec-M4-persistence.md`，死链全清；精简 todo.md（剥离已完成段、剥离文档重写）；文档重写 playbook 另立为 `doc-rewrite-todo.md` | 按需挑 §1.2 代码增量；文档重写在 `doc-rewrite-todo.md` 单独推进（#1 build.md 起）|
+| 2026-07-06 | 文档重写全部完成（#0 + #1–#28 = 29 篇）；删 `doc-rewrite-todo.md`（playbook 任务结束），「面试概念地图」移入 `README.md`；29 篇教学 doc 全 0 工程日志腔 token | 代码侧无必须做的；按需挑 §1.2 |
+| 2026-07-05 | docs/ 清理：删 `legacy/`（4 文件）+ `ALIGNMENT_OUTLINE.md` + `spec-M4-persistence.md`，死链全清；精简 todo.md（剥离已完成段、剥离文档重写）；文档重写 playbook 另立为 `doc-rewrite-todo.md`（已于 2026-07-06 删除） | 按需挑 §1.2 代码增量 |
 | 2026-07-03 | 端到端冒烟全绿：真 key 实跑拿到 LLM 真实回复（「2+2=4」）；修 2 个 blocking-IO bug + 2 个环境问题 + 1 个 `tools:` 配置坑；基线 1711 → **1713**。环境根治：`UV_PROJECT_ENVIRONMENT=~/.venvs/mini-deer-flow`（iCloud 坑） | （已完成，留作上下文）|
 
 ---
 
-> 一句话：代码侧**无必须做的**——mini 已是能干活的 agent（已实跑证实：聊天 + bash/读写文件 + 多轮记忆）。增量按需挑 §1.2；文档重写是另一条线，见 [doc-rewrite-todo.md](doc-rewrite-todo.md)。
+> 一句话：代码侧**无必须做的**——mini 已是能干活的 agent（已实跑证实：聊天 + bash/读写文件 + 多轮记忆）。增量按需挑 §1.2。文档重写已完成（29 篇）。

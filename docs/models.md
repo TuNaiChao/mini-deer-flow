@@ -263,7 +263,24 @@ def create_chat_model(
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> 模型工厂的每个选择都直击「**怎么把跟模型打交道的脏活、坑、provider 差异收口到一个函数**」。读得懂这些「为什么」，你才算理解了 LLM 应用的工程化（面试高频：「怎么接多家模型」「推理模型工程坑」「链路追踪怎么挂」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**让「接入任意 LangChain 兼容模型」变成零改代码、缺包不崩、provider 差异全自动处理的事**——把运维级开关集中到配置，把易错点（超时/追踪/能力门控）用机制兜住。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **配置驱动 + 反射**（`use` 字段） | 硬编码 `import` 换模型要改代码、缺包就全崩 | 换模型只改 `config.yaml` 一行；缺包按需报可操作提示；业务代码与 provider 解耦 | 硬 import → 换模型到处改、装少一个包整盘崩 |
+| **thinking 四路径关闭** | 各 provider 关闭思考的写法完全不同 | 换 provider 不改代码，工厂按优先级自动挑对的关闭方式 | 用户自己拼 → 每个 provider 写法不同，极易错 |
+| **`stream_chunk_timeout=240s`** | 推理模型首字可能要 90–150s（正常思考，不是卡死） | 不误判超时中断推理模型 | 默认 60s → 推理模型思考阶段被误中断 |
+| **`attach_tracing` 双调用方** | 图内图根已挂回调，模型级再挂会重复 + 剥元数据 | 明确两个调用方取值**相反**（图内 False / 独立 True） | 挂错 → 重复 span / `session_id`·`user_id` 被剥离 |
+| **fail-fast**（能力不匹配报错） | 静默忽略「不支持却请求」会让 bug 极难查 | `ValueError` 顶到调用现场，一眼看见 | 静默 → 以为开了思考其实没开 |
+| **vLLM 专门 provider** | LangChain 默认适配器丢 vLLM 私有 `reasoning` 字段 | `VllmChatModel` 重写三钩子保住，多轮「想完→调工具→继续想」正常 | 默认 `ChatOpenAI` → 多轮回传丢思考，模型行为异常 |
+
+下面 §6.1–§6.5 是逐条展开。
 
 ### 6.1 `stream_chunk_timeout` 为什么默认 240 秒？（[第 36 行](../backend/packages/harness/deerflow/models/factory.py#L36)）
 
@@ -441,7 +458,47 @@ reflection (resolve_class)┤
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/models/` + `config/model_config.py`，剥 docstring 后判逻辑差。结论：**核心工厂 + vllm provider + ModelConfig 是上游的忠实移植（逻辑一致）**；差异是 mini **砍掉 10 个 provider 专有补丁文件**，只保留「通用工厂 + 一个代表性 provider（vLLM）」。
+
+### 差异 1：models/ 目录——mini 砍 10 个 provider 专有文件，只留 factory + vllm
+
+| 类别 | 上游 deer-flow（13 文件） | mini（3 文件） |
+|---|---|---|
+| 通用 | `factory.py` / `__init__.py` | ✅ 保留 |
+| vLLM | `vllm_provider.py`（`VllmChatModel`） | ✅ 保留 |
+| 各 provider 补丁 | `patched_deepseek.py`（`PatchedChatDeepSeek`）/ `patched_mimo.py` / `patched_minimax.py` / `patched_openai.py` / `patched_stepfun.py` | ❌ 砍 |
+| 专有 provider | `claude_provider.py`（`ClaudeChatModel`）/ `mindie_provider.py`（MindIE，华为）/ `openai_codex_provider.py`（Codex） | ❌ 砍 |
+| 辅助 | `credential_loader.py` / `assistant_payload_replay.py` | ❌ 砍 |
+
+**为什么**：上游是产品，要兼容一长串国内外模型 API（DeepSeek / 豆包 / Kimi / MiniMax / StepFun / Claude / MindIE / Codex…），每个 provider「LangChain 默认适配器会丢某个私有字段」的问题都得单独打补丁。mini 是教学版，**只保留一个代表性补丁 `VllmChatModel`**（§5.4 讲透「继承 `ChatOpenAI` + 重写 payload 钩子保住私有字段」这套通用手法），其余 provider 补丁砍掉——读懂 vLLM 这一个，其它都是同套路。`credential_loader`（凭据加载，偏 Gateway/鉴权）和 `assistant_payload_replay`（回放调试）mini 也用不到。
+
+### 差异 2：factory.py / vllm_provider.py —— 核心逻辑忠实，mini 行数更多是 docstring
+
+mini `factory.py` 249 行 / `vllm_provider.py` 322 行，都比上游（204 / 258）多——**多的全是面向小白的中文 docstring / 注释**；核心逻辑（`create_chat_model` 8 步、thinking 四路径、`attach_tracing` 双调用方、`VllmChatModel` 三钩子、`_deep_merge_dicts` / `_apply_stream_chunk_timeout_default` 等辅助函数）**逐个一致**。这正是「教学版」的体现：同一套逻辑，配上更详尽的讲解。
+
+### 差异 3：ModelConfig —— 同 14 字段集，mini 用原生注解 + 属性 docstring（上游用 Field）
+
+两边 `ModelConfig` 的 **14 个字段完全相同**（`name` / `use` / `model` / `display_name` / `description` / 三项能力声明 / thinking 三件套 / `use_responses_api` / `output_version` / `stream_chunk_timeout` + `extra="allow"`），语义一致。差异纯是**写法风格**：
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| 字段定义 | 每个字段 `Field(..., description="...")` | Python 原生注解（`name: str`）+ 属性 docstring（`"""..."""`） |
+| 描述语言 | 英文 | 中文 |
+| 模块 docstring | 无 | 有（一段模块说明） |
+
+这是 mini 的**可读性重构，0 功能差**——字段、默认值、`extra="allow"` 全一致。
+
+> §5.4 提到的上游 `PatchedChatDeepSeek`，就是差异 1 砍掉的 `patched_deepseek.py`——解决 DeepSeek / 豆包 / Kimi 的 `reasoning_content` 字段被丢的**同类问题**；mini ship 的是面向 vLLM 的 `VllmChatModel`，**思路一模一样**（继承 + 重写 payload 钩子补回私有字段），只是 provider 对象不同。
+
+---
+
+> **一句话总结**：mini 的 models = 上游的**忠实移植 + 大幅瘦身**——核心工厂 / vllm provider / ModelConfig 逻辑逐个一致（mini 行数更多是面向小白的中文 docstring）；差异是砍掉 10 个 provider 专有补丁文件，只留「通用工厂 + 一个代表性 provider（vLLM）」。读懂 `VllmChatModel` 这套补丁手法，就懂了上游所有 provider 补丁的套路。
+
+---
+
+## 10. 常见问题 / 排错
 
 ### Q1：`ModuleNotFoundError: No module named 'langchain_deepseek'`
 
@@ -491,7 +548,7 @@ create_chat_model(..., attach_tracing=False)
 
 ---
 
-## 小结
+## 11. 小结
 
 模型工厂的精髓是**把 provider 差异和运维坑收口到一个函数**。记住四件事：
 

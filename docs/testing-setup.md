@@ -19,6 +19,14 @@
 
 ## 1. 太长不看 + 怎么跑测试
 
+> **最基础（几个测试术语，不熟先看这）**：
+> - **断言（assert）**——测试的核心动作：「我断言这个表达式为真」，不为真就报错失败。`assert add(1,2)==3` 就是断言「加法结果必须是 3」。
+> - **测试运行器（test runner）**——负责「收集所有测试 → 一条条跑 → 汇报通过/失败」的工具，我们用 **pytest**。
+> - **fixture**——测试的「公共道具/准备工作」（写一次、处处复用），如「每个测试要一个干净临时目录」「每个测试要一个默认 user」。省得每个测试都重写准备代码。
+> - **mock / monkeypatch（打桩）**——把真实外部依赖（网络、文件、真实模型）**换成假的**，让测试不碰外部世界。pytest 的 `monkeypatch` 临时改某个属性/环境变量，测试结束自动还原。
+> - **flaky（偶发失败）**——测试有时过有时不过（依赖网络/时间/执行顺序），是测试大忌；**deterministic（确定性）**——同输入永远同结果。hermetic 约定（§5）就是为消灭 flaky、保证 deterministic。
+> - **CI（持续集成）**——每次提交代码，服务器自动跑全部测试。CI 机器上**必须裸跑能过**，所以测试不能依赖你本机的 API key 或网络（否则 CI 必挂）。
+
 测试跑通靠两件事：
 
 1. **环境**：[test/conftest.py](../test/conftest.py) 显式把 `packages/harness` 塞进 `sys.path`，绕过 Python 3.14 + uv 导致的 editable 安装失效（§3）。
@@ -91,7 +99,9 @@ if ((getattr(st, 'st_flags', 0) & stat.UF_HIDDEN) or
 
 于是 site 启动时**跳过所有 hidden 的 .pth** → editable 的 `.pth` 不生效 → `packages/harness` 不进 `sys.path` → `import deerflow` 失败。
 
-这是 **uv（给 .pth 加 hidden）× Python 3.14（跳过 hidden .pth）** 的兼容问题——两边单独看都「没错」，合在一起就坏。上游 deer-flow 不受影响，因为它用更早的 Python 版本，`.pth` 没有 hidden flag。
+这是 **uv（给 .pth 加 hidden）× Python 3.14（跳过 hidden .pth）** 的兼容问题——两边单独看都「没错」，合在一起就坏。
+
+> 这**不是 mini 独有的坑**：上游 deer-flow 同样声明 `requires-python = ">=3.12"`，在 Python 3.14 + uv 下也会撞上同一问题。上游「看起来没事」是因为它**同样**不依赖 `.pth`——它的 [Makefile](https://github.com/bytedance/deer-flow) 每个 target 也带 `PYTHONPATH=.`、它的 `tests/conftest.py` 也 `sys.path.insert(...)` 显式注入。**「conftest 显式注入 sys.path 来绕过 .pth」是两边共享的防御模式**，mini 是直接沿用。§9 会专门讲这条。
 
 ### 3.3 怎么定位的
 
@@ -256,7 +266,68 @@ def test_models_attach_tracing(monkeypatch):
 
 ---
 
-## 7. 常见问题 / 排错
+## 7. 设计动机分析（为什么这么约定 / 作用 / 好处）
+
+本篇三个关键约定——**conftest 注入 sys.path**、**blocking-IO gate**、**hermetic 写法**——每个都不是随便定的。读得懂这三个「为什么」，你才算理解了「一个能上 CI、多人协作、不 flaky 的测试体系」长什么样。
+
+### 7.1 为什么用 conftest 注入 sys.path，而不是修好 .pth？
+
+- **作用**：让 `import deerflow` 从任何姿势（`uv run pytest` / 裸 `python -m pytest` / IDE）都能成功，绕过 Python 3.14 + uv 的 hidden-.pth 兼容问题。
+- **好处**：**一劳永逸**——`.pth` 是 uv 生成的，`uv sync` 每次都会重新带上 hidden flag（手动 `chflags nohidden` 是反复的、不可靠的）；而 conftest 是项目自己的代码，pytest 收集前**必然加载**，一次写死永久生效。
+- **不这么设计会怎样**：靠手动 `chflags nohidden *.pth` → 每次 `uv sync` 后都得重来，团队成员/CI 上没人记得做 → `import deerflow` 随机失败，浪费时间排查。
+
+### 7.2 为什么搞一个 blocking-IO gate（而不是靠 code review）？
+
+- **作用**：把「async 事件循环里不得做同步阻塞 IO」这条**口头铁律**变成**一条会失败的测试**。
+- **好处**：async 阻塞 IO 是**最难查的隐性 bug**——本地能跑、上线偶发卡死，极难复现。gate 让越界**当场被抓**，而且后续每个模块新落地一处卸载点，都能用「生产锚点」测试（§4.4）锁死，防止未来误删。
+- **不这么设计会怎样**：靠人肉 review 守 → 总有人忘；问题只在生产高负载时偶发「服务假死」，事后排查成本极高。
+- **代价**：gate 有学习成本（§4.2 那个「import 写错位置报成 ModuleNotFoundError」的坑），但比起生产假死，这点成本值得。
+
+### 7.3 为什么测试必须 hermetic（禁网络/真实模型/文件副作用）？
+
+- **作用**：让每个测试**自包含**——不读 `config.yaml`、不连网、不调真实 LLM、不留文件副作用。
+- **好处**：① **可重现**——同一条测试在你机器、同事机器、CI 机器上跑结果完全一样；② **不 flaky**——不依赖网络通不通、API key 有没有、模型回什么；③ **快**——桩化外部依赖后，测试毫秒级完成，1700+ 条几秒跑完；④ **CI 友好**——CI 机器上裸跑就能过，不用配 key/网络。
+- **不这么设计会怎样**：测试依赖真实网络/模型 → CI 上随机挂（网络抖动/key 失效/模型超时），团队慢慢失去对测试的信任，「红着也就红着」，测试形同虚设。
+
+> 三条约定合起来回答同一个问题：**怎么让一个测试体系「机器可信赖」**——把人容易忘的（sys.path/阻塞 IO/外部依赖）都变成代码强制。
+
+---
+
+## 8. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照上游 `backend/tests/` 与 mini `test/`，剥 docstring/comment 后判逻辑差。结论：**测试基础设施是上游的高度忠实移植**——conftest 的 autouse fixture、soft-load 模式、marker（`no_auto_user`/`allow_blocking_io`）、gate 的 pytest 集成几乎逐行一致。真差异集中在两处：① gate 的**检测器内核**（上游 blockbuster 库 / mini 手搓）；② 一处 mini **进度性简化**（循环导入 mock 上游现役 / mini 留注释模板）。
+
+### 差异 1：gate 的 pytest 集成逐行一致，差异只在检测器内核
+
+gate 的 **pytest 集成**（`blocking_io/conftest.py` 的 `pytest_runtest_protocol` hookwrapper + `_is_blocking_io_item` 路径过滤 + `allow_blocking_io` opt-out）**两边逐行一致**，仅 docstring 中英。差异在**检测器内核** `blocking_io_runtime.py`：上游 44 行薄封装 `blockbuster` 库；mini 131 行零依赖手搓。→ 详见 [build.md §9 差异 3](build.md)。
+
+### 差异 2：循环导入 mock——上游现役，mini 留注释模板
+
+- 上游 `tests/conftest.py` **现役注入** `sys.modules["deerflow.subagents.executor"] = MagicMock()`，打断生产代码里一条真实的循环导入链（`subagents → executor → agents.thread_state → agents → lead_agent → subagent_limit_middleware → executor`），让轻量单测能独立 import。
+- mini `test/conftest.py` 把同一段**注释保留为模板**（"当前 mini 无此问题，启用时取消注释"）。
+- **这是落地进度差异，不是设计分叉**：mini 要么还没引入这条链、要么已用别的方式解开；将来若撞上，取消注释即可。
+
+### 差异 3：conftest 的 sys.path 注入目标不同（因目录布局不同，模式一致）
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| conftest 注入的目录 | `backend/`（让 `app` 可 import）+ `scripts/`（provisioner 测试助手） | `test/support/` + `backend/` + `packages/harness`（让 `deerflow` 可 import，无 `app`） |
+| autouse fixture | `_reset_skill_storage_singleton` + `_auto_user_context`（都 try/except 软加载） | `_reset_singletons_between_tests`[重置更多：skill storage + mcp 缓存] + `_auto_user_context`（同样软加载） |
+| marker | `no_auto_user` / `allow_blocking_io` | 完全一致 |
+
+**模式一致**：都是「conftest 显式 sys.path 注入，不依赖 editable .pth」+「autouse fixture 软加载」。这条**防御模式两边共享**（§3.2 已澄清），mini 直接沿用、略作扩展（mini 的单例重置多管了 mcp 缓存）。
+
+### 差异 4：测试目录位置（同 build.md）
+
+上游 `backend/tests/`（在 backend 内）；mini 项目根 `test/`（在 backend 外）→ 配置上移到项目根（`ruff.toml`/`pytest.ini`）。→ 详见 [build.md §9 差异 2](build.md)。
+
+---
+
+> **一句话总结**：mini 的测试基础设施 = 上游的**高度忠实移植**（conftest autouse fixture / soft-load / marker / gate 的 pytest 集成逐行一致），真差异只有两处：gate 检测器内核（blockbuster 库 vs 手搓，教学简化）+ 循环导入 mock（上游现役 vs mini 留模板，进度差异）。测试写法（hermetic）和诊断方法（sys.path/.pth）两边共享同一套哲学。
+
+---
+
+## 9. 常见问题 / 排错
 
 **Q: `import deerflow` 报 `ModuleNotFoundError`？**
 A: 先怀疑环境（§3），再怀疑代码。用 `ls -lO .../*.pth` 看 hidden flag + `inspect.getsource(site.addpackage)` 确认。根治：用 `make` 命令（Makefile 带 `PYTHONPATH`），并确保 venv 不在 iCloud 同步目录（`UV_PROJECT_ENVIRONMENT=~/.venvs/mini-deer-flow`，见 [start-here.md](start-here.md) §4 第 1 步）。
@@ -275,6 +346,6 @@ A: hermetic 套件里不要它。要么用 fake（§5.3 模式 C），要么单�
 
 ---
 
-## 8. 一句话带走
+## 10. 一句话带走
 
 > **测试跑不通时，先怀疑环境（sys.path / .pth / site.py），再怀疑代码。** 这次卡住的根本不是业务逻辑，而是 Python 3.14 一处不起眼的 site.py 改动 × uv 的 hidden flag。诊断靠 `ls -lO` + `inspect.getsource(site.addpackage)` 两条命令闭环，修复靠 conftest 显式注入 `sys.path` 一劳永逸。写测试则牢记 **hermetic**：桩化外部依赖、显式注入、不碰真实世界。

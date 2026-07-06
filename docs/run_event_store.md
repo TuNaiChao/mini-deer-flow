@@ -187,7 +187,24 @@ return await session.scalar(stmt.with_for_update())   # sqlite 等保留行锁
 
 ---
 
-## 6. 设计权衡与踩坑
+## 6. 设计动机分析（为什么这么设计 / 作用 / 好处）
+
+> RunEventStore 的每个选择都直击「**怎么把 run 里发生的所有事，按顺序、安全、快速地存取**」。读得懂这些「为什么」，你才算理解了事件溯源 / 时序存储工程（面试高频：「事件溯源」「并发序号分配」「分页设计（游标 vs 偏移）」「安全（路径穿越）」）。每条都问：**解决什么问题？带来什么好处？不这么设计会怎样？**
+
+### 6.0 核心设计动机（先看这张表）
+
+一句话总动机：**用统一接口把消息 / 轨迹 / 生命周期都收口，靠 seq 单调保证顺序、靠安全校验防越权、靠多组投影让热路径读快**——让「run 里发生了什么」可回放、可展示、并发不乱。
+
+| 设计选择 | 存在动机（为什么） | 作用 / 好处 | 不这么设计会怎样 |
+|---------|-------------------|------------|-----------------|
+| **统一接口 + `category` 区分** | 消息/轨迹/生命周期都要存，分三套接口难管 | 一个接口、靠 category 区分「给谁看」 | 分三个 store → 调用方各管一套，重复且易不一致 |
+| **seq 单调 + 各后端锁** | 并发写会同时读到同一个 max → 撞序号 | 保证顺序，前端正确渲染 | 无锁 → seq 重复，消息乱序跳跃 |
+| **sqlite `FOR UPDATE` no-op + UNIQUE 兜底** | sqlite 无行锁，FOR UPDATE 被忽略 | 靠约束兜底；生产用 `put_batch` 单事务避开并发 | 没约束 → sqlite 并发写撞 seq 报错 |
+| **双向游标分页用 seq** | 页码会随消息追加漂移 | seq 是稳定锚点，「seq>100 前 50 条」永远精确 | 页码 → 翻页时新消息进来，内容错位 |
+| **jsonl 路径穿越防御** | `thread_id` 拼进路径可被 `../` 逃出 base_dir | 只允 `[A-Za-z0-9_-]+`，拒绝 `/`·`.`·空格 | 不校验 → 越权写文件到任意位置 |
+| **memory 4 组投影** | 热路径读每次全扫（含大量 trace）太慢 | thread 级 + run 级分桶，`bisect` 做 O(log+page) | 单列表 → `list_messages` 每次扫全量 |
+
+下面 §6.1–§6.7 是逐条展开。
 
 ### 6.1 seq 单调为何要锁
 
@@ -303,7 +320,37 @@ store = make_run_event_store(get_app_config().run_events)  # DbRunEventStore
 
 ---
 
-## 9. 常见问题 / 排错
+## 9. 实现差异（vs 上游 deer-flow 源码）
+
+> 对照 `deer-flow/backend/packages/harness/deerflow/runtime/events/`，剥 docstring 后判逻辑差。结论：**RunEventStore 是上游的高度忠实移植**——文件集完全相同（6 文件一一对应）、4 个核心文件（base/memory/jsonl/db）行数全在 ~7 行误差内（差异是 docstring 语言）、工厂 `make_run_event_store` **逐字节逻辑相同**。唯一实质差异是**工厂函数放在哪个 `__init__.py`**。
+
+### 差异 1：4 个核心文件——忠实移植（docstring 中英差）
+
+| 文件 | mini / 上游 行数 | 说明 |
+|---|---|---|
+| `store/base.py` | 102 / 109 | `RunEventStore` ABC（8 方法 + 5 不变量）一致 |
+| `store/memory.py` | 164 / 158 | 4 组投影 + `bisect` 分页一致 |
+| `store/jsonl.py` | 213 / 218 | 路径穿越防御 + 每线程锁 + IO 卸载一致 |
+| `store/db.py` | 312 / 315 | seq 锁（postgres advisory / sqlite FOR UPDATE）+ trace 截断 + JSON 往返 + user_id stamp 一致 |
+
+差异纯 docstring（mini 中文面向小白讲解，上游英文），逻辑逐个对齐。
+
+### 差异 2：工厂 `make_run_event_store` 放哪——mini 上移一层（结构选择）
+
+`make_run_event_store(config)` 工厂**逻辑两边逐字节相同**（memory / db / jsonl 三分支 + `database.backend=memory` 回退全一致）。差异只在**位置**：
+
+| | 上游 deer-flow | mini |
+|---|---|---|
+| 工厂位置 | `store/__init__.py` | `events/__init__.py`（上移一层） |
+| 调用方 import | `from deerflow.runtime.events.store import make_run_event_store` | `from deerflow.runtime.events import make_run_event_store`（少一层嵌套） |
+
+**为什么**：mini 把工厂上移到 `events/__init__.py`，让调用方少打一层 `.store`——教学版偏好更短的导入路径。**逻辑 0 差**，纯组织选择。
+
+> **一句话总结**：mini 的 RunEventStore = 上游的**高度忠实移植**（6 文件一一对应、base/memory/jsonl/db 全在几行误差内、工厂逻辑逐字节相同），唯一差异是工厂 `make_run_event_store` 的**位置**——上游放 `store/__init__.py`、mini 上移到 `events/__init__.py`（少一层 import 嵌套）。逻辑 0 差，纯组织选择。
+
+---
+
+## 10. 常见问题 / 排错
 
 **Q: `UNIQUE constraint failed: run_events.thread_id, run_events.seq`？**
 A: 同 thread 并发写撞 seq（sqlite 上 FOR UPDATE 是 no-op，§6.2）。生产中不应发生（RunJournal 用 `put_batch`）。如果你自己调 `put` 又并发了，改用 `put_batch`，或换 postgres 后端（advisory lock 真正串行化）。
@@ -325,7 +372,7 @@ A: 后台 worker 写时 contextvar 未设（没有 HTTP 请求上下文）→ st
 
 ---
 
-## 小结
+## 11. 小结
 
 RunEventStore 的精髓是**统一接口 + seq 单调 + 安全收口**。记住五件事：
 
